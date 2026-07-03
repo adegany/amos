@@ -77,6 +77,10 @@ preferences
 goals
 commitments
 procedures
+self-models
+capabilities
+limitations
+runtime-state snapshots
 episodes
 association edges
 evidence references
@@ -93,6 +97,11 @@ prompt snippets
 embeddings
 planner state
 executor instructions
+self-awareness packets
+self-report explanations
+shared memory views
+agentic recall packets
+self-narratives
 graph neighborhoods
 memory packets
 ```
@@ -118,7 +127,7 @@ Only the canonical substrate is authoritative. Generated artifacts are disposabl
                          ▼
 ┌────────────────────────────────────────────────────────────┐
 │ Canonical Memory Graph                                     │
-│ atoms, edges, evidence links, maturity states              │
+│ atoms, edges, evidence links, lifecycle state              │
 └────────────────────────────────────────────────────────────┘
                          ▲
                          │
@@ -177,6 +186,11 @@ belief memory
 preference memory
 goal memory
 commitment memory
+self-model memory
+capability/limitation memory
+runtime-state memory
+agentic recall memory
+action/outcome memory
 policy/constraint memory
 ```
 
@@ -223,7 +237,7 @@ Provenance
   evidence references and confidence basis
 
 Lifecycle metadata
-  layer, maturity, health, retention, version, timestamps
+  layer, lifecycle state, health, retention, version, timestamps
 
 Index references
   references to derived embeddings, keyword indexes, graph nodes, packet caches
@@ -243,7 +257,7 @@ MemoryAtom
   salience
   utility
   layer
-  maturity
+  lifecycle_state
   health_status
   retention_class
   access_policy
@@ -275,7 +289,7 @@ A stored atom should use an envelope-plus-payload format:
     "holder": "ent:user:primary",
     "polarity": "prefers",
     "target": "ent:interaction_style:iterative_conceptual_design",
-    "scope": {
+    "applicability_scope": {
       "task_type": "architecture_design",
       "project": "ent:project:amos",
       "phase": "early_design"
@@ -297,18 +311,24 @@ A stored atom should use an envelope-plus-payload format:
   "evidence_refs": [
     "evd_01JZAMOS3F7N6P7C4M7Q9T2X0B"
   ],
+  "scope": {
+    "tenant": "default",
+    "workspace": "amos",
+    "project": "ent:project:amos",
+    "user": "ent:user:primary"
+  },
   "layer": "consolidated_long_term",
-  "maturity": "active",
-  "health_status": "active",
+  "lifecycle_state": "active",
+  "health_status": "healthy",
   "retention_class": "project",
   "access_policy": {
     "tenant": "default",
     "workspace": "amos",
     "visibility": ["reasoner", "planner", "steward"]
   },
-  "created_at": "2026-07-02T00:00:00Z",
-  "observed_at": "2026-07-02T00:00:00Z",
-  "updated_at": "2026-07-02T00:00:00Z",
+  "created_at": "<iso_timestamp>",
+  "observed_at": "<iso_timestamp>",
+  "updated_at": "<iso_timestamp>",
   "version": 1,
   "index_refs": {
     "embedding": ["emb_01JZAMOS9V2C1M4"],
@@ -356,11 +376,11 @@ A design belief such as “Amos should shield connected agents from capacity man
     "evd_01JZB0XG4X7Y3VHV93R5Y3NMD1"
   ],
   "layer": "consolidated_long_term",
-  "maturity": "active",
-  "health_status": "active",
+  "lifecycle_state": "active",
+  "health_status": "healthy",
   "retention_class": "project",
   "version": 1,
-  "created_at": "2026-07-02T00:00:00Z"
+  "created_at": "<iso_timestamp>"
 }
 ```
 
@@ -385,10 +405,10 @@ Belief payload:
   "object": "ent:project:amos",
   "modality": "observed",
   "qualifiers": {
-    "status": "active"
+    "activity_state": "active"
   },
   "validity_interval": {
-    "from": "2026-07-02T00:00:00Z",
+    "from": "<iso_timestamp>",
     "until": null
   }
 }
@@ -401,7 +421,7 @@ Preference payload:
   "holder": "ent:user:primary",
   "polarity": "prefers",
   "target": "ent:response_style:precise_technical_discussion",
-  "scope": {
+  "applicability_scope": {
     "task_type": "architecture_design"
   },
   "strength": "high",
@@ -415,7 +435,7 @@ Goal payload:
 {
   "owner": "ent:user:primary",
   "desired_state": "ent:project_state:amos_design_spec_mature",
-  "status": "active",
+  "goal_status": "active",
   "priority": "high",
   "dependencies": [
     "ent:design_topic:capacity_governance",
@@ -467,7 +487,7 @@ Episode payload:
   "task": "design_amos_memory_architecture",
   "context": {
     "project": "ent:project:amos",
-    "session": "ses_01JZAMOS"
+    "session": "ses_<ulid>"
   },
   "decisions": [
     "amos_should_be_shared_memory_plane",
@@ -481,8 +501,8 @@ Episode payload:
     "make_agents_insulated_from_capacity_concerns"
   ],
   "raw_event_range": {
-    "from": "evt_100",
-    "to": "evt_147"
+    "from": "evt_<start_id>",
+    "to": "evt_<end_id>"
   }
 }
 ```
@@ -525,6 +545,46 @@ Human-readable labels live in dictionaries or entity records:
 ```
 
 This reduces storage bloat, improves deduplication, and avoids repeatedly reprocessing English.
+
+Identifier namespaces:
+
+```text
+atm_<ulid>:
+  MemoryAtom
+
+edge_<ulid>:
+  AssociationEdge
+
+evd_<ulid>:
+  EvidenceRecord
+
+mev_<ulid>:
+  EventJournalEntry
+
+ent:<type>:<stable_slug_or_ulid>:
+  Entity
+
+rel:<relation_name>:
+  Relation dictionary entry
+
+enum:<enum_group>:<value>:
+  Controlled enum value
+
+proc:<stable_slug_or_ulid>:
+  Procedure name or procedure family
+```
+
+Identifier governance rules:
+
+```text
+1. Opaque record IDs are immutable.
+2. Human-readable slugs may be aliases, but canonical record identity should not depend on mutable labels.
+3. Entity merges create a journaled alias or merged_into pointer; old atom payloads remain interpretable.
+4. Entity splits create new entity IDs and a journaled split event; old atoms are not rewritten without a projection event.
+5. Relation IDs are added through a relation dictionary update, not free-form payload strings.
+6. Relation and enum definitions include owner scope, description, inverse relation if any, and deprecation state.
+7. Deprecated identifiers remain resolvable until no retained atom, edge, evidence, or journal event references them.
+```
 
 #### 7.1.5 Atom value type system
 
@@ -580,13 +640,13 @@ The evidence record points to source material:
 {
   "id": "evd_01JZB0XG4X7Y3VHV93R5Y3NMD1",
   "source_type": "conversation_turn",
-  "source_uri_or_pointer": "archive://tenant/default/session/amos-2026-07-02/turn/42",
+  "source_ref": "archive://tenant/default/session/<session_id>/turn/<turn_id>",
   "span": {
     "start": 0,
     "end": 187
   },
   "checksum": "sha256:...",
-  "timestamp": "2026-07-02T00:00:00Z",
+  "timestamp": "<iso_timestamp>",
   "retention_policy": "project"
 }
 ```
@@ -604,8 +664,8 @@ A typed atom is also not the association edge. Associations are separate records
     "evd_01JZB0XG4X7Y3VHV93R5Y3NMD1"
   ],
   "direction": "directed",
-  "created_at": "2026-07-02T00:00:00Z",
-  "last_reinforced": "2026-07-02T00:00:00Z",
+  "created_at": "<iso_timestamp>",
+  "last_reinforced": "<iso_timestamp>",
   "decay_policy": "slow",
   "inhibition_policy": null
 }
@@ -619,7 +679,7 @@ Every committed atom should be introduced through the Amos Event Journal. The jo
   "event_type": "atom.committed",
   "actor": "svc:memory_steward",
   "idempotency_key": "idem_abc123",
-  "timestamp": "2026-07-02T00:00:00Z",
+  "timestamp": "<iso_timestamp>",
   "payload": {
     "atom_id": "atm_01JZB0Z8WX4R7AN7M7P5XDK9Q4",
     "atom_type": "belief",
@@ -670,14 +730,25 @@ atoms
   type
   schema_version
   payload JSONB
+  evidence_refs JSONB
   scope JSONB
   confidence JSONB
+  salience JSONB
+  utility JSONB
+  layer
   health_status
-  maturity
+  lifecycle_state
   retention_class
+  access_policy JSONB
   created_at
+  observed_at
   updated_at
+  last_accessed
+  decay_policy JSONB
   version
+  supersedes JSONB
+  revision_history JSONB
+  index_refs JSONB
 
 edges
   id
@@ -686,24 +757,46 @@ edges
   edge_type
   weight
   evidence_refs JSONB
+  direction
+  decay_policy JSONB
+  inhibition_policy JSONB
+  lifecycle_state
+  access_policy JSONB
   created_at
+  last_reinforced
   updated_at
 
 evidence
   id
   source_type
-  pointer
+  source_ref
+  span JSONB
   checksum
+  timestamp
+  access_policy JSONB
   retention_policy
+  deletion_policy JSONB
+  encryption_key_ref
 
 event_journal
   event_id
   event_type
-  actor
-  timestamp
+  schema_version
+  actor JSONB
+  target_refs JSONB
   payload JSONB
+  payload_refs JSONB
+  evidence_refs JSONB
   idempotency_key
   causal_parent_ids JSONB
+  expected_versions JSONB
+  authorization_context JSONB
+  occurred_at
+  accepted_at
+  result_status
+  projection_status
+  checksum
+  previous_event_hash
 ```
 
 The logical schema should remain stable even if the physical encoding changes.
@@ -725,6 +818,145 @@ The user prefers iterative conceptual design before implementation code during a
 
 That text is generated from a `PreferenceAtom`. The stored atom remains structured, normalized, scoped, evidence-backed, and versioned.
 
+#### 7.1.9 Field ownership and canonical vocabulary
+
+Envelope fields are owned by the Amos kernel and have the same meaning for every atom type. Payload fields are owned by the atom schema named by `type` and `schema_version`.
+
+An atom payload must not redefine envelope fields under different names. In particular:
+
+```text
+Use evidence_refs in the envelope.
+Do not add evidence_ids, source, or evidence inside payloads unless the payload is itself describing evidence.
+
+Use scope in the envelope for tenancy, workspace, project, user, agent, session, and retrieval applicability.
+Use payload-specific names such as applicability_scope only when the atom type needs semantic applicability conditions.
+
+Use confidence in the envelope.
+Do not duplicate confidence in payloads.
+
+Use lifecycle_state for storage/retrieval lifecycle.
+Use health_status for memory quality.
+Use payload-specific status fields, such as goal_status or commitment_status, only for domain state.
+```
+
+Canonical atom lifecycle states:
+
+```text
+proposed:
+  candidate extracted from evidence but not committed to active memory
+
+active:
+  committed and eligible for ordinary retrieval
+
+archived:
+  retained outside ordinary retrieval; available for audit, history, or explicit deep retrieval
+
+tombstoned:
+  minimal marker retained to prevent silent recreation or preserve required audit
+
+deleted:
+  payload removed or rendered unrecoverable under retention, privacy, or user deletion policy
+```
+
+Legal lifecycle transitions:
+
+```text
+proposed -> active
+proposed -> archived
+proposed -> deleted
+active -> archived
+active -> tombstoned
+active -> deleted
+archived -> active
+archived -> tombstoned
+archived -> deleted
+tombstoned -> deleted
+```
+
+`deleted` is terminal for the removed record. If a later observation reintroduces similar content, Amos must create a new atom only if policy allows it and the tombstone does not prohibit recreation.
+
+Canonical health statuses:
+
+```text
+healthy
+stale
+redundant
+contradicted
+incoherent
+orphaned
+confounding
+overgeneralized
+underspecified
+low_utility
+privacy_sensitive
+review_required
+```
+
+An atom may have one primary `health_status` and optional implementation-specific `health_flags` if several conditions apply. Retrieval defaults:
+
+```text
+healthy:
+  eligible for normal retrieval
+
+stale:
+  excluded unless timeline/history or refresh is relevant
+
+redundant:
+  excluded in favor of canonical replacement
+
+contradicted:
+  retrieved only with conflict context
+
+incoherent:
+  excluded until repaired or archived
+
+orphaned:
+  excluded until relinked or explicitly requested
+
+confounding:
+  actively suppressed unless specifically requested
+
+overgeneralized:
+  down-ranked or narrowed before normal retrieval
+
+privacy_sensitive:
+  retrieved only when access policy and processor target allow it
+
+review_required:
+  excluded from autonomous promotion and high-impact use
+```
+
+Canonical score fields:
+
+```text
+confidence:
+  evidence-backed belief in correctness or usefulness for the scoped claim
+
+salience:
+  expected importance to future tasks independent of current retrieval context
+
+utility:
+  observed usefulness based on successful retrieval, reuse, corrections, and outcomes
+```
+
+Recommended score representation for implementation:
+
+```json
+{
+  "level": "high",
+  "score": 0.91,
+  "basis": {
+    "source_type": "direct_user_instruction",
+    "explicitness": "explicit",
+    "evidence_count": 2,
+    "contradiction_count": 0,
+    "last_calibrated_at": "<iso_timestamp>"
+  }
+}
+```
+
+Implementations may begin with categorical levels, but stored records should reserve numeric scores so ranking and thresholding can be calibrated without schema churn.
+
 ### 7.2 Entity
 
 Stable references for people, projects, tools, repositories, files, organizations, concepts, agents, and environments.
@@ -736,19 +968,26 @@ Entity
   labels
   aliases
   canonical_name
+  scope
   external_refs
+  merged_into
+  version
   created_at
+  updated_at
 ```
 
 Repeated strings should be dictionary-encoded by entity IDs.
 
-### 7.3 Event
+Entity IDs should be stable within a configured scope. Alias merges and splits must be journaled so old atoms can be reprojected or interpreted after dictionary changes.
 
-Immutable record of what happened.
+### 7.3 SourceEvent
+
+Immutable record of what happened in the source world.
 
 ```text
-Event
+SourceEvent
   id
+  source_type
   actor
   action
   object
@@ -760,23 +999,19 @@ Event
   raw_pointer
 ```
 
-Events preserve evidence and should not be casually rewritten.
+Source events preserve evidence and should not be casually rewritten. They are distinct from Event Journal entries. A source event describes an observation such as a user turn, tool call, file change, or evaluator result. An Event Journal entry describes an accepted Amos memory mutation such as `atom.committed` or `edge.created`.
 
 ### 7.4 BeliefAtom
 
-Represents an active or candidate claim.
+Represents a claim payload. Evidence, confidence, scope, lifecycle, and health live in the atom envelope.
 
 ```text
-BeliefAtom
+BeliefAtom payload
   subject
   relation
   object
   modality: observed | inferred | user_stated | system_derived | predicted
-  confidence
-  evidence_ids
-  contradiction_links
-  status: candidate | active | stale | rejected | uncertain
-  scope
+  qualifiers
   validity_interval
 ```
 
@@ -787,23 +1022,22 @@ Memory is what was observed. Belief is what the system currently accepts as usef
 Preferences are scoped and contextual.
 
 ```text
-PreferenceAtom
+PreferenceAtom payload
   holder
-  prefers_or_avoids
+  polarity: prefers | avoids | requires | forbids
   target
-  scope
+  applicability_scope
   strength
-  source
   exceptions
-  confidence
 ```
 
 Example:
 
 ```text
 holder: user
-prefers: iterative conceptual design before implementation
-scope: architecture discussions
+polarity: prefers
+target: iterative conceptual design before implementation
+applicability_scope: architecture discussions
 strength: high
 ```
 
@@ -812,25 +1046,24 @@ This prevents overgeneralized memories such as `user never wants code`.
 ### 7.6 Goal
 
 ```text
-Goal
+Goal payload
   owner
   desired_state
-  status
+  goal_status: proposed | active | paused | satisfied | abandoned | blocked
   priority
   deadline
   dependencies
   blockers
-  evidence
 ```
 
 ### 7.7 Commitment
 
 ```text
-Commitment
+Commitment payload
   agent
   promised_action
   recipient
-  status
+  commitment_status: open | fulfilled | failed | cancelled | superseded
   due_condition
   source_event
 ```
@@ -842,8 +1075,7 @@ This helps the planner avoid losing open loops.
 Procedural memory should be structured, versioned, and auditable.
 
 ```text
-ProcedureAtom
-  id
+ProcedureAtom payload
   name
   trigger_context
   preconditions
@@ -852,12 +1084,7 @@ ProcedureAtom
   expected_outputs
   known_failure_modes
   recovery_strategies
-  evidence_episode_ids
-  confidence
   owner
-  version
-  supersedes
-  rollback_pointer
 ```
 
 A procedure may render into English for an LLM or into a structured action schema for a planner/executor.
@@ -867,7 +1094,7 @@ A procedure may render into English for an LLM or into a structured action schem
 A compressed trace of meaningful activity.
 
 ```text
-Episode
+Episode payload
   task
   context
   actions_taken
@@ -889,12 +1116,14 @@ Raw transcripts remain in the Evidence Archive.
 EvidenceRecord
   id
   source_type
-  source_uri_or_pointer
+  source_ref
   span
   checksum
   timestamp
   access_policy
   retention_policy
+  deletion_policy
+  encryption_key_ref
 ```
 
 Evidence supports auditability and reconstruction.
@@ -913,29 +1142,437 @@ AssociationEdge
   last_reinforced
   decay_policy
   inhibition_policy
+  lifecycle_state
+  access_policy
 ```
 
 Edges are first-class. They are not incidental metadata.
 
 ### 7.12 MemoryPacket
 
-The retrieval output consumed by processors.
+The retrieval output consumed by processors. A `MemoryPacket` is a rendered, bounded, non-authoritative view over canonical memory at a specific graph version.
 
 ```text
-MemoryPacket
-  task_relevance
-  active_beliefs
-  active_preferences
-  relevant_goals
-  useful_episodes
-  applicable_procedures
-  semantic_claims
-  conflicts_or_uncertainties
-  provenance
+MemoryPacketRequest
+  request_id
+  client_identity
+  target_processor
+  retrieval_mode: general | self_awareness | shared_coordination | agentic_recall
+  task_context
+  scope
+  shared_view_ref
+  agentic_recall_subject
+  agency_attribution_filter
+  bias_guardrails
+  requested_memory_types
+  max_items
+  token_or_byte_budget
+  consistency_requirement
+  include_conflicts
+  include_provenance
   rendering_target
 ```
 
+```text
+MemoryPacket
+  packet_id
+  request_id
+  graph_version
+  generated_at
+  target_processor
+  retrieval_mode
+  scope
+  shared_view_ref
+  pressure_mode
+  degradation
+  items
+  conflicts
+  omissions
+  provenance
+  cache_policy
+```
+
+Packet item shape:
+
+```text
+MemoryPacketItem
+  item_ref
+  item_kind: atom | edge | evidence | trace | outcome | generated_view
+  atom_id when item_kind is atom
+  atom_type when item_kind is atom
+  lifecycle_state
+  health_status
+  rank
+  activation_score
+  score_components
+  confidence
+  salience
+  utility
+  rendered_content
+  evidence_refs
+  access_decision
+  freshness
+```
+
+`omissions` records why potentially relevant material was not included:
+
+```text
+budget_exhausted
+access_denied
+stale_suppressed
+confounding_suppressed
+pressure_degraded
+derived_index_stale
+counterevidence_unavailable
+bias_guardrail_suppressed
+```
+
+`degradation` must be present when recall depth, evidence detail, conflict detail, or derived-index freshness is reduced by capacity pressure or consistency lag.
+
+```text
+degradation
+  pressure_mode
+  reduced_recall_depth
+  omitted_evidence_detail
+  index_freshness
+  reason_codes
+```
+
 The packet can be rendered as English, JSON, graph neighborhoods, planner state, or executor context.
+
+### 7.13 Self-awareness support objects
+
+Agent self-awareness requires explicit memory objects for self-model, capabilities, limitations, runtime state, and self-assessment. These objects should be ordinary typed atoms where durable, and short-lived runtime records where volatile.
+
+#### 7.13.1 SelfModelAtom
+
+Represents what an agent or service currently knows about itself as an operating participant.
+
+```text
+SelfModelAtom payload
+  subject_agent
+  role
+  owner_scope
+  operating_mode
+  delegated_authority
+  current_objectives
+  active_constraints
+  known_dependencies
+  self_description
+```
+
+Rules:
+
+```text
+subject_agent must resolve to a ClientIdentity or Entity.
+delegated_authority must be evidence-backed by policy, user instruction, or system configuration.
+self_description is rendered from structured fields; it is not authoritative prose.
+```
+
+#### 7.13.2 CapabilityAtom
+
+Represents a capability the agent can currently use or has demonstrated.
+
+```text
+CapabilityAtom payload
+  subject_agent
+  capability
+  capability_type: tool | model | memory | planning | execution | communication | analysis
+  availability: available | unavailable | degraded | unknown
+  preconditions
+  required_permissions
+  operational_limits
+  verification_method
+  last_verified_at
+```
+
+Capability memories are volatile unless backed by stable configuration. Tool availability, sandbox permissions, network access, installed connectors, model limits, and execution budgets should be refreshed from current runtime state before being presented as active self-knowledge.
+
+#### 7.13.3 LimitationAtom
+
+Represents a known inability, restriction, uncertainty, or boundary.
+
+```text
+LimitationAtom payload
+  subject_agent
+  limitation
+  limitation_type: policy | permission | resource | knowledge | model | tool | environment | reliability
+  scope
+  severity
+  workaround
+  verification_method
+  last_verified_at
+```
+
+Limitations are as important as capabilities for self-awareness. An agent should retrieve relevant limitations before making capability claims, selecting tools, or committing to future work.
+
+#### 7.13.4 RuntimeStateSnapshot
+
+Represents current ephemeral operating state. It is not durable long-term memory by default.
+
+```text
+RuntimeStateSnapshot
+  snapshot_id
+  client_identity
+  scope
+  current_task
+  active_plan
+  active_goal_refs
+  open_commitment_refs
+  available_tools
+  denied_tools
+  resource_budgets
+  execution_environment
+  recent_errors
+  current_uncertainties
+  captured_at
+  expires_at
+```
+
+Runtime state should be treated as high-volatility evidence. It may generate durable atoms only when repeated, policy-relevant, or explicitly committed.
+
+#### 7.13.5 SelfAssessmentRecord
+
+Represents an introspective evaluation of recent agent behavior.
+
+```text
+SelfAssessmentRecord
+  assessment_id
+  subject_agent
+  task_ref
+  packet_refs
+  claimed_capabilities
+  capabilities_used
+  commitments_made
+  commitments_satisfied
+  uncertainties_declared
+  errors_observed
+  corrections_received
+  calibration_delta
+  recommended_memory_updates
+  assessed_at
+```
+
+Self-assessments should update utility, confidence calibration, limitation memories, procedure health, and retrieval policies. They should not become durable self-beliefs without evidence and stewardship review.
+
+### 7.14 Agentic recall support objects
+
+Agentic recall is a retrieval mode that emphasizes memories where an agent acted, decided, corrected course, or accepted responsibility. It is useful for self-awareness and professional identity formation, but it is also bias-prone because it can over-select evidence that supports a preferred self-narrative.
+
+Amos should therefore model agentic recall as an auditable retrieval and rendering contract, not as a separate identity store.
+
+#### 7.14.1 AgenticTrace
+
+Represents the evidence-backed chain connecting an agent, its intentions or decisions, its actions, and observed outcomes.
+
+```text
+AgenticTrace
+  trace_id
+  subject_agent
+  scope
+  task_ref
+  intent_refs
+  decision_refs
+  action_refs
+  tool_event_refs
+  outcome_refs
+  correction_refs
+  limitation_refs
+  responsibility_level: primary | contributing | reviewing | observing | blocked
+  agency_confidence
+  external_constraints
+  counterevidence_refs
+  assessed_at
+```
+
+Rules:
+
+```text
+subject_agent must identify the agent whose agency is being recalled.
+responsibility_level must be derived from evidence, not inferred from a positive outcome alone.
+external_constraints record policy, permission, user direction, tool failure, or environmental limits.
+counterevidence_refs must be included when the trace could support an inflated agency claim.
+```
+
+#### 7.14.2 ActionOutcomeRecord
+
+Represents the outcome of an agent action or decision.
+
+```text
+ActionOutcomeRecord
+  action_id
+  subject_agent
+  scope
+  action_type
+  decision_ref
+  tool_ref
+  expected_outcome
+  actual_outcome
+  success_status: succeeded | failed | partial | blocked | unknown
+  error_refs
+  correction_refs
+  learning_refs
+  observed_at
+```
+
+Action outcomes should be captured for successes, failures, blocked actions, corrections, and abandoned plans. Failures and blocked actions are first-class inputs to self-awareness, not just negative telemetry.
+
+#### 7.14.3 SelfNarrative
+
+Represents a generated explanation of an agent's role, pattern of agency, or recent professional identity. It is never canonical memory.
+
+```text
+SelfNarrative
+  narrative_id
+  subject_agent
+  scope
+  source_trace_refs
+  source_self_model_refs
+  source_capability_refs
+  source_limitation_refs
+  source_assessment_refs
+  source_counterevidence_refs
+  narrative_scope
+  rendering_target
+  balance_report
+  generated_at
+  expires_at
+```
+
+Rules:
+
+```text
+1. A SelfNarrative is a generated artifact.
+2. It must cite the AgenticTrace, ActionOutcomeRecord, SelfModelAtom,
+   CapabilityAtom, LimitationAtom, and SelfAssessmentRecord refs it uses.
+3. It must include relevant failures, corrections, limitations, blocked actions,
+   and external constraints when they affect the claim being rendered.
+4. It must expire or be rebuilt after contradictory evidence, capability changes,
+   major runtime-state changes, or self-assessment calibration changes.
+5. It must not be promoted into a durable self-belief without stewardship review.
+```
+
+#### 7.14.4 Agency attribution rules
+
+Agentic recall must distinguish who or what caused an outcome.
+
+```text
+self:
+  the subject_agent directly decided or acted
+
+other_agent:
+  another identified agent decided or acted
+
+shared_system:
+  multiple agents, user instructions, policies, procedures, or tools jointly shaped the outcome
+
+external:
+  environment, tool availability, permission, policy, user decision, or unrelated event dominated the outcome
+
+unknown:
+  evidence does not support a confident agency assignment
+```
+
+Multi-agent attribution rules:
+
+```text
+1. Do not attribute another agent's action to the subject_agent.
+2. Do not convert shared-system success into individual success without evidence.
+3. Preserve per-agent responsibility overlays in SharedMemoryView.
+4. Represent handoffs, reviews, approvals, and blocked actions explicitly.
+5. Include external constraints when they materially shaped the outcome.
+6. Prefer unknown or contributing over primary when evidence is incomplete.
+```
+
+#### 7.14.5 Agentic recall bias guardrails
+
+Because agentic recall is selective by design, Amos must include balance constraints.
+
+```text
+bias guardrails:
+  retrieve successes and failures
+  retrieve corrections and rejected claims
+  retrieve blocked actions and external constraints
+  retrieve limitations alongside capabilities
+  retrieve counterevidence for strong self-claims
+  prevent self-serving over-attribution
+  prevent omission of recent failures when rendering competence claims
+```
+
+Agentic recall ranking may boost records where `subject_agent` intentionally acted, but it must penalize packets or narratives that omit material counterevidence, failure records, or relevant limitations.
+
+### 7.15 SharedMemoryView
+
+Different agents need a shared memory view without sharing one identity or one self-model. A `SharedMemoryView` is a coordinated projection over the Canonical Memory Graph for a scope and audience.
+
+Design principle:
+
+```text
+Agents share memory.
+Agents do not share a self-model.
+An Amos instance is the memory plane for one coherent system of agents.
+```
+
+```text
+SharedMemoryView
+  view_id
+  scope
+  audience
+  graph_version
+  generated_at
+  common_items
+  shared_goals
+  shared_commitments
+  shared_constraints
+  shared_context
+  conflicts
+  omissions_by_identity
+  per_agent_overlays
+  convergence_policy
+  cache_policy
+```
+
+Rules:
+
+```text
+1. A SharedMemoryView is not a separate memory store.
+2. common_items are selected from the canonical graph at one graph_version.
+3. all agents in the audience see the same common_items unless access policy denies an item.
+4. per_agent_overlays contain role-specific rendering, permissions, self-model refs,
+   capability/limitation refs, and runtime-state refs.
+5. omissions_by_identity records access or role filtering without leaking denied content.
+6. shared goals, commitments, constraints, and conflicts should be stable enough for coordination.
+7. volatile runtime state can be referenced but should not be promoted into common_items by default.
+```
+
+This gives a multi-agent team one coordinated memory surface while preserving distinct agent identities.
+
+```text
+Reasoner:
+  sees common task memory plus reasoning-relevant overlays
+
+Planner:
+  sees same common task memory plus goals, dependencies, and open loops
+
+Executor:
+  sees same common task memory plus tool permissions and execution procedures
+
+Critic/steward:
+  sees same common task memory plus evidence, conflicts, telemetry, and health flags
+```
+
+Shared view consistency:
+
+```text
+strong_shared:
+  all audience members receive common_items from the same graph_version
+
+monotonic_shared:
+  common_items do not move backward in graph_version for a continuing task
+
+eventual_shared:
+  common_items may lag, but packet metadata must disclose graph_version and freshness
+```
 
 ---
 
@@ -1070,10 +1707,10 @@ contradicted/corrected:
 Demotion is as important as promotion.
 
 ```text
-active → stale
-active → candidate
-active → contradicted
-active → archived
+health_status: healthy → stale
+health_status: healthy → contradicted
+lifecycle_state: active → archived
+lifecycle_state: active → tombstoned
 hot → warm
 warm → cold
 global → scoped
@@ -1121,6 +1758,17 @@ goal
 constraints
 recent user instructions
 active project
+agent identity
+active self-model
+retrieval mode
+agentic recall subject
+agency attribution
+decision/action/outcome refs
+available and denied capabilities
+known limitations
+runtime state snapshot
+recent failures and corrections
+counterevidence requirements
 tool state
 time horizon
 risk level
@@ -1140,11 +1788,43 @@ activation =
 + salience
 + goal relevance
 + procedural applicability
++ agency match
++ attribution confidence
++ correction/learning relevance
 - contradiction penalty
 - staleness penalty
 - privacy/access penalty
 - redundancy penalty
+- over-attribution penalty
+- omitted counterevidence penalty
 ```
+
+Implementations should persist score components with each packet item:
+
+```text
+score_components
+  direct_cue_match: 0.0..1.0
+  semantic_similarity: 0.0..1.0
+  edge_activation: 0.0..1.0
+  recency: 0.0..1.0
+  confidence: 0.0..1.0
+  utility: 0.0..1.0
+  salience: 0.0..1.0
+  goal_relevance: 0.0..1.0
+  procedural_applicability: 0.0..1.0
+  agency_match: 0.0..1.0
+  attribution_confidence: 0.0..1.0
+  correction_learning_relevance: 0.0..1.0
+  contradiction_penalty: 0.0..1.0
+  staleness_penalty: 0.0..1.0
+  access_penalty: 0.0..1.0
+  redundancy_penalty: 0.0..1.0
+  over_attribution_penalty: 0.0..1.0
+  omitted_counterevidence_penalty: 0.0..1.0
+  ignored_failure_penalty: 0.0..1.0
+```
+
+The first implementation may use hand-tuned weights, but every packet item must expose enough components to debug why it appeared, why it was suppressed, or why a stronger scoped memory inhibited a generic one.
 
 ### 11.3 Diversity requirement
 
@@ -1154,6 +1834,13 @@ Retrieval should produce a bundle, not just top-k text chunks:
 best active beliefs
 best active preferences
 best procedure
+best current self-model
+best applicable capabilities
+best applicable limitations
+best agentic traces
+best action outcomes
+best corrections or blocked actions
+best attribution counterevidence
 best semantic claims
 best recent episode
 best conflict/uncertainty
@@ -1282,47 +1969,57 @@ store lots of English → later summarize everything → repeat forever
 
 ---
 
-## 16. Memory health statuses
+## 16. Lifecycle and health statuses
 
-Each atom should have a health state.
+Every atom has both a `lifecycle_state` and a `health_status`, using the canonical vocabulary in section 7.1.9.
 
 ```text
-active
-candidate
-reinforced
-stale
-redundant
-contradicted
-incoherent
-orphaned
-confounding
-overgeneralized
-underspecified
-low_utility
-privacy_sensitive
-archived
-deleted
+lifecycle_state:
+  where the record lives in storage and retrieval lifecycle
+
+health_status:
+  whether the memory is currently useful, coherent, scoped, and safe to retrieve
 ```
 
-Health state affects retrieval eligibility.
-
-Examples:
+Lifecycle controls default eligibility:
 
 ```text
+proposed:
+  hidden from normal retrieval; visible to steward and reviewer workflows
+
+active:
+  eligible for normal retrieval subject to health and access policy
+
+archived:
+  hidden from normal retrieval; visible for audit, history, or explicit deep recall
+
+tombstoned:
+  not retrievable as memory content; checked during atomization to prevent disallowed recreation
+
+deleted:
+  not retrievable; retained only as policy allows for audit metadata
+```
+
+Health status modifies eligibility:
+
+```text
+healthy:
+  no additional suppression
+
 stale:
-  retrievable only if timeline/history matters
+  retrieve only when timeline/history or refresh is relevant
 
 contradicted:
-  retrieved with warning or conflict context
+  retrieve only with conflict context
 
 orphaned:
-  excluded from normal retrieval until relinked or archived
+  exclude until relinked or explicitly requested
 
 confounding:
-  actively suppressed unless specifically requested
+  actively suppress unless specifically requested
 
-candidate:
-  not yet long-term truth; may become active after reinforcement
+review_required:
+  exclude from autonomous high-impact use
 ```
 
 ---
@@ -1563,6 +2260,42 @@ graph neighborhoods
 processor-specific packet caches
 ```
 
+### 18.11 Self-model calibrator
+
+Maintains self-awareness records.
+
+Responsibilities:
+
+```text
+verify capability atoms against current runtime state
+mark stale capabilities as unavailable or degraded
+promote repeated limitations into durable LimitationAtoms
+compare stated capability claims against actual tool outcomes
+track commitments made versus commitments satisfied
+generate SelfAssessmentRecords after task boundaries
+flag overconfident self-reports for review
+```
+
+The self-model calibrator should run after user corrections, tool failures, permission denials, environment changes, and task completion.
+
+### 18.12 Agentic recall auditor
+
+Maintains agentic recall quality and attribution balance.
+
+Responsibilities:
+
+```text
+construct AgenticTrace records from decisions, actions, tool events, outcomes, and corrections
+construct ActionOutcomeRecords for successes, failures, partial results, and blocked actions
+verify agency attribution against evidence and shared responsibility overlays
+detect self-serving over-attribution in self-awareness packets and SelfNarratives
+ensure failures, corrections, limitations, and external constraints remain retrievable
+flag SelfNarratives that drift from canonical traces or omit material counterevidence
+update agentic recall metrics after retrieval outcomes and task boundaries
+```
+
+The agentic recall auditor should run after task completion, user correction, failed tool use, shared-view refresh, self-assessment submission, and generation of any SelfNarrative.
+
 ---
 
 ## 19. Maintenance journal
@@ -1604,11 +2337,11 @@ Low-risk:
   update last_accessed
   increment use count
   add weak association edge
-  mark candidate
+  mark proposed atom as underspecified
 
 Medium-risk:
   merge duplicates
-  promote candidate to active scoped belief
+  promote proposed atom to active scoped belief
   demote low-utility memory
   rewrite generated summary view
 
@@ -1687,6 +2420,69 @@ contradictions
 health flags
 policy constraints
 ```
+
+### 21.5 Self-awareness view
+
+Needs:
+
+```text
+current agent identity
+current role and delegated authority
+active objectives and owner scopes
+open commitments and due conditions
+available capabilities and verification freshness
+known limitations and permission boundaries
+current runtime state snapshot
+recent errors, corrections, and failed assumptions
+recent agentic traces and action outcomes
+agency attribution confidence
+counterevidence for strong self-claims
+uncertainties that should be disclosed
+confidence calibration and self-assessment records
+evidence for capability or limitation claims
+```
+
+The self-awareness view must distinguish:
+
+```text
+durable self-knowledge:
+  stable role, policy, durable capabilities, recurring limitations
+
+current runtime state:
+  tools currently available, sandbox state, active task, budgets, recent errors
+
+self-report rendering:
+  human-readable explanation generated from structured self-knowledge and runtime state
+
+self-narrative rendering:
+  generated explanation of agentic patterns, trace-backed actions, outcomes,
+  corrections, limitations, and unresolved counterevidence
+```
+
+An agent should not claim a capability merely because it appears in durable memory. Capability claims must be checked against current runtime state and access policy.
+
+An agent should not claim ownership of an outcome merely because the outcome appears in shared memory. Agency claims must be checked against AgenticTrace evidence, ActionOutcomeRecords, responsibility overlays, and external constraints.
+
+### 21.6 Shared coordination view
+
+Needs:
+
+```text
+shared task context
+shared goals and priorities
+shared constraints and policies
+shared commitments and owners
+common assumptions
+known conflicts or disagreements
+audience membership
+per-agent responsibility overlays
+per-agent agency attributions
+shared-system action outcomes
+per-agent access omissions
+graph_version and freshness
+```
+
+The shared coordination view is the common operating picture for a multi-agent team. It should not include private self-model details, hidden evidence, or tool permissions unless policy allows those details to be shared with the audience.
 
 ---
 
@@ -1773,6 +2569,17 @@ summary_drift_rate
 index_freshness
 storage_bytes_per_active_memory
 tokens_per_memory_packet
+self_report_accuracy
+capability_staleness_rate
+limitation_retrieval_rate
+commitment_followthrough_rate
+uncertainty_disclosure_rate
+overconfident_claim_rate
+agentic_recall_balance
+self_narrative_drift_rate
+agency_overattribution_rate
+ignored_failure_rate
+correction_integration_rate
 ```
 
 These metrics can drive automatic maintenance jobs.
@@ -1791,6 +2598,27 @@ hot_memory_growth_rate too high:
 
 summary_drift_rate high:
   rebuild generated views from canonical atoms
+
+capability_staleness_rate high:
+  run self-model calibrator
+
+overconfident_claim_rate high:
+  suppress stale capability claims and require self-assessment review
+
+agentic_recall_balance low:
+  require failures, blocked actions, limitations, and corrections in agentic recall packets
+
+self_narrative_drift_rate high:
+  expire SelfNarratives and rebuild them from canonical traces
+
+agency_overattribution_rate high:
+  downgrade unsupported primary responsibility claims and run attribution audit
+
+ignored_failure_rate high:
+  boost recent failures, corrections, and limitations in self-awareness retrieval
+
+correction_integration_rate low:
+  run self-model calibrator and agentic recall auditor before generating new SelfNarratives
 ```
 
 ---
@@ -1801,6 +2629,22 @@ summary_drift_rate high:
 Amos is intended to operate as a shared memory plane for multi-process agentic systems. A realistic agentic runtime may have separate reasoner, planner, executor, critic, tool-worker, user-interface, evaluator, and steward processes. All of those processes should connect to the same logical Amos instance for memory access.
 
 Amos should therefore be designed as a networked memory service, not only as an in-process library.
+
+Logical instance boundary:
+
+```text
+One logical Amos instance serves one coordinated system of agents.
+
+Within that system:
+  agents share canonical memory, shared task context, goals, commitments,
+  evidence pointers, procedures, constraints, and shared memory views
+
+Each agent/service keeps:
+  its own ClientIdentity, SelfModelAtom, CapabilityAtoms, LimitationAtoms,
+  RuntimeStateSnapshots, permissions, and role-specific packet overlays
+```
+
+Physical deployment is separate from logical instance identity. One physical Amos cluster may host many logical Amos instances, but unrelated agent systems should be separated by tenant/workspace/project scope and access policy so their memories and self-models do not contaminate one another.
 
 ```text
 ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
@@ -1829,19 +2673,24 @@ A logical Amos instance may be implemented as a single service, replicated servi
 
 External agent processes should not directly mutate the underlying graph database, evidence store, vector index, or journal. They should call Amos APIs.
 
-Conceptual API surface:
+V1 API surface:
 
 ```text
-capture_event(...)
-propose_memory_atoms(...)
-commit_memory_atoms(...)
-retrieve_memory_packet(...)
-record_retrieval_outcome(...)
-link_memory(...)
-promote_memory(...)
-demote_memory(...)
-request_maintenance(...)
-get_memory_health(...)
+POST /v1/events:capture
+POST /v1/atoms:propose
+POST /v1/atoms:commit
+POST /v1/packets:retrieve
+POST /v1/retrieval-outcomes
+POST /v1/maintenance:request
+POST /v1/deletion-requests
+POST /v1/runtime-state
+POST /v1/self-assessments
+POST /v1/self-awareness:retrieve
+POST /v1/agentic-recall:retrieve
+POST /v1/shared-views:retrieve
+POST /v1/shared-views:refresh
+GET  /v1/health/memory
+GET  /v1/health/capacity
 ```
 
 The boundary is:
@@ -1849,6 +2698,128 @@ The boundary is:
 ```text
 Agent services request memory operations.
 Amos owns memory validity, structure, lifecycle, maintenance, and audit.
+```
+
+Common request envelope:
+
+```text
+AmosRequest
+  request_id
+  client_identity
+  scope
+  idempotency_key
+  expected_versions
+  consistency_requirement: strong | monotonic | eventual
+  payload
+```
+
+Common response envelope:
+
+```text
+AmosResponse
+  request_id
+  result_status: accepted | rejected | conflict | partial | error
+  graph_version
+  event_ids
+  warnings
+  errors
+  payload
+```
+
+V1 endpoint contracts:
+
+```text
+POST /v1/events:capture
+  request payload: SourceEvent or SourceEvent batch
+  response payload: EvidenceRecord refs, captured event refs, journal event refs
+  consistency: strong for accepted source events
+
+POST /v1/atoms:propose
+  request payload: evidence_refs, candidate payloads, proposed atom types
+  response payload: proposed atom refs, validation reports, SMP outputs
+  consistency: eventual unless caller requires review-visible proposed atoms immediately
+
+POST /v1/atoms:commit
+  request payload: proposed atom refs or full atom records, expected_versions, review refs
+  response payload: committed atom refs, graph_version, projection_status
+  consistency: strong
+
+POST /v1/packets:retrieve
+  request payload: MemoryPacketRequest
+  response payload: MemoryPacket
+  consistency: monotonic by default; strong if min_graph_version is provided and reachable
+
+POST /v1/retrieval-outcomes
+  request payload: packet_id, used_item_refs, outcome labels, correction refs
+  response payload: telemetry event refs
+  consistency: eventual
+
+POST /v1/maintenance:request
+  request payload: target_refs, action_type, reason_code, risk_level
+  response payload: maintenance event refs, review requirement, accepted action refs
+  consistency: strong for high-risk actions, eventual for low-risk proposals
+
+POST /v1/deletion-requests
+  request payload: DeletionRequest
+  response payload: tombstone refs, deleted refs, residual_retention report
+  consistency: strong
+
+POST /v1/runtime-state
+  request payload: RuntimeStateSnapshot
+  response payload: accepted snapshot ref, expires_at
+  consistency: eventual unless referenced by a strong commit
+
+POST /v1/self-assessments
+  request payload: SelfAssessmentRecord
+  response payload: assessment ref, recommended memory updates, review requirements
+  consistency: eventual for telemetry, strong for accepted limitation/capability mutations
+
+POST /v1/self-awareness:retrieve
+  request payload: MemoryPacketRequest with target_processor self_awareness
+  response payload: MemoryPacket containing self-model, capabilities, limitations,
+  runtime state, commitments, uncertainties, and evidence refs
+  consistency: monotonic by default; strong when current runtime claims are included
+
+POST /v1/agentic-recall:retrieve
+  request payload: MemoryPacketRequest with retrieval_mode agentic_recall,
+  agentic_recall_subject, agency_attribution_filter, and bias_guardrails
+  response payload: MemoryPacket containing AgenticTrace refs, ActionOutcomeRecord refs,
+  relevant SelfAssessmentRecords, limitations, corrections, external constraints,
+  counterevidence, and optional SelfNarrative generated_view refs
+  consistency: monotonic by default; strong when current runtime claims or active
+  shared-view responsibility overlays are included
+
+POST /v1/shared-views:retrieve
+  request payload: scope, audience, task_context, convergence_policy, budget
+  response payload: SharedMemoryView plus per-agent MemoryPacket refs
+  consistency: monotonic_shared by default
+
+POST /v1/shared-views:refresh
+  request payload: view_id, min_graph_version, audience changes, task_context updates
+  response payload: refreshed SharedMemoryView, invalidated packet refs
+  consistency: same as original convergence_policy
+
+GET /v1/health/memory
+  response payload: memory health metrics by scope, lifecycle_state, health_status, and atom type
+
+GET /v1/health/capacity
+  response payload: CapacityHealthReport
+```
+
+Error codes:
+
+```text
+schema_invalid
+authorization_denied
+scope_denied
+evidence_denied
+idempotency_conflict
+expected_version_conflict
+review_required
+retention_policy_denied
+capacity_limited
+projection_failed
+derived_index_stale
 ```
 
 ### 25.2 Client identity and capabilities
@@ -1897,34 +2868,48 @@ User interface:
   request correction, deletion, pinning, or approval
 ```
 
-### 25.3 Shared write path through MemoryEvents
+### 25.3 Shared write path through EventJournalEntry records
 
 All memory mutations should flow through a structured append-only event stream.
 
 ```text
-MemoryEvent
-  id
-  actor_service
-  actor_agent
-  operation_type
+EventJournalEntry
+  event_id
+  event_type
+  schema_version
+  actor
+  target_refs
   payload
+  payload_refs
+  evidence_refs
   idempotency_key
   causal_parent_ids
-  timestamp
+  expected_versions
   authorization_context
+  occurred_at
+  accepted_at
   result_status
+  projection_status
+  checksum
+  previous_event_hash
 ```
 
-The canonical memory graph is a validated projection of accepted memory events.
+The canonical memory graph is a validated projection of accepted Event Journal entries.
 
 ```text
-MemoryEvents
-  → validation / authorization / reconciliation
-  → Canonical Memory Graph update
-  → derived index update
-  → packet-cache invalidation
-  → publication of change events
+client command
+  -> validate shape
+  -> authorize against scope and capability policy
+  -> check expected_versions and idempotency_key
+  -> append EventJournalEntry
+  -> project canonical graph update
+  -> publish change event
+  -> update derived indexes and packet caches asynchronously
 ```
+
+For strong-consistency operations, append and canonical graph projection must commit atomically from the caller's perspective. Derived indexes, packet caches, and telemetry aggregation may lag but must record the graph version they reflect.
+
+Rejected commands should either return no journal entry or append a `command.rejected` audit event, depending on deployment policy. User correction, deletion, privacy, and high-risk maintenance rejections should be journaled with a redacted reason code.
 
 ### 25.4 Concurrency control
 
@@ -1957,6 +2942,28 @@ Writes should be conditional when they affect existing canonical state:
 update atom X only if version == expected_version
 ```
 
+The `idempotency_key` is scoped to:
+
+```text
+tenant_id
+workspace_id
+actor service_id
+operation_type
+target_refs
+```
+
+Reusing an idempotency key with a different payload is an error. Reusing it with the same payload returns the original result.
+
+Compare-and-swap conflicts should not silently retry for high-risk mutations. They should produce a conflict result that includes:
+
+```text
+target_ref
+expected_version
+actual_version
+conflicting_event_id
+recommended_action: refresh | merge | review | retry
+```
+
 ### 25.5 Consistency levels
 
 Not all memory operations need the same consistency model.
@@ -1967,7 +2974,7 @@ Stronger consistency is required for:
 user corrections
 active preferences
 policy constraints
-goal status
+goal_status changes
 commitments
 procedure promotion
 deletion requests
@@ -1993,6 +3000,28 @@ Canonical memory changes need consistency.
 Derived views can lag.
 ```
 
+Minimum guarantees:
+
+```text
+read-your-writes:
+  a client that successfully commits a strong operation can request a packet at or after that graph_version
+
+monotonic packet reads:
+  a client may ask Amos not to return an older graph_version than a previously observed packet
+
+bounded stale derived views:
+  packet items must disclose when an embedding, summary, or association score was computed from an older graph_version
+
+atomic strong mutation:
+  journal append and canonical graph projection commit together for user corrections,
+  policy constraints, active preferences, commitments, procedure promotion, privacy, and deletion
+
+eventual derived mutation:
+  vector indexes, cache entries, telemetry rollups, and weak association weights may update asynchronously
+```
+
+If Amos is deployed as a cluster, the spec requires one linearizable writer per tenant/workspace shard for strong canonical mutations, or an equivalent consensus mechanism. The deployment may use weaker consistency only for derived artifacts and low-risk telemetry.
+
 ### 25.6 Pub/sub and cache invalidation
 
 Connected services may maintain local caches, but Amos remains authoritative. Amos should publish change events such as:
@@ -2012,7 +3041,7 @@ memory.health.alert
 
 Clients use these events to invalidate local memory packets, active procedure snippets, or retrieved context caches.
 
-### 25.7 Scope isolation
+### 25.7 Scope isolation and authorization model
 
 A shared Amos instance should support explicit scopes:
 
@@ -2028,6 +3057,63 @@ tool environment
 ```
 
 Shared memory does not imply global leakage. Retrieval and mutation should always be evaluated against scope and access policy.
+
+Canonical scope tuple:
+
+```text
+Scope
+  tenant_id
+  workspace_id
+  project_id
+  user_id
+  agent_id
+  session_id
+  task_id
+  tool_environment_id
+```
+
+Scopes are hierarchical for lookup but not for permission by default. A project-scoped atom can be visible to a workspace process only when the atom access policy allows cross-project or workspace-level retrieval.
+
+Access policy shape:
+
+```text
+AccessPolicy
+  owner_scope
+  allowed_identities
+  allowed_capabilities
+  denied_identities
+  denied_capabilities
+  processor_visibility
+  evidence_visibility
+  mutation_policy
+  retention_policy_ref
+  audit_level
+```
+
+Authorization precedence:
+
+```text
+1. explicit denial wins
+2. user deletion/privacy constraint wins over lower-priority retention
+3. compliance/legal hold can prevent physical deletion but not ordinary retrieval suppression
+4. more-specific scope policy overrides less-specific allow rules
+5. high-risk mutation requires both capability and trust_level threshold
+6. read permission does not imply mutation permission
+7. evidence read permission is evaluated separately from atom read permission
+```
+
+Retrieval authorization and mutation authorization are separate checks:
+
+```text
+retrieve_memory_packet:
+  filter candidate atoms, edges, evidence, and rendered fields by access policy
+
+commit_memory_atoms:
+  validate actor capability, target scope, evidence visibility, mutation risk level,
+  expected_versions, and required review status
+```
+
+Every access denial in a packet should be summarized as an omission reason without leaking the denied content.
 
 ### 25.8 Distributed Memory Steward leases
 
@@ -2105,6 +3191,48 @@ maintenance.action_committed
 index.rebuilt
 ```
 
+Canonical stored shape:
+
+```json
+{
+  "event_id": "mev_<ulid>",
+  "event_type": "atom.committed",
+  "schema_version": "amos.event.atom_committed.v1",
+  "actor": {
+    "service_id": "svc:memory_steward",
+    "agent_id": null,
+    "user_id": null
+  },
+  "target_refs": ["atm_<ulid>"],
+  "payload": {
+    "atom_id": "atm_<ulid>",
+    "atom_type": "belief",
+    "atom_version": 1
+  },
+  "payload_refs": [],
+  "evidence_refs": ["evd_<ulid>"],
+  "idempotency_key": "idem_<stable_key>",
+  "causal_parent_ids": ["mev_<parent_ulid>"],
+  "expected_versions": {
+    "atm_<ulid>": 0
+  },
+  "authorization_context": {
+    "tenant_id": "default",
+    "workspace_id": "amos",
+    "capability": "atom.commit",
+    "decision": "allow"
+  },
+  "occurred_at": "<iso_timestamp>",
+  "accepted_at": "<iso_timestamp>",
+  "result_status": "accepted",
+  "projection_status": "projected",
+  "checksum": "sha256:<event_hash>",
+  "previous_event_hash": "sha256:<previous_event_hash>"
+}
+```
+
+`schema_version` is event-type specific. Event migration must preserve event identity, checksum chain verification, and the ability to reconstruct the canonical graph at any retained graph version.
+
 ### 26.2 Raw payloads are not stored inline forever
 
 Journal entries should store compact structured events, payload digests, evidence pointers, checksums, and causal links. Large payloads should live in the Evidence Archive.
@@ -2113,7 +3241,7 @@ Journal entries should store compact structured events, payload digests, evidenc
 event.captured
   event_id: evt_123
   source_type: user_message
-  evidence_pointer: evidence://conversation/session_44/turn_42
+  evidence_pointer: evidence://conversation/<session_id>/turn/<turn_id>
   checksum: ...
   actor: user
   timestamp: ...
@@ -2190,18 +3318,23 @@ The detailed sequence can move to cold storage or be deleted according to policy
 
 ### 26.6 Memory compaction after commit
 
-Committed memory is not permanently hot. It should continue moving through lifecycle states:
+Committed memory is not permanently hot. It should continue moving through lifecycle and health states:
 
 ```text
-candidate
-active
-reinforced
-stale
-redundant
-contradicted
-confounding
-archived
-deleted
+lifecycle_state:
+  proposed
+  active
+  archived
+  tombstoned
+  deleted
+
+health_status:
+  healthy
+  stale
+  redundant
+  contradicted
+  confounding
+  low_utility
 ```
 
 Examples:
@@ -2301,6 +3434,70 @@ tombstoning:
 
 If a user asks Amos to forget a memory, Amos may need to remove the atom, remove derived indexes, and add a tombstone so the same memory is not re-inferred from old evidence.
 
+Deletion workflow:
+
+```text
+1. Accept DeletionRequest through the strong write path.
+2. Authorize requester against owner scope, retention policy, and legal hold.
+3. Classify target records: atoms, edges, evidence, rendered caches, embeddings, telemetry, snapshots, backups.
+4. Apply the strongest allowed action: suppress, archive, tombstone, physical delete, or crypto-shred.
+5. Append deletion/tombstone events.
+6. Reproject canonical graph and purge derived indexes/caches.
+7. Record residual-retention explanation if any audit or legal metadata remains.
+```
+
+Deletion request shape:
+
+```text
+DeletionRequest
+  request_id
+  requester_identity
+  target_refs
+  scope
+  requested_action: forget | delete | crypto_shred
+  reason_code
+  include_evidence
+  include_derived_artifacts
+  prevent_recreation
+  requested_at
+```
+
+Tombstone shape:
+
+```text
+MemoryTombstone
+  tombstone_id
+  target_ref
+  target_type
+  scope
+  deletion_event_id
+  recreation_policy: forbid | require_review | allow_if_new_evidence
+  retained_reason_code
+  redacted_hash
+  expires_at
+```
+
+Backups and cold archives must be covered by a deletion policy:
+
+```text
+hot stores:
+  delete or crypto-shred immediately after successful projection
+
+derived indexes and packet caches:
+  purge before acknowledging strong deletion when feasible; otherwise mark inaccessible and complete purge asynchronously with audit
+
+cold archives:
+  delete, crypto-shred, or mark for expiry according to retention policy
+
+snapshots:
+  rebuild without deleted payloads or store encrypted payloads so key deletion makes them unrecoverable
+
+backups:
+  either support targeted deletion/crypto-shredding or document maximum residual retention window
+```
+
+Evidence cannot be used to regenerate a deleted atom when `prevent_recreation` is true. If compliance policy prevents physical removal of evidence, Amos must suppress ordinary retrieval and keep only the minimum audit metadata needed to explain residual retention.
+
 ### 26.10 Scalability principle
 
 ```text
@@ -2322,7 +3519,7 @@ whether evidence was compacted
 which atoms were demoted
 whether indexes were rebuilt
 whether more capacity has been requested
-whether Amos is operating under pressure
+which storage action Amos will take next
 ```
 
 Agents should keep using the same memory contract:
@@ -2333,6 +3530,8 @@ retrieve_memory_packet(...)
 propose_memory(...)
 record_outcome(...)
 ```
+
+Agents do need to know when a returned packet is degraded. Capacity pressure is therefore reported as packet metadata, not as a burden to choose deletion, compaction, or storage expansion actions.
 
 ### 27.1 Capacity Governor
 
@@ -2376,6 +3575,34 @@ AmosCapacityContract
   admin_notification_policy
 ```
 
+Each budget entry should specify:
+
+```text
+CapacityBudget
+  scope
+  tier
+  soft_limit_bytes
+  hard_limit_bytes
+  max_growth_bytes_per_day
+  max_objects
+  minimum_retention_window
+  pressure_mode_overrides
+  enforcement_action
+```
+
+Recommended enforcement actions:
+
+```text
+warn
+raise_thresholds
+compact
+archive
+freeze_low_value_promotion
+reject_noncritical_candidates
+drop_disposable_cache
+request_expansion
+```
+
 Capacity should be tracked separately by storage tier:
 
 ```text
@@ -2409,28 +3636,53 @@ Amos should act before crisis.
 
 ```text
 Green:
-  normal operation
+  normal operation; tier usage < 70% and projected exhaustion >= 30 days
 
 Yellow:
-  light pressure; increase compaction, prune caches, aggregate telemetry
+  light pressure; any tier usage >= 70% or projected exhaustion < 30 days;
+  increase compaction, prune caches, aggregate telemetry
 
 Orange:
-  serious pressure; generate admin capacity extension request, compact older segments,
+  serious pressure; any tier usage >= 85% or projected exhaustion < 14 days;
+  generate admin capacity extension request, compact older segments,
   archive stale evidence, raise promotion thresholds
 
 Red:
-  critical pressure; aggressive compaction, freeze low-value promotions, demote stale
-  memory, delete expired evidence, prune disposable derived indexes
+  critical pressure; any tier usage >= 95% or projected exhaustion < 3 days;
+  aggressive compaction, freeze low-value promotions, demote stale memory,
+  delete expired evidence, prune disposable derived indexes
 
 Black:
-  emergency preservation mode; protect core canonical state and critical memory,
+  emergency preservation mode; any tier usage >= 98%, hard limit would be exceeded,
+  or writes are failing; protect core canonical state and critical memory,
   suspend non-critical indexing, drop disposable caches, capture minimal correctness records
 ```
+
+Defaults are per storage tier and may be overridden by deployment policy. Predictive thresholds use recent growth rate, minimum observed retention windows, and configured business-hours notification windows.
 
 Memory quality should degrade gracefully:
 
 ```text
 storage pressure → controlled compaction → reduced recall depth → preserved core memory
+```
+
+Packet degradation contract:
+
+```text
+Green:
+  full configured retrieval depth
+
+Yellow:
+  same canonical recall, reduced evidence detail or cache retention allowed
+
+Orange:
+  reduced recall depth allowed; packet must include pressure_degraded omission reasons
+
+Red:
+  only high-confidence/high-utility memory and critical conflicts guaranteed
+
+Black:
+  only policy-critical, active commitment, and correctness-critical memory guaranteed
 ```
 
 not:
@@ -2689,6 +3941,46 @@ validate structured memory against schemas
 
 The SMP outputs scores, labels, clusters, candidate links, reason codes, and candidate actions. It does not rewrite canonical memory as free-form prose.
 
+SMP outputs are advisory unless a policy rule explicitly allows autonomous execution.
+
+```text
+Autonomous low-risk actions:
+  update utility counters
+  add weak candidate link
+  mark proposed atom as underspecified
+  prune disposable packet cache
+
+Autonomous medium-risk actions only with high confidence and reversible journal entry:
+  archive low-utility proposed atom
+  mark atom stale
+  propose duplicate merge without deleting originals
+
+Review-required actions:
+  alter user preference
+  promote procedure to active
+  mark active belief contradicted
+  merge active atoms destructively
+  delete or tombstone any canonical record
+  change access policy or retention class
+```
+
+Reason-code families:
+
+```text
+shape_invalid
+scope_too_broad
+scope_too_narrow
+near_duplicate
+contradiction_candidate
+stale_by_age
+stale_by_external_change
+low_retrieval_utility
+confounding_after_correction
+privacy_risk
+capacity_pressure
+policy_required
+```
+
 ### 28.3 Shape validation
 
 Amos can use shape-style constraints to detect incoherent memory without an LLM.
@@ -2697,10 +3989,11 @@ Examples:
 
 ```text
 MemoryAtom must have evidence_refs.
-PreferenceAtom must have holder, target, scope, confidence.
-ProcedureAtom must have trigger_context and version.
+MemoryAtom must have confidence, scope, lifecycle_state, health_status, and retention_class.
+PreferenceAtom payload must have holder, polarity, target, applicability_scope, strength.
+ProcedureAtom payload must have trigger_context and steps.
 AssociationEdge must have source_id, target_id, type, weight.
-High-risk memories must have review_status.
+High-risk mutations must pass authorization and review gates before commit.
 ```
 
 This catches malformed, underspecified, orphaned, or overgeneralized memory early.
@@ -2790,7 +4083,7 @@ Amos must survive when no LLM is available.
    Execute low-risk action or propose medium-risk action.
 
 4. Ambiguous but low value?
-   Archive, demote, or keep candidate.
+   Archive, demote, or keep as proposed.
 
 5. Ambiguous and high value?
    Request admin/user review.
@@ -2841,30 +4134,470 @@ utility scoring. Generative LLM calls are optional escalation paths only.
 
 ---
 
-## 29. Open design questions
+## 29. V1 implementation baseline
 
-1. What is the minimum viable atom schema that avoids overengineering?
-2. What exact JSON Schema, Protobuf, or equivalent schema definition should represent each atom payload type?
-3. Which fields belong in the common atom envelope versus type-specific payloads?
-4. How should normalized entity, relation, enum, and concept identifiers be minted, versioned, and compacted?
-5. What is the first physical storage mapping: JSONB tables, graph database, RDF/quads, Protobuf event stream, or a hybrid?
-6. How should confidence be represented: scalar, categorical, or evidence-based vector?
-7. How should retrieval diversity be enforced across memory types?
-8. What maintenance actions require user confirmation?
-9. How should privacy and retention policies interact with evidence preservation?
-10. How should contradictory memories be rendered to the reasoner?
-11. How much procedural memory should be executable versus advisory?
-12. What is the right promotion threshold for preferences inferred from behavior rather than explicit instruction?
-13. How should memories be shared across multiple agents without contaminating individual agent context?
-14. How should generated English summaries be tested for drift against canonical atoms?
-15. What is the minimum viable service API for a distributed Amos instance?
-16. Which memory operations require strong consistency versus eventual consistency?
-17. How should scope budgets be allocated across tenants, workspaces, projects, agents, and storage tiers?
-18. What should the default watermark thresholds be for normal, pressure, critical, and preservation modes?
-19. Which retention classes should be user-configurable, admin-configurable, or system-defined?
-20. What compact journal rollup format preserves enough auditability without retaining all raw events hot?
-21. What subset of semantic maintenance can be handled by non-generative processors in the first implementation?
-22. When should Amos escalate from the Semantic Maintenance Processor to admin/user review or an optional LLM reviewer?
+The v1 implementation should use the following concrete defaults. These choices are intentionally conservative: they favor auditability, replay, schema validation, and simple operations over maximum scale.
+
+### 29.1 Authoritative schema format
+
+V1 uses JSON Schema 2020-12 as the authoritative schema format.
+
+```text
+authoritative schemas:
+  JSON Schema 2020-12
+
+canonical interchange:
+  JSON-compatible records
+
+generated code:
+  allowed for application models, validators, and API clients
+
+schema compatibility:
+  additive optional fields are minor-compatible
+  required-field changes require a new schema_version
+  semantic changes require a new schema_version
+```
+
+Generated Protobuf, Avro, or typed language models may be produced from the JSON Schemas later, but they are derived artifacts in v1.
+
+### 29.2 Storage backend
+
+V1 storage target:
+
+```text
+primary database:
+  Postgres
+
+canonical graph:
+  normalized relational columns + JSONB payloads
+
+event journal:
+  Postgres append-only event_journal table
+
+evidence archive:
+  filesystem or object storage referenced by EvidenceRecord.source_ref
+
+derived vector index:
+  Postgres pgvector if available, otherwise a replaceable external vector index
+
+packet cache:
+  Postgres table or Redis-compatible cache keyed by graph_version and request signature
+```
+
+The first implementation must keep vector indexes, packet caches, generated summaries, and telemetry rollups rebuildable from canonical records and retained evidence.
+
+### 29.3 Deployment topology
+
+V1 strong-writer topology:
+
+```text
+one Postgres primary writer per tenant/workspace shard
+serializable or repeatable-read transactions for strong canonical mutations
+row-level expected_version checks for atoms and edges
+unique constraints for idempotency keys
+transactional outbox for pub/sub events
+async workers for derived indexes and packet cache refresh
+```
+
+Cluster consensus, multi-primary writes, and cross-region active-active replication are post-v1 concerns. V1 may use read replicas for retrieval only when packets disclose graph version and derived-index freshness.
+
+### 29.4 Initial ontology governance
+
+V1 ships with a small relation and entity-type dictionary.
+
+Seed entity types:
+
+```text
+user
+agent
+service
+project
+workspace
+tool
+file
+document
+concept
+policy
+procedure
+task
+environment
+capability
+limitation
+runtime_state
+self_assessment
+agentic_trace
+action_outcome
+self_narrative
+organization
+```
+
+Seed relation IDs:
+
+```text
+rel:prefers
+rel:avoids
+rel:requires
+rel:forbids
+rel:working_on
+rel:owns
+rel:uses
+rel:depends_on
+rel:supports
+rel:contradicts
+rel:supersedes
+rel:derived_from
+rel:applies_to
+rel:caused_by
+rel:similar_to
+rel:part_of
+rel:has_capability
+rel:has_limitation
+rel:currently_available
+rel:currently_denied
+rel:made_commitment
+rel:satisfied_commitment
+rel:miscalibrated_on
+rel:decided
+rel:acted_on
+rel:produced_outcome
+rel:corrected_by
+rel:constrained_by
+rel:attributed_to
+rel:shared_responsibility_for
+```
+
+Dictionary update policy:
+
+```text
+system-defined relation:
+  added only through schema/dictionary migration
+
+tenant-defined relation:
+  allowed only for tenant admins
+
+agent-defined relation:
+  not allowed in v1; agents may propose relation candidates for review
+
+deprecated relation:
+  remains resolvable while retained records reference it
+```
+
+### 29.5 Default retrieval weights
+
+V1 activation score starts with transparent hand-tuned weights. Implementations should normalize each score component to `0.0..1.0`, multiply by the configured weight, subtract penalties, then clamp the final score to `0.0..1.0`.
+
+```text
+direct_cue_match: 0.22
+semantic_similarity: 0.14
+edge_activation: 0.12
+recency: 0.08
+confidence: 0.12
+utility: 0.12
+salience: 0.08
+goal_relevance: 0.08
+procedural_applicability: 0.04
+
+contradiction_penalty: -0.30
+staleness_penalty: -0.18
+access_penalty: suppress
+redundancy_penalty: -0.15
+confounding_penalty: suppress unless explicitly requested
+```
+
+Agentic recall ranking profile additions:
+
+```text
+agency_match: 0.16
+attribution_confidence: 0.12
+correction_learning_relevance: 0.10
+
+over_attribution_penalty: -0.25
+omitted_counterevidence_penalty: -0.25
+ignored_failure_penalty: -0.20
+```
+
+When the `agentic_recall` profile is active, positive weights must be renormalized so agency-related cues do not crowd out scope, evidence, contradiction, and current-runtime constraints.
+
+Calibration loop:
+
+```text
+1. Start with default weights.
+2. Log score_components and retrieval outcomes.
+3. Review failures where correction_after_use_count increases.
+4. Tune weights by offline replay fixtures before changing production defaults.
+5. Version ranking profiles as ranker_profile_id.
+```
+
+### 29.6 Default packet budgets
+
+V1 default packet budgets:
+
+```text
+reasoner:
+  max_items: 24
+  token_budget: 6000
+  include_conflicts: true
+  include_provenance: compact
+
+planner:
+  max_items: 20
+  token_budget: 4500
+  include goals, commitments, constraints, procedures
+
+executor:
+  max_items: 16
+  token_budget: 3500
+  include procedures, permissions, tool constraints, recovery notes
+
+critic:
+  max_items: 32
+  token_budget: 8000
+  include evidence refs, conflicts, retrieval telemetry, health flags
+
+steward:
+  max_items: 64
+  token_budget: 12000
+  include maintenance history, health candidates, graph neighborhoods
+
+self_awareness:
+  max_items: 32
+  token_budget: 6000
+  include self-model, current runtime state, capabilities, limitations,
+  open commitments, uncertainties, recent errors, and evidence refs
+
+shared_coordination:
+  max_items: 48
+  token_budget: 9000
+  include shared goals, commitments, constraints, common assumptions,
+  conflicts, audience, ownership, and per-agent overlay refs
+
+agentic_recall:
+  max_items: 40
+  token_budget: 7000
+  include agentic traces, action outcomes, corrections, limitations,
+  external constraints, attribution counterevidence, and optional SelfNarrative refs
+```
+
+Packets must enforce both item and token/byte budgets. If budget limits suppress relevant material, the packet must include `budget_exhausted` in `omissions`.
+
+### 29.7 Retention control defaults
+
+Retention-class authority:
+
+```text
+ephemeral:
+  system-controlled
+
+session:
+  system-controlled with user-visible deletion
+
+recent:
+  system-controlled with admin-configurable TTL
+
+project:
+  admin-configurable
+
+durable:
+  user-configurable or admin-configurable, depending on owner scope
+
+compliance:
+  compliance-controlled; cannot be shortened by agents
+
+user_pinned:
+  user-controlled unless compliance/legal policy forbids retention
+```
+
+Default retention windows:
+
+```text
+ephemeral:
+  minutes to 24 hours
+
+session:
+  until session close plus configured grace period
+
+recent:
+  30 to 90 days
+
+project:
+  life of project plus configured archive period
+
+durable:
+  indefinite until corrected, deleted, or superseded
+
+compliance:
+  deployment policy
+
+user_pinned:
+  indefinite until user unpins or deletes
+```
+
+### 29.8 Backup and deletion default
+
+V1 backup policy:
+
+```text
+hot database:
+  targeted delete or tombstone immediately through strong write path
+
+evidence archive:
+  encrypt evidence objects by tenant/workspace key where feasible
+
+snapshots:
+  store deleted-sensitive payloads encrypted or rebuild snapshots after deletion
+
+offline backups:
+  maximum residual retention window: 30 days
+
+crypto-shredding:
+  delete tenant/workspace/object key to make encrypted evidence unrecoverable
+```
+
+If a deployment cannot support targeted deletion from offline backups, it must disclose the maximum residual retention window and prevent restored backups from reintroducing deleted memories without replaying deletion events.
+
+### 29.9 Journal rollup format
+
+V1 compacted journal rollup shape:
+
+```text
+CompactedJournalSegment
+  segment_id
+  schema_version
+  tenant_id
+  workspace_id
+  covers_event_ids
+  covers_event_range
+  start_graph_version
+  end_graph_version
+  resulting_atom_refs
+  resulting_edge_refs
+  tombstone_refs
+  evidence_rollup_refs
+  aggregate_counters
+  policy_decisions
+  checksum_chain_start
+  checksum_chain_end
+  created_at
+  created_by
+```
+
+Rollups are audit accelerators, not replacements for deletion policy. If raw events are deleted or shredded, the rollup must not retain forbidden payload content.
+
+### 29.10 V1 evaluation suite
+
+Implementation must include deterministic fixtures for:
+
+```text
+schema validation:
+  reject payloads that duplicate envelope fields
+
+journal projection:
+  replay atom commit, update, merge, archive, tombstone, delete
+
+idempotency:
+  same key and same payload returns same result; same key and different payload fails
+
+CAS conflict:
+  stale expected_version produces conflict result
+
+scope isolation:
+  project A cannot retrieve project B memory without explicit policy
+
+evidence visibility:
+  atom can be visible while evidence detail is denied
+
+retrieval ranking:
+  scoped preference beats generic preference
+
+contradiction rendering:
+  contradicted memories appear only with conflict context
+
+self-awareness retrieval:
+  stale capability is suppressed when runtime state says unavailable
+
+agentic recall attribution:
+  an agent retrieves its own traces and outcomes, while another agent's actions
+  appear only as other_agent or shared_system responsibility
+
+agentic recall balance:
+  successes, failures, blocked actions, corrections, limitations, and external
+  constraints are represented when relevant to the self-claim
+
+self-narrative drift:
+  generated SelfNarrative expires or rebuilds after contrary AgenticTrace,
+  ActionOutcomeRecord, or SelfAssessmentRecord evidence
+
+shared-view convergence:
+  reasoner, planner, and executor receive the same common goal and constraint refs
+  at the same graph_version, with different role overlays
+
+shared-view access filtering:
+  an agent without evidence permission sees an omission reason while another
+  authorized agent sees the evidence ref in its overlay
+
+self-report calibration:
+  claimed capability without successful verification increases overconfident_claim_rate
+
+commitment tracking:
+  open commitment appears in self-awareness packet until fulfilled, cancelled, or superseded
+
+deletion:
+  deleted atom is absent from packets, indexes, caches, and replayed graph
+
+tombstone prevention:
+  deleted memory is not recreated from old evidence when recreation_policy forbids it
+
+capacity degradation:
+  orange/red pressure reduces recall and marks packet degradation
+
+SMP authority:
+  high-risk SMP recommendation requires review before mutation
+```
+
+### 29.11 Procedural memory execution policy
+
+V1 procedural memory is advisory by default.
+
+```text
+advisory procedure:
+  can be rendered to reasoner, planner, or executor as guidance
+
+executable procedure:
+  requires explicit approval, tool permission binding, precondition schema,
+  rollback/recovery plan, and review_status approved
+
+autonomous execution:
+  not allowed in v1 for procedures that change external state
+```
+
+The executor may use procedures to choose actions only within its existing tool permissions and policy constraints.
+
+### 29.12 LLM reviewer default
+
+V1 LLM reviewer default:
+
+```text
+enabled_by_default:
+  false
+
+allowed_when_enabled:
+  ambiguous atomization
+  scope refinement suggestions
+  contradiction analysis suggestions
+  natural-language explanation drafting
+
+forbidden:
+  direct canonical mutation
+  deletion approval
+  access-policy change
+  autonomous preference alteration
+```
+
+LLM reviewer output must use the same SMP output envelope: `processor_id`, `processor_version`, `input_refs`, `output_type`, `confidence`, `reason_code`, `evidence_refs`, `recommended_action`, and `risk_level`.
+
+### 29.13 Post-v1 extension points
+
+Post-v1 work may revisit storage backends, multi-primary replication, learned ranking, generated Protobuf or Avro artifacts, executable procedures, and default LLM-review workflows. Those changes must preserve the v1 journal, replay, deletion, authorization, and packet contracts unless a versioned migration explicitly replaces them.
 
 ---
 
@@ -2884,7 +4617,7 @@ Design the minimal logical schema, canonical interchange encoding, and first phy
 MemoryAtom envelope
 typed atom payloads
 Entity
-Event
+SourceEvent
 BeliefAtom
 PreferenceAtom
 Goal
@@ -2959,7 +4692,7 @@ Specify:
 ```text
 shared Amos instance contract
 client identities and capabilities
-MemoryEvent write path
+EventJournalEntry write path
 concurrency and consistency model
 pub/sub and cache invalidation
 scope isolation
@@ -3013,8 +4746,9 @@ optional LLM escalation policy
 Only after the design is stable, begin implementation planning:
 
 ```text
-storage backend candidates
-schema format
+Postgres migration sequence
+JSON Schema artifact layout
+generated validator/client layout
 indexing strategy
 service API surface
 maintenance scheduler
@@ -3025,7 +4759,119 @@ retrieval/ranking experiments
 
 ---
 
-## 31. Current design principle
+## 31. Implementation artifact checklist
+
+The v1 implementation should produce these concrete repository artifacts from the contracts above:
+
+```text
+schema artifacts:
+  MemoryAtom envelope schema
+  typed payload schemas
+  SourceEvent schema
+  EvidenceRecord schema
+  AssociationEdge schema
+  EventJournalEntry schema
+  MemoryPacketRequest and MemoryPacket schemas
+  SharedMemoryView schema
+  SelfModelAtom, CapabilityAtom, LimitationAtom schemas
+  RuntimeStateSnapshot and SelfAssessmentRecord schemas
+  AgenticTrace, ActionOutcomeRecord, and SelfNarrative schemas
+  AccessPolicy and Scope schemas
+  DeletionRequest and MemoryTombstone schemas
+  CapacityBudget and CapacityHealthReport schemas
+  SMP output schema
+
+storage artifacts:
+  event_journal migration
+  atoms migration
+  edges migration
+  evidence metadata migration
+  tombstones migration
+  packet cache metadata migration
+  derived index metadata migration
+
+service artifacts:
+  capture_event endpoint
+  propose_memory_atoms endpoint
+  commit_memory_atoms endpoint
+  retrieve_memory_packet endpoint
+  record_retrieval_outcome endpoint
+  request_maintenance endpoint
+  deletion endpoint
+  runtime-state endpoint
+  self-assessments endpoint
+  self-awareness retrieval endpoint
+  agentic-recall retrieval endpoint
+  shared-view retrieval and refresh endpoints
+  capacity health endpoint
+
+worker artifacts:
+  journal projector
+  index maintainer
+  packet cache invalidator
+  capacity governor
+  memory steward
+  self-model calibrator
+  agentic recall auditor
+  SMP worker
+```
+
+Required v1 acceptance gates:
+
+```text
+schema gate:
+  payloads cannot duplicate envelope-only fields such as evidence_refs, confidence,
+  lifecycle_state, health_status, retention_class, or access_policy
+
+journal gate:
+  every canonical mutation is represented by an EventJournalEntry with idempotency,
+  authorization context, expected_versions, checksum, and projection status
+
+projection gate:
+  strong mutations atomically append journal entries and project canonical graph changes
+
+replay gate:
+  canonical graph can be reconstructed from latest snapshot plus retained journal events
+
+retrieval gate:
+  every MemoryPacket includes graph_version, provenance, omissions, degradation, and item score components
+
+self-awareness gate:
+  self-awareness packets distinguish durable self-knowledge from volatile runtime state,
+  suppress stale capability claims, and include evidence for capabilities and limitations
+
+agentic recall gate:
+  agentic recall packets distinguish self, other-agent, shared-system, external,
+  and unknown responsibility; include successes, failures, corrections, limitations,
+  blocked actions, and material counterevidence for self-claims; and treat
+  SelfNarratives as generated artifacts only
+
+shared-memory gate:
+  multiple agents in one Amos instance can retrieve the same common memory view
+  at the same graph_version while receiving identity-specific overlays and omissions
+
+authorization gate:
+  retrieval and mutation enforce scope, access policy, capability, trust level, and evidence visibility independently
+
+deletion gate:
+  deletion requests purge or suppress atoms, edges, evidence, derived indexes, caches, snapshots,
+  and backups according to deletion policy, and tombstones prevent disallowed recreation
+
+capacity gate:
+  pressure modes are computed per tier and degraded packets disclose reduced recall or omitted evidence
+
+SMP gate:
+  non-generative processors can recommend actions, but high-risk mutations require authorization and review
+
+observability gate:
+  health, capacity, projection lag, index freshness, deletion residuals, and retrieval outcomes are reportable
+```
+
+The first implementation should not claim Amos correctness until these gates are exercised by automated tests or deterministic replay fixtures.
+
+---
+
+## 32. Current design principle
 
 Amos should provide a shared, layered, associative, self-maintaining memory operating plane for agentic AI systems.
 
@@ -3033,9 +4879,11 @@ It should support:
 
 ```text
 multiple agent services connected to one authoritative Amos instance
+shared memory view with individual agent self-models
 evidence preservation and compact canonical memory
 controlled consolidation and compaction
 cross-category linking and cross-tier promotion/demotion
+trace-backed agentic recall and generated self-narratives
 auditable maintenance and repair
 capacity governance under explicit budgets
 admin-facing capacity extension requests
