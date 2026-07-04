@@ -97,9 +97,19 @@ DEFAULT_MEMORY_POLICY = {
             "authority": "draft_only",
         },
     },
+    "decay": {
+        "enabled": True,
+        "max_atoms": 256,
+        "require_atom_policy": True,
+        "mark_stale_after_seconds": None,
+        "archive_after_seconds": None,
+        "low_utility_threshold": None,
+    },
 }
 SEARCH_INDEX_REF = "amos.v1.search"
+SEARCH_INDEX_SCHEMA = "amos.v1.search.payload_values"
 ATTENTION_POLICY_ID = "amos.v1.attention.default"
+RETRIEVAL_RECENCY_HORIZON_SECONDS = 30 * 24 * 60 * 60
 RETRIEVAL_WEIGHTS = {
     "direct_cue_match": 0.22,
     "semantic_similarity": 0.14,
@@ -111,9 +121,10 @@ RETRIEVAL_WEIGHTS = {
     "scope_specificity": 0.06,
     "goal_relevance": 0.08,
     "procedural_applicability": 0.04,
-    "attention_focus": 0.18,
+    "attention_focus": 0.14,
     "attention_type_boost": 0.08,
     "attention_counterevidence": 0.08,
+    "attention_novelty": 0.05,
     "attention_suppression_penalty": -0.20,
     "contradiction_penalty": -0.30,
     "staleness_penalty": -0.18,
@@ -245,6 +256,7 @@ class Amos:
         maintenance: Mapping[str, Any] | None = None,
         distillation: Mapping[str, Any] | None = None,
         maintenance_distiller: Mapping[str, Any] | None = None,
+        decay: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         policy = self.memory_policy()
         if enabled is not None:
@@ -263,6 +275,8 @@ class Amos:
                 **policy["maintenance_distiller"],
                 **dict(maintenance_distiller),
             }
+        if decay is not None:
+            policy["decay"] = {**policy["decay"], **dict(decay)}
         policy = self._normalize_memory_policy(policy)
         self.store.set_meta("memory_policy", canonical_json(policy))
         return {
@@ -300,18 +314,40 @@ class Amos:
             + " "
             + str(atom.get("type") or "")
             + " "
-            + canonical_json(atom.get("payload", {}))
+            + self._search_text_for_value(atom.get("payload", {}))
         ).lower()
+
+    def _search_text_for_value(self, value: Any) -> str:
+        if value in (None, "", [], {}):
+            return ""
+        if isinstance(value, Mapping):
+            return " ".join(
+                part
+                for item in value.values()
+                if (part := self._search_text_for_value(item))
+            )
+        if isinstance(value, (list, tuple, set)):
+            return " ".join(
+                part
+                for item in value
+                if (part := self._search_text_for_value(item))
+            )
+        return str(value)
 
     def _search_index_for_atom(self, atom: Mapping[str, Any]) -> dict[str, Any]:
         text = self._search_text_for_atom(atom)
-        tokens = sorted({token for token in re.findall(r"[a-z0-9_]+", text) if token})
+        raw_tokens = {token for token in re.findall(r"[a-z0-9_]+", text) if token}
+        tokens = set(raw_tokens)
+        for token in raw_tokens:
+            tokens.update(part for part in token.split("_") if part)
+        tokens = sorted(tokens)
         return {
             "text": text,
             "tokens": tokens,
             "vector": self.smp.encode(text),
             "processor_id": self.smp.processor_id,
             "processor_version": self.smp.processor_version,
+            "search_schema": SEARCH_INDEX_SCHEMA,
         }
 
     def _attach_search_index(self, atom: Mapping[str, Any]) -> dict[str, Any]:
@@ -329,7 +365,13 @@ class Amos:
                 text = stored.get("text")
                 tokens = stored.get("tokens")
                 vector = stored.get("vector")
-                if isinstance(text, str) and isinstance(tokens, list) and isinstance(vector, list):
+                search_schema = stored.get("search_schema")
+                if (
+                    search_schema == SEARCH_INDEX_SCHEMA
+                    and isinstance(text, str)
+                    and isinstance(tokens, list)
+                    and isinstance(vector, list)
+                ):
                     return {
                         "text": text,
                         "tokens": [str(token) for token in tokens],
@@ -411,6 +453,19 @@ class Amos:
                         + [action.get("kept"), action.get("archived")]
                         if ref
                     )
+
+            decay = policy["decay"]
+            if decay["enabled"]:
+                results["decay"] = self._run_decay_policy(
+                    decay=decay,
+                    scope=scope,
+                    actor=actor,
+                )
+                target_refs.extend(
+                    action["atom_ref"]
+                    for action in results["decay"].get("actions", [])
+                    if action.get("atom_ref")
+                )
 
             if policy["distillation"]["enabled"]:
                 results["distillation"] = self._run_policy_distillation(
@@ -1097,14 +1152,31 @@ class Amos:
         lifecycle_states = ["active", "proposed"]
         if include_archived:
             lifecycle_states.append("archived")
+        cue_text = " ".join(request["cues"]).lower()
+        cue_tokens = {token for token in re.findall(r"[a-z0-9_]+", cue_text) if token}
+        candidate_atom_ids = self._indexed_retrieval_candidates(
+            cue_tokens=cue_tokens,
+            attention_policy=attention_policy,
+        )
         atoms = self.store.list_atoms_filtered(
             types=sorted(allowed_types) if allowed_types else None,
             lifecycle_states=lifecycle_states,
+            atom_ids=candidate_atom_ids,
         )
         edge_degrees = self.store.edge_degree_counts()
-        cue_text = " ".join(request["cues"]).lower()
-        cue_tokens = {token for token in re.findall(r"[a-z0-9_]+", cue_text) if token}
         cue_vector = self.smp.encode(cue_text) if cue_text else []
+        edge_activation_scores = self._graph_activation_scores(
+            atoms,
+            cues=request["cues"],
+            request_scope=request["scope"],
+            requester=requester,
+            target_processor=target_processor,
+            include_conflicts=bool(include_conflicts),
+            include_low_health=bool(include_low_health),
+            cue_text=cue_text,
+            cue_tokens=cue_tokens,
+            attention_policy=attention_policy,
+        )
         for atom in atoms:
             atom_ref = atom["id"]
             if atom.get("deleted"):
@@ -1133,6 +1205,7 @@ class Amos:
                 cue_tokens=cue_tokens,
                 cue_vector=cue_vector,
                 edge_degrees=edge_degrees,
+                edge_activation_scores=edge_activation_scores,
                 attention_policy=attention_policy,
             )
             if request["cues"] and not matched:
@@ -1244,9 +1317,157 @@ class Amos:
         outcome: Mapping[str, Any],
     ) -> dict[str, Any]:
         with self.store.transaction() as conn:
-            return self.store.insert_retrieval_outcome(
+            record = self.store.insert_retrieval_outcome(
                 conn, packet_id=packet_id, request=request, outcome=outcome
             )
+            if record.get("status") != "recorded":
+                return record
+            feedback = self._apply_retrieval_outcome_feedback(
+                conn,
+                packet_id=packet_id,
+                request=request,
+                outcome=outcome,
+            )
+            if feedback["updated_atoms"]:
+                event = self.store.append_event(
+                    conn,
+                    event_type="retrieval_outcome_recorded",
+                    actor=str(request.get("requester") or "system"),
+                    payload={
+                        "operation": "record_retrieval_outcome",
+                        "packet_id": packet_id,
+                        "outcome_id": record["outcome_id"],
+                        "feedback": feedback,
+                        "projected_atoms": feedback["projected_atoms"],
+                    },
+                    target_refs=feedback["updated_atom_refs"],
+                )
+                self.store.clear_packet_cache(conn)
+                record["event"] = event
+            record["feedback"] = feedback
+            return record
+
+    def _apply_retrieval_outcome_feedback(
+        self,
+        conn: Any,
+        *,
+        packet_id: str,
+        request: Mapping[str, Any],
+        outcome: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        del packet_id, request
+        positive_refs, correction_refs = self._retrieval_outcome_atom_refs(outcome)
+        label = str(outcome.get("label") or outcome.get("status") or "").lower()
+        negative_label = label in {
+            "bad",
+            "wrong",
+            "unused",
+            "unhelpful",
+            "misleading",
+            "corrected",
+            "correction",
+            "failed",
+            "failure",
+        }
+        now = utc_now()
+        updated_atoms: list[dict[str, Any]] = []
+        projected_atoms: list[dict[str, Any]] = []
+        for atom_ref in sorted(positive_refs.union(correction_refs)):
+            atom = self.store.get_atom(atom_ref)
+            if atom is None or atom.get("deleted"):
+                continue
+            changed = dict(atom)
+            telemetry = dict(changed.get("decay_policy") or {}).get(
+                "retrieval_telemetry", {}
+            )
+            telemetry = dict(telemetry) if isinstance(telemetry, Mapping) else {}
+            used_count = int(telemetry.get("used_count", 0) or 0)
+            correction_count = int(telemetry.get("correction_count", 0) or 0)
+            if atom_ref in positive_refs:
+                used_count += 1
+            if atom_ref in correction_refs or negative_label:
+                correction_count += 1
+            delta = 0.0
+            if atom_ref in positive_refs and not negative_label:
+                delta += 0.03
+            if atom_ref in correction_refs or negative_label:
+                delta -= 0.06
+            changed["utility"] = max(0.0, min(1.0, float(changed["utility"]) + delta))
+            if atom_ref in positive_refs and not negative_label:
+                changed["salience"] = max(
+                    0.0, min(1.0, float(changed["salience"]) + 0.02)
+                )
+            if changed["utility"] < 0.25 and changed["health_status"] == "healthy":
+                changed["health_status"] = "low_utility"
+            telemetry.update(
+                {
+                    "used_count": used_count,
+                    "correction_count": correction_count,
+                    "last_outcome_label": label or None,
+                    "last_outcome_at": now,
+                }
+            )
+            changed["decay_policy"] = {
+                **dict(changed.get("decay_policy") or {}),
+                "retrieval_telemetry": telemetry,
+            }
+            changed["last_accessed"] = now
+            changed["updated_at"] = now
+            changed["version"] = int(changed["version"]) + 1
+            changed = normalize_atom(self._attach_search_index(changed), require_id=True)
+            self.store.replace_atom(conn, changed)
+            projected_atoms.append(changed)
+            updated_atoms.append(
+                {
+                    "atom_ref": atom_ref,
+                    "utility": changed["utility"],
+                    "salience": changed["salience"],
+                    "health_status": changed["health_status"],
+                    "used_count": used_count,
+                    "correction_count": correction_count,
+                }
+            )
+        return {
+            "updated_atom_refs": [item["atom_ref"] for item in updated_atoms],
+            "updated_atoms": updated_atoms,
+            "projected_atoms": projected_atoms,
+            "positive_refs": sorted(positive_refs),
+            "correction_refs": sorted(correction_refs),
+        }
+
+    def _retrieval_outcome_atom_refs(
+        self, outcome: Mapping[str, Any]
+    ) -> tuple[set[str], set[str]]:
+        positive: set[str] = set()
+        corrections: set[str] = set()
+
+        def add_refs(target: set[str], value: Any) -> None:
+            if isinstance(value, str):
+                if value:
+                    target.add(value)
+            elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                for item in value:
+                    add_refs(target, item)
+
+        for key in (
+            "used_item_refs",
+            "used_atom_refs",
+            "cited_atom_refs",
+            "selected_item_refs",
+            "helpful_atom_refs",
+        ):
+            add_refs(positive, outcome.get(key))
+        add_refs(positive, outcome.get("cited_atom_ref"))
+        add_refs(positive, outcome.get("used_atom_ref"))
+        for key in (
+            "correction_refs",
+            "corrected_atom_refs",
+            "misleading_atom_refs",
+            "unhelpful_atom_refs",
+        ):
+            add_refs(corrections, outcome.get(key))
+        add_refs(corrections, outcome.get("corrected_atom_ref"))
+        return positive, corrections
 
     def distill_memories(
         self,
@@ -2190,6 +2411,9 @@ class Amos:
                         if not auto_commit_low_risk
                         else "requires_review_or_unsupported_action",
                         "source_refs": proposal["source_refs"],
+                        "proposal_digest": self._maintenance_proposal_fingerprint(
+                            proposal
+                        ),
                     }
                 )
 
@@ -2755,7 +2979,12 @@ class Amos:
                         edges.pop(edge["edge_id"], None)
                     else:
                         edges[edge["edge_id"]] = edge
-            elif event_type in {"atom_merged", "steward_run"}:
+            elif event_type in {
+                "atom_merged",
+                "steward_run",
+                "retrieval_outcome_recorded",
+                "decay_policy_applied",
+            }:
                 for atom in payload.get("projected_atoms", []):
                     if atom.get("deleted"):
                         atoms.pop(atom["id"], None)
@@ -3042,6 +3271,20 @@ class Amos:
             },
         )
 
+    def _maintenance_proposal_fingerprint(self, proposal: Mapping[str, Any]) -> str:
+        return digest(
+            {
+                "action": proposal.get("action"),
+                "risk_level": proposal.get("risk_level"),
+                "source_refs": sorted(str(ref) for ref in proposal.get("source_refs", [])),
+                "target_refs": sorted(str(ref) for ref in proposal.get("target_refs", [])),
+                "payload": proposal.get("payload", {}),
+                "recommended_action": proposal.get("recommended_action"),
+                "reason_code": proposal.get("reason_code"),
+                "output_type": proposal.get("output_type"),
+            }
+        )
+
     def _maintenance_distiller_blocked_fingerprint(
         self,
         *,
@@ -3072,6 +3315,7 @@ class Amos:
                             "action": str(item.get("action")),
                             "risk_level": str(item.get("risk_level")),
                             "reason": str(item.get("reason")),
+                            "proposal_digest": str(item.get("proposal_digest") or ""),
                             "source_refs": sorted(
                                 str(ref) for ref in item.get("source_refs", [])
                             ),
@@ -3201,6 +3445,7 @@ class Amos:
                 "maintenance",
                 "distillation",
                 "maintenance_distiller",
+                "decay",
             } and isinstance(value, Mapping):
                 normalized[key].update(dict(value))
             else:
@@ -3265,6 +3510,22 @@ class Amos:
             "enabled": bool(reviewer.get("enabled", False)),
             "authority": "draft_only",
         }
+        decay = normalized["decay"]
+        decay["enabled"] = bool(decay.get("enabled", True))
+        decay["max_atoms"] = max(1, int(decay.get("max_atoms", 256) or 256))
+        decay["require_atom_policy"] = bool(decay.get("require_atom_policy", True))
+        for key in (
+            "mark_stale_after_seconds",
+            "archive_after_seconds",
+            "low_utility_threshold",
+        ):
+            value = decay.get(key)
+            if value in (None, ""):
+                decay[key] = None
+            elif key == "low_utility_threshold":
+                decay[key] = max(0.0, min(1.0, float(value)))
+            else:
+                decay[key] = max(0, int(value))
         return normalized
 
     def _memory_policy_state(self) -> dict[str, Any]:
@@ -3518,6 +3779,159 @@ class Amos:
             return None
         return max(0, int((datetime.now(timezone.utc) - parsed).total_seconds()))
 
+    def _timestamp_elapsed(self, timestamp: Any) -> bool:
+        if not timestamp:
+            return False
+        try:
+            parsed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        return datetime.now(timezone.utc) >= parsed
+
+    def _run_decay_policy(
+        self,
+        *,
+        decay: Mapping[str, Any],
+        scope: Mapping[str, Any],
+        actor: str,
+    ) -> dict[str, Any]:
+        max_atoms = max(1, int(decay.get("max_atoms", 256) or 256))
+        require_atom_policy = bool(decay.get("require_atom_policy", True))
+        actions: list[dict[str, Any]] = []
+        projected_atoms: list[dict[str, Any]] = []
+        now = utc_now()
+        atoms = self.store.list_atoms_filtered(
+            lifecycle_states=["active", "proposed"],
+            limit=max_atoms,
+        )
+        with self.store.transaction() as conn:
+            for atom in atoms:
+                if not scope_visible(atom["scope"], scope):
+                    continue
+                atom_policy = (
+                    dict(atom.get("decay_policy") or {})
+                    if isinstance(atom.get("decay_policy"), Mapping)
+                    else {}
+                )
+                explicit_atom_policy = bool(
+                    {
+                        key: value
+                        for key, value in atom_policy.items()
+                        if key != "retrieval_telemetry" and value not in (None, "", [], {})
+                    }
+                )
+                if require_atom_policy and not explicit_atom_policy:
+                    continue
+                if atom_policy.get("enabled") is False:
+                    continue
+                if self._timestamp_elapsed(atom_policy.get("retain_until")):
+                    pass
+                elif atom_policy.get("retain_until"):
+                    continue
+                action = self._decay_action_for_atom(
+                    atom,
+                    atom_policy=atom_policy,
+                    policy=decay,
+                )
+                if action is None:
+                    continue
+                changed = dict(atom)
+                changed["version"] = int(changed["version"]) + 1
+                changed["updated_at"] = now
+                if action["action"] == "archive":
+                    changed["lifecycle_state"] = "archived"
+                    changed["health_status"] = action.get("health_status", "stale")
+                elif action["action"] == "mark_stale":
+                    changed["health_status"] = "stale"
+                elif action["action"] == "mark_low_utility":
+                    changed["health_status"] = "low_utility"
+                changed["decay_policy"] = {
+                    **atom_policy,
+                    "last_decay": {
+                        "action": action["action"],
+                        "reason": action["reason"],
+                        "applied_at": now,
+                    },
+                }
+                changed = normalize_atom(
+                    self._attach_search_index(changed), require_id=True
+                )
+                self.store.replace_atom(conn, changed)
+                projected_atoms.append(changed)
+                actions.append(
+                    {
+                        "atom_ref": changed["id"],
+                        "action": action["action"],
+                        "reason": action["reason"],
+                        "health_status": changed["health_status"],
+                        "lifecycle_state": changed["lifecycle_state"],
+                    }
+                )
+            if actions:
+                event = self.store.append_event(
+                    conn,
+                    event_type="decay_policy_applied",
+                    actor=actor,
+                    payload={
+                        "operation": "run_decay_policy",
+                        "policy": dict(decay),
+                        "actions": actions,
+                        "projected_atoms": projected_atoms,
+                    },
+                    target_refs=[action["atom_ref"] for action in actions],
+                )
+                self.store.clear_packet_cache(conn)
+            else:
+                event = None
+        return {
+            "status": "completed",
+            "action_count": len(actions),
+            "actions": actions,
+            "event": event,
+        }
+
+    def _decay_action_for_atom(
+        self,
+        atom: Mapping[str, Any],
+        *,
+        atom_policy: Mapping[str, Any],
+        policy: Mapping[str, Any],
+    ) -> dict[str, str] | None:
+        if self._timestamp_elapsed(atom_policy.get("expires_at")):
+            return {"action": "archive", "reason": "expires_at_elapsed"}
+        low_utility_threshold = atom_policy.get(
+            "low_utility_threshold", policy.get("low_utility_threshold")
+        )
+        if low_utility_threshold not in (None, ""):
+            try:
+                threshold = max(0.0, min(1.0, float(low_utility_threshold)))
+            except (TypeError, ValueError):
+                threshold = None
+            if threshold is not None and float(atom["utility"]) < threshold:
+                return {
+                    "action": "mark_low_utility",
+                    "reason": "utility_below_threshold",
+                }
+        archive_after = atom_policy.get(
+            "archive_after_seconds", policy.get("archive_after_seconds")
+        )
+        if archive_after not in (None, ""):
+            age = self._seconds_since(
+                atom.get("last_accessed") or atom.get("updated_at") or atom.get("observed_at")
+            )
+            if age is not None and age >= int(archive_after):
+                return {"action": "archive", "reason": "archive_after_elapsed"}
+        stale_after = atom_policy.get(
+            "mark_stale_after_seconds", policy.get("mark_stale_after_seconds")
+        )
+        if stale_after not in (None, "") and atom.get("health_status") == "healthy":
+            age = self._seconds_since(
+                atom.get("last_accessed") or atom.get("updated_at") or atom.get("observed_at")
+            )
+            if age is not None and age >= int(stale_after):
+                return {"action": "mark_stale", "reason": "stale_after_elapsed"}
+        return None
+
     def _run_policy_distillation(
         self,
         *,
@@ -3761,6 +4175,8 @@ class Amos:
             graph_version if graph_version is not None else self.store.graph_version()
         )
         with self.store.transaction() as conn:
+            for atom in self.store.list_atoms_filtered(include_deleted=True):
+                self.store.replace_atom_text_index(conn, atom)
             lexical = self.store.upsert_derived_index_metadata(
                 conn,
                 index_name="semantic_lexical_vectors",
@@ -3768,6 +4184,7 @@ class Amos:
                 freshness="fresh",
                 details={
                     "atom_count": self.store.atom_count(),
+                    "token_count": self.store.atom_text_index_count(),
                     "processor_id": self.smp.processor_id,
                     "rebuildable_from_canonical": True,
                     "maintained_by": "memory_policy",
@@ -3789,6 +4206,29 @@ class Amos:
             "graph_version": graph_version,
             "indexes": [lexical, graph],
         }
+
+    def _indexed_retrieval_candidates(
+        self,
+        *,
+        cue_tokens: set[str],
+        attention_policy: Mapping[str, Any],
+    ) -> list[str] | None:
+        tokens = set(cue_tokens)
+        tokens.update(str(token) for token in attention_policy.get("focus_terms", []) or [])
+        tokens.update(str(token) for token in attention_policy.get("suppress_terms", []) or [])
+        normalized = sorted(
+            token
+            for token in {token.strip().lower() for token in tokens if token.strip()}
+            if len(token) > 1
+        )
+        if not normalized or self.store.atom_text_index_count() == 0:
+            return None
+        direct = self.store.candidate_atom_ids_for_tokens(normalized, limit=512)
+        if not direct:
+            return []
+        candidates = set(direct)
+        candidates.update(self.store.neighbor_atom_ids(direct))
+        return sorted(candidates)
 
     def _invalidate_packet_cache(
         self, *, graph_version: int | None = None
@@ -3824,6 +4264,7 @@ class Amos:
                 "attention_counterevidence": RETRIEVAL_WEIGHTS[
                     "attention_counterevidence"
                 ],
+                "attention_novelty": RETRIEVAL_WEIGHTS["attention_novelty"],
                 "attention_suppression_penalty": RETRIEVAL_WEIGHTS[
                     "attention_suppression_penalty"
                 ],
@@ -3929,9 +4370,11 @@ class Amos:
         *,
         text: str,
         text_tokens: set[str],
+        edge_degree: int,
         attention_policy: Mapping[str, Any] | None,
     ) -> dict[str, float]:
         policy = attention_policy if isinstance(attention_policy, Mapping) else {}
+        context = policy.get("context", {}) if isinstance(policy.get("context", {}), Mapping) else {}
         focus_terms = set(policy.get("focus_terms", []) or [])
         suppress_terms = set(policy.get("suppress_terms", []) or [])
         atom_type = str(atom.get("type", ""))
@@ -3956,6 +4399,16 @@ class Amos:
         )
         if atom_type in set(policy.get("suppress_memory_types", []) or []):
             attention_suppression = max(attention_suppression, 1.0)
+        try:
+            novelty_preference = max(
+                0.0, min(1.0, float(context.get("novelty_preference", 0.0) or 0.0))
+            )
+        except (TypeError, ValueError):
+            novelty_preference = 0.0
+        novelty = 0.0
+        if novelty_preference:
+            graph_familiarity = min(1.0, max(0, int(edge_degree)) / 5.0)
+            novelty = novelty_preference * (1.0 - graph_familiarity)
         counterevidence = 0.0
         if policy.get("counterevidence_required"):
             if atom.get("health_status") == "contradicted":
@@ -3977,6 +4430,7 @@ class Amos:
             "attention_focus": attention_focus,
             "attention_type_boost": attention_type_boost,
             "attention_counterevidence": counterevidence,
+            "attention_novelty": novelty,
             "attention_suppression_penalty": attention_suppression,
         }
 
@@ -4014,6 +4468,100 @@ class Amos:
             "omitted_reasons": omitted_reasons,
         }
 
+    def _recency_score(self, atom: Mapping[str, Any]) -> float:
+        seconds = self._seconds_since(atom.get("updated_at") or atom.get("observed_at"))
+        if seconds is None:
+            return 0.0
+        return max(
+            0.0,
+            min(1.0, 1.0 - (float(seconds) / RETRIEVAL_RECENCY_HORIZON_SECONDS)),
+        )
+
+    def _graph_activation_scores(
+        self,
+        atoms: Sequence[Mapping[str, Any]],
+        *,
+        cues: Sequence[str],
+        request_scope: Mapping[str, Any] | None,
+        requester: str,
+        target_processor: str,
+        include_conflicts: bool,
+        include_low_health: bool,
+        cue_text: str,
+        cue_tokens: set[str],
+        attention_policy: Mapping[str, Any] | None,
+    ) -> dict[str, float]:
+        eligible_refs: set[str] = set()
+        seed_strengths: dict[str, float] = {}
+        for atom in atoms:
+            atom_ref = str(atom.get("id") or "")
+            if not atom_ref or atom.get("deleted"):
+                continue
+            if not scope_visible(atom["scope"], request_scope or {}):
+                continue
+            if not access_visible(atom["access_policy"], requester, target_processor):
+                continue
+            if atom["health_status"] == "contradicted" and not include_conflicts:
+                continue
+            if atom["health_status"] in LOW_HEALTH_STATES and not include_low_health:
+                continue
+            eligible_refs.add(atom_ref)
+            search_index = self._atom_search_index(atom)
+            text = str(search_index["text"])
+            text_tokens = set(str(token) for token in search_index["tokens"])
+            direct = any(cue.lower() in text for cue in cues if cue)
+            overlap = len(cue_tokens.intersection(text_tokens))
+            cue_score = 1.0 if direct else min(1.0, overlap / max(1, len(cue_tokens)))
+            attention = self._attention_score_components(
+                atom,
+                text=text,
+                text_tokens=text_tokens,
+                edge_degree=0,
+                attention_policy=attention_policy,
+            )
+            seed = max(cue_score, float(attention.get("attention_focus", 0.0) or 0.0))
+            if seed > 0:
+                seed_strengths[atom_ref] = seed
+        if not seed_strengths:
+            return {}
+
+        activation: dict[str, float] = {}
+        for edge in self.store.list_edges():
+            source = str(edge.get("source_ref") or "")
+            target = str(edge.get("target_ref") or "")
+            if source not in eligible_refs or target not in eligible_refs:
+                continue
+            relation_weight = self._edge_relation_activation_weight(
+                str(edge.get("relation") or "")
+            )
+            if source in seed_strengths:
+                activation[target] = max(
+                    activation.get(target, 0.0),
+                    min(1.0, seed_strengths[source] * relation_weight),
+                )
+            if target in seed_strengths:
+                activation[source] = max(
+                    activation.get(source, 0.0),
+                    min(1.0, seed_strengths[target] * relation_weight * 0.8),
+                )
+        return activation
+
+    def _edge_relation_activation_weight(self, relation: str) -> float:
+        if relation in {
+            "rel:uses",
+            "rel:supports",
+            "rel:produced_outcome",
+            "rel:made_commitment",
+            "rel:has_capability",
+            "rel:has_limitation",
+        }:
+            return 0.9
+        if relation in {"rel:derived_from", "rel:supersedes"}:
+            return 0.75
+        if relation in {"rel:contradicts", "rel:similar_to"}:
+            return 0.65
+        return 0.5
+
     def _rank_atom(
         self,
         atom: Mapping[str, Any],
@@ -4025,6 +4573,7 @@ class Amos:
         cue_tokens: set[str] | None = None,
         cue_vector: Sequence[float] | None = None,
         edge_degrees: Mapping[str, int] | None = None,
+        edge_activation_scores: Mapping[str, float] | None = None,
         attention_policy: Mapping[str, Any] | None = None,
     ) -> tuple[float, bool, dict[str, float]]:
         search_index = self._atom_search_index(atom)
@@ -4040,12 +4589,16 @@ class Amos:
         overlap = len(cue_tokens.intersection(text_tokens))
         matched = direct or overlap > 0 or not cue_tokens
         semantic_similarity = 0.0
-        if cue_text:
+        if matched and cue_text:
             cue_vector = self.smp.encode(cue_text) if cue_vector is None else cue_vector
             semantic_similarity = cosine(cue_vector, search_index["vector"])
         direct_score = 1.0 if direct else min(1.0, overlap / max(1, len(cue_tokens)))
-        edge_activation = self._edge_activation(atom["id"], edge_degrees=edge_degrees)
-        recency = 1.0 if atom.get("updated_at") else 0.5
+        edge_degree = int((edge_degrees or {}).get(atom["id"], 0))
+        edge_activation = min(
+            1.0, max(0.0, float((edge_activation_scores or {}).get(atom["id"], 0.0)))
+        )
+        matched = matched or edge_activation > 0.0
+        recency = self._recency_score(atom)
         confidence = confidence_score(atom["confidence"])
         utility = min(1.0, float(atom["utility"]))
         salience = min(1.0, float(atom["salience"]))
@@ -4055,8 +4608,24 @@ class Amos:
             if request_scope
             else 0.0
         )
-        goal_relevance = 1.0 if atom["type"] in {"goal", "commitment"} else 0.0
-        procedural_applicability = 1.0 if atom["type"] == "procedure" else 0.0
+        attention_components = self._attention_score_components(
+            atom,
+            text=text,
+            text_tokens=text_tokens,
+            edge_degree=edge_degree,
+            attention_policy=attention_policy,
+        )
+        relevance_signal = max(
+            direct_score,
+            float(attention_components.get("attention_focus", 0.0) or 0.0),
+            edge_activation * 0.5,
+        )
+        goal_relevance = (
+            relevance_signal if atom["type"] in {"goal", "commitment"} else 0.0
+        )
+        procedural_applicability = (
+            relevance_signal if atom["type"] == "procedure" else 0.0
+        )
         contradiction_penalty = (
             1.0 if atom["health_status"] == "contradicted" else 0.0
         )
@@ -4083,14 +4652,7 @@ class Amos:
         }
         if retrieval_mode == "agentic_recall":
             components.update(self._agentic_score_components(atom))
-        components.update(
-            self._attention_score_components(
-                atom,
-                text=text,
-                text_tokens=text_tokens,
-                attention_policy=attention_policy,
-            )
-        )
+        components.update(attention_components)
         score = 0.0
         weights = dict(RETRIEVAL_WEIGHTS)
         if retrieval_mode == "agentic_recall":
@@ -4202,18 +4764,6 @@ class Amos:
             "text": str(content),
             "payload": payload,
         }
-
-    def _edge_activation(
-        self, atom_id: str, *, edge_degrees: Mapping[str, int] | None = None
-    ) -> float:
-        if edge_degrees is not None:
-            count = int(edge_degrees.get(atom_id, 0))
-        else:
-            count = 0
-            for edge in self.store.list_edges():
-                if edge["source_ref"] == atom_id or edge["target_ref"] == atom_id:
-                    count += 1
-        return min(1.0, count / 5.0)
 
     def _agentic_score_components(self, atom: Mapping[str, Any]) -> dict[str, float]:
         payload = atom["payload"]

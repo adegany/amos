@@ -1902,6 +1902,7 @@ score_components
   attention_focus: 0.0..1.0
   attention_type_boost: 0.0..1.0
   attention_counterevidence: 0.0..1.0
+  attention_novelty: 0.0..1.0
   attention_suppression_penalty: 0.0..1.0
   agency_match: 0.0..1.0
   attribution_confidence: 0.0..1.0
@@ -1917,12 +1918,57 @@ score_components
 
 The first implementation may use hand-tuned weights, but every packet item must expose enough components to debug why it appeared, why it was suppressed, or why a stronger scoped memory inhibited a generic one.
 
+V1-local retrieval computes recency from `updated_at` age, not mere timestamp
+presence. The default horizon is 30 days: a just-updated atom scores near `1.0`,
+and atoms at or beyond the horizon score `0.0` for the recency component.
+
+`goal_relevance` and `procedural_applicability` are relevance-conditioned. Goal,
+commitment, and procedure atoms do not receive their type boost solely because
+of their memory type; they need cue overlap, attention focus, or relation
+activation connected to the current request.
+
+`edge_activation` is seeded by cue or attention matches and then propagated over
+typed graph edges with bounded relation weights. It is not raw degree
+centrality. Degree may still be used by separate components such as novelty
+preference, but it must not make a globally connected atom look relevant without
+a path from the active cue or attention context.
+
 Attention does not replace cues. Cues describe what the caller is asking about;
 attention describes what should be foregrounded, reserved, or inhibited while
 answering. For example, a pilot can ask about current training policy while
 attention reserves budget for active mission rules and recent corrective
 failures, and a critic can ask the same cue while reserving more budget for
 counterevidence and contradictions.
+
+If `cues` is empty, retrieval enters browse-by-context mode: all visible,
+eligible atoms may enter ranking, and scope plus `attention_context` become the
+primary relevance signal. This is intentional for callers that want "what is
+relevant to my current mission/role/task?" rather than an answer to a specific
+query string. Implementations must expose this through `attention_trace` so the
+caller can see which focus terms selected or inhibited packet items.
+
+Attention and cue token matching must use canonical search text derived from
+atom ids, atom types, and payload values only. Payload object keys and envelope
+field names are not semantic content and must not create focus, suppression, or
+cue-overlap matches. This prevents generic keys such as `claim`, `confidence`,
+`schema_version`, or `status` from making unrelated atoms appear mission
+relevant.
+
+`novelty_preference` is advisory and should be implemented as a bounded
+`attention_novelty` component rather than merely echoed in the request. V1-local
+uses a lightweight graph-familiarity proxy: less-connected atoms receive more
+novelty credit when the caller asks for novelty, while ordinary retrieval keeps
+the component at zero.
+
+V1-local maintains a disposable SQLite token candidate index populated from the
+same canonical payload-value search text. When cue or attention tokens are
+present, retrieval prefilters atom ids through this token table and then expands
+the candidate set to graph neighbors so edge activation can still surface linked
+memories that do not repeat the query wording. Empty-cue retrieval with
+attention terms uses the same token prefilter; empty-cue retrieval without
+attention terms remains an unprefiltered browse over visible eligible memory.
+Canonical memory remains the event journal and atom/edge graph, not the derived
+token index; the memory policy can rebuild the index from atom `index_refs`.
 
 ### 11.3 Diversity requirement
 
@@ -3239,7 +3285,7 @@ index_rebuilt
 memory_health_alert
 ```
 
-Clients use these events to invalidate local memory packets, active procedure snippets, or retrieved context caches. V1-local retrieval outcomes are stored as telemetry records, not canonical event-journal mutations.
+Clients use these events to invalidate local memory packets, active procedure snippets, or retrieved context caches. V1-local retrieval outcomes are stored as telemetry records and, when they reference atoms, also journal `retrieval_outcome_recorded` mutations that update atom utility, salience, `last_accessed`, and retrieval telemetry counters.
 
 ### 25.7 Scope isolation and authorization model
 
@@ -4541,9 +4587,10 @@ utility: 0.12
 salience: 0.08
 goal_relevance: 0.08
 procedural_applicability: 0.04
-attention_focus: 0.18
+attention_focus: 0.14
 attention_type_boost: 0.08
 attention_counterevidence: 0.08
+attention_novelty: 0.05
 
 contradiction_penalty: -0.30
 staleness_penalty: -0.18
@@ -4858,6 +4905,14 @@ maintenance_distiller:
   reviewer:
     enabled: false
     authority: draft_only
+
+decay:
+  enabled: true
+  max_atoms: 256
+  require_atom_policy: true
+  mark_stale_after_seconds: null
+  archive_after_seconds: null
+  low_utility_threshold: null
 ```
 
 The v1 HTTP service starts a background memory-policy worker. Foreground
@@ -4886,6 +4941,8 @@ When due, the policy should:
 ```text
 run SMP analysis
 run the memory steward for low-risk reversible cleanup
+execute deterministic decay rules from atom decay_policy and configured global
+  bounds
 create provenance-linked semantic distillations when enough eligible source
   atoms are available
 build a bounded evidence window and run registered maintenance processor packs
@@ -4897,6 +4954,15 @@ invalidate packet cache
 persist memory_policy_state
 append a memory_policy_run event
 ```
+
+Decay execution is deterministic and non-generative. By default, v1-local only
+mutates atoms with explicit atom-level `decay_policy` rules. Supported v1-local
+rules include `expires_at`, `retain_until`, `mark_stale_after_seconds`,
+`archive_after_seconds`, and `low_utility_threshold`; operator policy can relax
+`require_atom_policy` to apply global stale/archive/low-utility thresholds.
+Applied decay actions are journaled as `decay_policy_applied`, update atom
+version/health/lifecycle state, refresh derived token rows, and invalidate packet
+cache.
 
 V1-local policy execution profile:
 
@@ -5264,6 +5330,8 @@ storage artifacts:
   tombstones migration
   packet cache metadata migration
   derived index metadata migration
+  rebuildable atom token candidate index
+  retrieval outcome telemetry table
 
 service artifacts:
   capture_event endpoint
@@ -5272,8 +5340,10 @@ service artifacts:
   archive_atom and merge_atoms endpoints
   retrieve_memory_packet endpoint
   record_retrieval_outcome endpoint
+  retrieval outcome utility/salience feedback loop
   request_maintenance endpoint
   memory-policy status/configure/run endpoints
+  memory-policy decay executor
   maintenance-processor listing endpoint
   maintenance-distiller endpoint
   deletion endpoint

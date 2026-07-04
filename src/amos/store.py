@@ -129,6 +129,14 @@ class SQLiteStore:
             CREATE INDEX IF NOT EXISTS idx_atoms_lifecycle_health_type
                 ON amos_atoms(lifecycle_state, health_status, type);
 
+            CREATE TABLE IF NOT EXISTS amos_atom_text_index (
+                atom_id TEXT NOT NULL,
+                token TEXT NOT NULL,
+                PRIMARY KEY(atom_id, token)
+            );
+            CREATE INDEX IF NOT EXISTS idx_atom_text_index_token
+                ON amos_atom_text_index(token);
+
             CREATE TABLE IF NOT EXISTS amos_edges (
                 edge_id TEXT PRIMARY KEY,
                 source_ref TEXT NOT NULL,
@@ -227,6 +235,7 @@ class SQLiteStore:
                 self._set_meta(conn, "graph_version", "0")
             if self._get_meta(conn, "last_event_hash") is None:
                 self._set_meta(conn, "last_event_hash", "genesis")
+            self._backfill_atom_text_index(conn)
 
     def _get_meta(self, conn: sqlite3.Connection, key: str) -> str | None:
         row = conn.execute("SELECT value FROM amos_meta WHERE key = ?", (key,)).fetchone()
@@ -454,6 +463,7 @@ class SQLiteStore:
                 1 if atom.get("deleted") else 0,
             ),
         )
+        self.replace_atom_text_index(conn, atom)
 
     def replace_atom(self, conn: sqlite3.Connection, atom: Mapping[str, Any]) -> None:
         conn.execute(
@@ -491,6 +501,59 @@ class SQLiteStore:
                 atom["id"],
             ),
         )
+        self.replace_atom_text_index(conn, atom)
+
+    def replace_atom_text_index(
+        self, conn: sqlite3.Connection, atom: Mapping[str, Any]
+    ) -> None:
+        atom_id = str(atom.get("id") or "")
+        if not atom_id:
+            return
+        conn.execute("DELETE FROM amos_atom_text_index WHERE atom_id = ?", (atom_id,))
+        if atom.get("deleted"):
+            return
+        tokens = sorted(self._atom_text_index_tokens(atom))
+        if not tokens:
+            return
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO amos_atom_text_index(atom_id, token)
+            VALUES (?, ?)
+            """,
+            [(atom_id, token) for token in tokens],
+        )
+
+    def _atom_text_index_tokens(self, atom: Mapping[str, Any]) -> set[str]:
+        tokens: set[str] = set()
+        index_refs = atom.get("index_refs", {})
+        if isinstance(index_refs, Mapping):
+            for index in index_refs.values():
+                if not isinstance(index, Mapping):
+                    continue
+                for token in index.get("tokens", []) or []:
+                    text = str(token or "").strip().lower()
+                    if text:
+                        tokens.add(text)
+        return tokens
+
+    def _backfill_atom_text_index(self, conn: sqlite3.Connection) -> None:
+        atom_count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS count FROM amos_atoms WHERE deleted = 0"
+            ).fetchone()["count"]
+        )
+        if atom_count == 0:
+            return
+        indexed_count = int(
+            conn.execute("SELECT COUNT(*) AS count FROM amos_atom_text_index").fetchone()[
+                "count"
+            ]
+        )
+        if indexed_count > 0:
+            return
+        rows = conn.execute("SELECT * FROM amos_atoms WHERE deleted = 0").fetchall()
+        for row in rows:
+            self.replace_atom_text_index(conn, self._row_dict(row))
 
     def list_atoms(self) -> list[dict[str, Any]]:
         rows = self.conn.execute("SELECT * FROM amos_atoms ORDER BY updated_at DESC").fetchall()
@@ -504,6 +567,7 @@ class SQLiteStore:
         lifecycle_states: list[str] | None = None,
         excluded_health: list[str] | None = None,
         included_health: list[str] | None = None,
+        atom_ids: list[str] | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
@@ -528,6 +592,11 @@ class SQLiteStore:
                 f"health_status IN ({','.join('?' for _ in included_health)})"
             )
             params.extend(included_health)
+        if atom_ids is not None:
+            if not atom_ids:
+                return []
+            clauses.append(f"id IN ({','.join('?' for _ in atom_ids)})")
+            params.extend(atom_ids)
         query = "SELECT * FROM amos_atoms"
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
@@ -537,6 +606,50 @@ class SQLiteStore:
             params.append(max(0, int(limit)))
         rows = self.conn.execute(query, tuple(params)).fetchall()
         return [self._row_dict(row) for row in rows]
+
+    def atom_text_index_count(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS count FROM amos_atom_text_index"
+        ).fetchone()
+        return int(row["count"])
+
+    def candidate_atom_ids_for_tokens(
+        self, tokens: list[str], *, limit: int | None = None
+    ) -> list[str]:
+        normalized = sorted(
+            {
+                str(token or "").strip().lower()
+                for token in tokens
+                if str(token or "").strip()
+            }
+        )
+        if not normalized:
+            return []
+        placeholders = ",".join("?" for _ in normalized)
+        query = f"""
+            SELECT atom_id, COUNT(*) AS matches
+            FROM amos_atom_text_index
+            WHERE token IN ({placeholders})
+            GROUP BY atom_id
+            ORDER BY matches DESC, atom_id ASC
+        """
+        params: list[Any] = list(normalized)
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [str(row["atom_id"]) for row in rows]
+
+    def neighbor_atom_ids(self, refs: list[str]) -> list[str]:
+        neighbors: set[str] = set()
+        for edge in self.list_edges_for_refs(refs):
+            source = str(edge.get("source_ref") or "")
+            target = str(edge.get("target_ref") or "")
+            if source:
+                neighbors.add(source)
+            if target:
+                neighbors.add(target)
+        return sorted(neighbors)
 
     def atom_count(self, *, include_deleted: bool = False) -> int:
         query = "SELECT COUNT(*) AS count FROM amos_atoms"

@@ -52,6 +52,14 @@ CREATE INDEX IF NOT EXISTS idx_amos_atoms_lifecycle ON amos_atoms(lifecycle_stat
 CREATE INDEX IF NOT EXISTS idx_amos_atoms_health ON amos_atoms(health_status);
 CREATE INDEX IF NOT EXISTS idx_amos_atoms_scope ON amos_atoms USING GIN(scope);
 
+CREATE TABLE IF NOT EXISTS amos_atom_text_index (
+    atom_id TEXT NOT NULL,
+    token TEXT NOT NULL,
+    PRIMARY KEY(atom_id, token)
+);
+CREATE INDEX IF NOT EXISTS idx_amos_atom_text_index_token
+    ON amos_atom_text_index(token);
+
 CREATE TABLE IF NOT EXISTS amos_edges (
     edge_id TEXT PRIMARY KEY,
     source_ref TEXT NOT NULL,

@@ -90,6 +90,8 @@ in-process SQLite store and serializes access through the service boundary:
   checksum chain.
 - Typed memory atoms, evidence records, associative edges, tombstones, packet cache,
   and retrieval outcomes.
+- Rebuildable SQLite token candidate index used to prefilter cue/attention
+  retrieval before deterministic in-Python ranking.
 - Schema validation for envelope/payload separation, typed payload contracts,
   and JSON-compatible atoms.
 - Idempotent capture/commit operations and compare-and-swap update checks.
@@ -98,13 +100,15 @@ in-process SQLite store and serializes access through the service boundary:
 - Attention-aware packet ranking with explicit focus, type-boost,
   counterevidence, and suppression score components plus packet-level
   `attention_trace` diagnostics.
+- Retrieval-outcome feedback that journals packet-use telemetry and updates
+  referenced atom utility, salience, access time, and low-utility health.
 - Self-awareness and agentic-recall views for self models, capabilities,
   limitations, runtime state, self-assessments, traces, outcomes, corrections,
   and blocked actions.
 - Provenance-linked deterministic memory distillation.
 - Automatic memory policy scheduling with a background HTTP-service worker for
   deterministic distillation, SMP, stewardship, processor-pack distillation,
-  derived-index refresh, and packet-cache invalidation.
+  decay-policy execution, derived-index refresh, and packet-cache invalidation.
 - Deterministic non-generative Semantic Maintenance Processor (SMP) outputs
   using the required audit envelope.
 - Generic maintenance proposal records, a processor registry, and a policy gate
@@ -166,7 +170,12 @@ PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 retrieve \
 
 The returned packet includes `attention_trace` and item-level
 `score_components` such as `attention_focus`, `attention_type_boost`,
-`attention_counterevidence`, and `attention_suppression_penalty`.
+`attention_counterevidence`, `attention_novelty`, and
+`attention_suppression_penalty`. Retrieval without cues intentionally browses
+visible memory by scope and attention context; cue and attention matching use
+payload values rather than JSON field names to avoid schema-key false positives.
+When cues or attention terms are present, v1-local uses a SQLite token index to
+prefilter candidate atoms and then expands to graph neighbors before ranking.
 
 Run the Amos Mirror Agent integration demo:
 
@@ -208,6 +217,7 @@ Inspect or tune the automatic memory policy:
 ```bash
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy --configure --schedule '{"every_graph_versions": 10, "every_seconds": 300}'
+PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy --configure --decay '{"require_atom_policy":true,"max_atoms":256}'
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy --run --force --trigger operator_check
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 maintenance-processors
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 maintenance-distiller --domain generic --processor-id amos.maintenance.generic.v1
@@ -243,14 +253,14 @@ Reference result from a local workstation run on 2026-07-04:
 | --- | ---: |
 | Atoms committed | 100 |
 | Retrievals | 20 |
-| Commit throughput | 1096.26 atoms/s |
-| Commit latency p50 / p95 | 0.898 ms / 1.139 ms |
-| Retrieval latency p50 / p95 | 0.28 ms / 14.229 ms |
+| Commit throughput | 1120.0 atoms/s |
+| Commit latency p50 / p95 | 0.841 ms / 1.024 ms |
+| Retrieval latency p50 / p95 | 0.243 ms / 15.1 ms |
 | Average packet items | 9 |
-| Replay verification | 22.519 ms (ok) |
-| Forced memory policy run | 205.419 ms (completed) |
+| Replay verification | 20.036 ms (ok) |
+| Forced memory policy run | 195.668 ms (completed) |
 | Final atoms / edges | 101 / 60 |
-| SQLite DB size | 884736 bytes |
+| SQLite DB size | 1126400 bytes |
 | Environment | Python 3.12.2; 24 CPUs; Linux-6.17.0-35-generic-x86_64-with-glibc2.39 |
 
 ## Integration boundary
@@ -281,13 +291,14 @@ ambiguous or high-risk work for review.
 - Keep SQLite as the first supported shared-service deployment profile.
 - Expand replay verification and background-maintenance acceptance tests.
 - Improve attention policy diagnostics, packet-ranking diagnostics, omissions
-  reporting, and retrieval-outcome telemetry.
+  reporting, and retrieval-outcome utility learning.
 - Harden the Mirror Agent demo as the reference self-awareness integration.
 
 ### Storage and Scale
 
 - Add production Postgres support using the existing migration contract.
-- Add optional vector index integrations while keeping vector data as a rebuildable derived index.
+- Add optional vector and full-text index integrations while keeping index data
+  rebuildable and non-canonical.
 - Support larger multi-tenant deployments with clearer capacity budgets, pressure modes, and retention policy controls.
 - Add export/import tooling for moving v1-local SQLite stores into production deployments.
 

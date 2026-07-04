@@ -4,6 +4,7 @@ import json
 import threading
 import time
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -490,6 +491,249 @@ def test_retrieve_packet_attention_context_shapes_ranking_and_trace(amos):
     assert packet["request"]["attention_context"]["boost_memory_types"] == ["policy"]
 
 
+def test_attention_matching_ignores_payload_keys(amos):
+    amos.commit_atom(
+        {
+            "id": "attention_payload_key_only",
+            "type": "belief",
+            "payload": {
+                "claim": "Unrelated storage cleanup note",
+            },
+        }
+    )
+    amos.commit_atom(
+        {
+            "id": "attention_payload_value_match",
+            "type": "belief",
+            "payload": {
+                "claim": "Production claim handling requires review",
+            },
+        }
+    )
+
+    packet = amos.retrieve_packet(
+        cues=[],
+        max_items=2,
+        attention_context={"active_task": "claim production"},
+        run_policy=False,
+    )
+    by_ref = {item["atom_ref"]: item for item in packet["items"]}
+
+    assert by_ref["attention_payload_value_match"]["score_components"]["attention_focus"] > 0
+    assert "attention_payload_key_only" not in by_ref
+    assert packet["items"][0]["atom_ref"] == "attention_payload_value_match"
+
+
+def test_empty_cue_retrieval_browses_by_attention_context(amos):
+    amos.commit_atom(
+        {
+            "id": "attention_no_cue_generic",
+            "type": "semantic",
+            "payload": {"summary": "Generic unrelated operating note"},
+        }
+    )
+    amos.commit_atom(
+        {
+            "id": "attention_no_cue_mission",
+            "type": "semantic",
+            "payload": {"summary": "Mission routing policy for performance search"},
+        }
+    )
+
+    packet = amos.retrieve_packet(
+        cues=[],
+        max_items=2,
+        attention_context={"mission": "performance search mission routing"},
+        run_policy=False,
+    )
+
+    assert packet["items"][0]["atom_ref"] == "attention_no_cue_mission"
+    assert packet["items"][0]["score_components"]["attention_focus"] > 0
+    assert packet["attention_trace"]["selected_item_refs"] == [
+        item["atom_ref"] for item in packet["items"]
+    ]
+
+
+def test_attention_novelty_preference_affects_score_components(amos):
+    source_refs = []
+    for idx in range(5):
+        source_refs.append(
+            amos.commit_atom(
+                {
+                    "id": f"novelty_source_{idx}",
+                    "type": "semantic",
+                    "payload": {"summary": f"Novelty source {idx}"},
+                }
+            )["atom"]["id"]
+        )
+    amos.commit_atom(
+        {
+            "id": "attention_familiar_atom",
+            "type": "semantic",
+            "payload": {
+                "summary": "Novelty target familiar graph node",
+                "source_refs": source_refs,
+            },
+        }
+    )
+    amos.commit_atom(
+        {
+            "id": "attention_novel_atom",
+            "type": "semantic",
+            "payload": {"summary": "Novelty target isolated graph node"},
+        }
+    )
+
+    packet = amos.retrieve_packet(
+        cues=["novelty target"],
+        max_items=8,
+        attention_context={"novelty_preference": 1.0},
+        run_policy=False,
+    )
+    by_ref = {item["atom_ref"]: item for item in packet["items"]}
+
+    assert by_ref["attention_novel_atom"]["score_components"]["attention_novelty"] == 1.0
+    assert by_ref["attention_familiar_atom"]["score_components"]["attention_novelty"] == 0.0
+    assert packet["request"]["attention_context"]["novelty_preference"] == 1.0
+
+
+def test_retrieval_recency_decays_with_updated_at_age(amos):
+    now = datetime.now(timezone.utc)
+    old = (now - timedelta(days=45)).isoformat().replace("+00:00", "Z")
+    recent = now.isoformat().replace("+00:00", "Z")
+    amos.commit_atom(
+        {
+            "id": "recency_old_atom",
+            "type": "semantic",
+            "payload": {"summary": "Recency ranking target old"},
+            "updated_at": old,
+            "created_at": old,
+            "observed_at": old,
+            "salience": 0.5,
+            "utility": 0.5,
+        }
+    )
+    amos.commit_atom(
+        {
+            "id": "recency_recent_atom",
+            "type": "semantic",
+            "payload": {"summary": "Recency ranking target recent"},
+            "updated_at": recent,
+            "created_at": recent,
+            "observed_at": recent,
+            "salience": 0.5,
+            "utility": 0.5,
+        }
+    )
+
+    packet = amos.retrieve_packet(cues=["recency ranking target"], max_items=2, run_policy=False)
+    by_ref = {item["atom_ref"]: item for item in packet["items"]}
+
+    assert by_ref["recency_recent_atom"]["score_components"]["recency"] > 0.95
+    assert by_ref["recency_old_atom"]["score_components"]["recency"] == 0.0
+    assert by_ref["recency_recent_atom"]["score"] > by_ref["recency_old_atom"]["score"]
+
+
+def test_goal_and_procedure_boosts_require_relevance(amos):
+    amos.commit_atom(
+        {
+            "id": "irrelevant_goal_atom",
+            "type": "goal",
+            "payload": {"description": "Archive cleanup objective for another project"},
+        }
+    )
+    amos.commit_atom(
+        {
+            "id": "relevant_goal_atom",
+            "type": "goal",
+            "payload": {"description": "Route search objective for current mission"},
+        }
+    )
+    amos.commit_atom(
+        {
+            "id": "irrelevant_procedure_atom",
+            "type": "procedure",
+            "payload": {
+                "trigger_context": "Archive cleanup",
+                "steps": ["Collect cold storage candidates"],
+            },
+        }
+    )
+
+    packet = amos.retrieve_packet(
+        cues=["route search"],
+        max_items=3,
+        include_low_health=True,
+        run_policy=False,
+    )
+    by_ref = {item["atom_ref"]: item for item in packet["items"]}
+
+    assert by_ref["relevant_goal_atom"]["score_components"]["goal_relevance"] > 0
+    assert "irrelevant_goal_atom" not in by_ref
+    assert "irrelevant_procedure_atom" not in by_ref
+
+
+def test_edge_activation_spreads_from_cue_matched_atom(amos):
+    source = amos.commit_atom(
+        {
+            "id": "edge_origin_atom",
+            "type": "semantic",
+            "payload": {"summary": "Seed phrase for graph activation"},
+        }
+    )["atom"]
+    linked = amos.commit_atom(
+        {
+            "id": "edge_linked_atom",
+            "type": "semantic",
+            "payload": {
+                "summary": "Associated downstream memory without query wording",
+                "source_refs": [source["id"]],
+            },
+        }
+    )["atom"]
+
+    packet = amos.retrieve_packet(cues=["seed phrase"], max_items=4, run_policy=False)
+    by_ref = {item["atom_ref"]: item for item in packet["items"]}
+
+    assert source["id"] in by_ref
+    assert linked["id"] in by_ref
+    assert by_ref[linked["id"]]["score_components"]["direct_cue_match"] == 0.0
+    assert by_ref[linked["id"]]["score_components"]["edge_activation"] > 0
+
+
+def test_retrieve_packet_uses_sqlite_token_candidate_index(amos, monkeypatch):
+    amos.commit_atom(
+        {
+            "id": "indexed_candidate_match",
+            "type": "semantic",
+            "payload": {"summary": "Indexed retrieval target phrase"},
+        }
+    )
+    amos.commit_atom(
+        {
+            "id": "indexed_candidate_other",
+            "type": "semantic",
+            "payload": {"summary": "Unrelated background memory"},
+        }
+    )
+    assert amos.store.atom_text_index_count() > 0
+
+    calls = []
+    original = amos.store.list_atoms_filtered
+
+    def capture_list_atoms_filtered(**kwargs):
+        calls.append(kwargs.get("atom_ids"))
+        return original(**kwargs)
+
+    monkeypatch.setattr(amos.store, "list_atoms_filtered", capture_list_atoms_filtered)
+    packet = amos.retrieve_packet(cues=["target phrase"], max_items=4, run_policy=False)
+
+    assert calls[-1] is not None
+    assert "indexed_candidate_match" in calls[-1]
+    assert "indexed_candidate_other" not in calls[-1]
+    assert [item["atom_ref"] for item in packet["items"]] == ["indexed_candidate_match"]
+
+
 def test_attention_context_is_part_of_packet_cache_key(amos):
     amos.commit_atom(
         {
@@ -755,6 +999,12 @@ def test_retrieval_outcome_telemetry_is_reportable(amos):
 
     assert outcome["packet_id"] == packet["packet_id"]
     assert outcome["outcome_id"].startswith("rto_")
+    assert outcome["feedback"]["updated_atom_refs"] == [atom["id"]]
+    updated = amos.store.get_atom(atom["id"])
+    assert updated["utility"] > atom["utility"]
+    assert updated["salience"] > atom["salience"]
+    assert updated["last_accessed"]
+    assert updated["decay_policy"]["retrieval_telemetry"]["used_count"] == 1
     assert amos.health_memory()["retrieval_outcomes"] == 1
 
 
@@ -1031,6 +1281,31 @@ def test_retrieval_outcome_accepts_stable_outcome_id(amos):
     assert first["status"] == "recorded"
     assert second["status"] == "already_recorded"
     assert amos.store.retrieval_outcome_count() == 1
+
+
+def test_retrieval_outcome_corrections_demote_atom_utility(amos):
+    atom = amos.commit_atom(
+        {
+            "id": "outcome_correction_atom",
+            "type": "belief",
+            "payload": {"claim": "Correction telemetry target"},
+            "utility": 0.3,
+        }
+    )["atom"]
+    packet = amos.retrieve_packet(cues=["correction telemetry"], run_policy=False)
+
+    amos.record_retrieval_outcome(
+        packet_id=packet["packet_id"],
+        request=packet["request"],
+        outcome={
+            "correction_refs": [atom["id"]],
+            "label": "corrected",
+        },
+    )
+
+    updated = amos.store.get_atom(atom["id"])
+    assert updated["utility"] < atom["utility"]
+    assert updated["decay_policy"]["retrieval_telemetry"]["correction_count"] == 1
 
 
 def test_steward_backfills_intrinsic_edges_for_existing_atoms(amos):
@@ -1953,6 +2228,61 @@ def test_automatic_memory_policy_distills_and_maintains_on_retrieval(amos):
     assert replacement["payload"]["source_refs"] == distilled["payload"]["source_refs"]
     assert not replacement["payload"]["summary"].lstrip().startswith("{")
     assert "Replacement renderer output" in replacement["payload"]["summary"]
+
+
+def test_memory_policy_executes_atom_decay_policy(amos):
+    old = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    stale_atom = amos.commit_atom(
+        {
+            "id": "decay_stale_atom",
+            "type": "semantic",
+            "payload": {"summary": "Decay stale target"},
+            "updated_at": old,
+            "observed_at": old,
+            "created_at": old,
+            "decay_policy": {"mark_stale_after_seconds": 1},
+        }
+    )["atom"]
+    archive_atom = amos.commit_atom(
+        {
+            "id": "decay_archive_atom",
+            "type": "semantic",
+            "payload": {"summary": "Decay archive target"},
+            "decay_policy": {"expires_at": expired},
+        }
+    )["atom"]
+    ignored_atom = amos.commit_atom(
+        {
+            "id": "decay_ignored_atom",
+            "type": "semantic",
+            "payload": {"summary": "Decay ignored target"},
+            "updated_at": old,
+            "observed_at": old,
+            "created_at": old,
+        }
+    )["atom"]
+
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": True, "require_atom_policy": True},
+    )
+    result = amos.run_memory_policy(force=True, trigger="decay_test")
+
+    assert result["results"]["decay"]["action_count"] == 2
+    assert amos.store.get_atom(stale_atom["id"])["health_status"] == "stale"
+    assert amos.store.get_atom(archive_atom["id"])["lifecycle_state"] == "archived"
+    assert amos.store.get_atom(ignored_atom["id"])["health_status"] == "healthy"
+    assert any(
+        event["event_type"] == "decay_policy_applied"
+        for event in amos.store.list_events()
+    )
 
 
 def test_health_memory_can_skip_foreground_policy_tick(amos):
