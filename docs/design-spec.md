@@ -4512,10 +4512,12 @@ steward:
   include maintenance history, health candidates, graph neighborhoods
 
 self_awareness:
-  max_items: 32
-  token_budget: 6000
+  max_items: 100
+  token_budget: 24000
   include self-model, current runtime state, capabilities, limitations,
   open commitments, uncertainties, recent errors, and evidence refs
+  required role self-awareness fields are structural and are not dropped
+  by generic packet budget ordering
 
 shared_coordination:
   max_items: 48

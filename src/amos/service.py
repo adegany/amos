@@ -50,7 +50,7 @@ DEFAULT_PACKET_PROFILES = {
     "executor": {"max_items": 16, "tokens": 3500, "include_conflicts": False},
     "critic": {"max_items": 32, "tokens": 8000, "include_conflicts": True},
     "steward": {"max_items": 64, "tokens": 12000, "include_conflicts": True},
-    "self_awareness": {"max_items": 32, "tokens": 6000, "include_conflicts": True},
+    "self_awareness": {"max_items": 100, "tokens": 24000, "include_conflicts": True},
     "shared_coordination": {"max_items": 48, "tokens": 9000, "include_conflicts": True},
     "agentic_recall": {"max_items": 40, "tokens": 7000, "include_conflicts": True},
 }
@@ -1398,23 +1398,6 @@ class Amos:
         requester: str = "system",
         target_processor: str = "self-model",
     ) -> dict[str, Any]:
-        packet = self.retrieve_packet(
-            scope=scope or {},
-            requester=requester,
-            target_processor=target_processor,
-            retrieval_mode="self_awareness",
-            max_items=100,
-            include_conflicts=True,
-            include_low_health=True,
-            type_filter=[
-                "capability",
-                "commitment",
-                "limitation",
-                "runtime_state",
-                "self_assessment",
-                "self_model",
-            ],
-        )
         by_type: dict[str, list[dict[str, Any]]] = {
             "capability": [],
             "commitment": [],
@@ -1423,19 +1406,62 @@ class Amos:
             "self_assessment": [],
             "self_model": [],
         }
-        omissions = list(packet["omissions"])
-        latest_runtime = None
-        for item in packet["items"]:
-            payload = item["payload"]
-            if payload_agent_id(payload) not in {None, agent_id}:
+        request_scope = dict(scope or {})
+        omissions: list[dict[str, Any]] = []
+        pressure_mode = self._capacity_pressure_mode()
+        target_types = set(by_type)
+        for atom in self.store.list_atoms():
+            atom_ref = atom["id"]
+            if atom.get("deleted"):
+                omissions.append({"atom_ref": atom_ref, "reason": "deleted"})
+                continue
+            if atom["type"] not in target_types:
+                continue
+            if not scope_visible(atom["scope"], request_scope):
+                omissions.append({"atom_ref": atom_ref, "reason": "scope_hidden"})
+                continue
+            if not access_visible(atom["access_policy"], requester, target_processor):
+                omissions.append({"atom_ref": atom_ref, "reason": "access_hidden"})
+                continue
+            if atom["lifecycle_state"] == "archived":
+                omissions.append({"atom_ref": atom_ref, "reason": "archived"})
+                continue
+            if atom["lifecycle_state"] not in {"active", "proposed"}:
                 omissions.append(
-                    {"atom_ref": item["atom_ref"], "reason": "different_agent"}
+                    {"atom_ref": atom_ref, "reason": f"lifecycle:{atom['lifecycle_state']}"}
                 )
                 continue
-            if item["type"] == "runtime_state":
-                if latest_runtime is None or item["updated_at"] > latest_runtime["updated_at"]:
-                    latest_runtime = item
-            by_type[item["type"]].append(item)
+            payload = atom["payload"]
+            if payload_agent_id(payload) not in {None, agent_id}:
+                omissions.append({"atom_ref": atom_ref, "reason": "different_agent"})
+                continue
+            score, _matched, components = self._rank_atom(
+                atom,
+                [],
+                request_scope=request_scope,
+                retrieval_mode="self_awareness",
+            )
+            item, evidence_omissions = self._packet_item(
+                {**atom, "_score_components": components},
+                score,
+                requester=requester,
+                target_processor=target_processor,
+            )
+            omissions.extend(evidence_omissions)
+            by_type[atom["type"]].append(item)
+
+        for items in by_type.values():
+            items.sort(
+                key=lambda item: (
+                    item.get("updated_at") or "",
+                    item.get("score") or 0.0,
+                ),
+                reverse=True,
+            )
+        latest_runtime = None
+        for item in by_type["runtime_state"]:
+            if latest_runtime is None or item["updated_at"] > latest_runtime["updated_at"]:
+                latest_runtime = item
 
         denied = set()
         capability_status: Mapping[str, Any] = {}
@@ -1457,28 +1483,110 @@ class Amos:
                 continue
             visible_capabilities.append(item)
 
+        open_commitments = [
+            item
+            for item in by_type["commitment"]
+            if str(item["payload"].get("status", "open")).lower()
+            not in {"fulfilled", "cancelled", "canceled", "superseded"}
+        ]
+        response_items = [
+            *by_type["self_model"],
+            *visible_capabilities,
+            *by_type["limitation"],
+            *open_commitments,
+            *by_type["self_assessment"],
+        ]
+        if latest_runtime:
+            response_items.append(latest_runtime)
+        for rank, item in enumerate(response_items, start=1):
+            item["rank"] = rank
+        selected = {item["atom_ref"] for item in response_items}
+        conflicts = []
+        if selected:
+            for edge in self.store.list_edges():
+                if edge["relation"] not in CONFLICT_RELATIONS:
+                    continue
+                if edge["source_ref"] in selected or edge["target_ref"] in selected:
+                    conflicts.append(edge)
+        graph_version = self.store.graph_version()
+        request = {
+            "scope": request_scope,
+            "requester": requester,
+            "target_processor": target_processor,
+            "retrieval_mode": "self_awareness",
+            "agent_id": agent_id,
+            "structural": True,
+            "budget_policy": "required_self_awareness_fields_not_budget_limited",
+            "pressure_mode": pressure_mode,
+        }
+        packet_id = stable_id(
+            "pkt",
+            {"request": request, "graph_version": graph_version, "items": response_items},
+        )
+        used_bytes = len(canonical_json(response_items).encode("utf-8"))
+        packet = {
+            "packet_id": packet_id,
+            "schema_version": SCHEMA_VERSION,
+            "request": request,
+            "graph_version": graph_version,
+            "generated_at": utc_now(),
+            "target_processor": target_processor,
+            "retrieval_mode": "self_awareness",
+            "scope": request_scope,
+            "pressure_mode": pressure_mode,
+            "items": response_items,
+            "omissions": omissions,
+            "conflicts": conflicts,
+            "degradation": {
+                "mode": "smp-deterministic-local",
+                "pressure_mode": pressure_mode,
+                "reduced_recall_depth": False,
+                "omitted_evidence_detail": any(
+                    omission["reason"] == "evidence_access_denied"
+                    for omission in omissions
+                ),
+                "index_freshness": {
+                    "semantic_index": "inline_rebuildable",
+                    "graph_version": graph_version,
+                },
+                "reason_codes": sorted({omission["reason"] for omission in omissions}),
+                "vector_index_available": False,
+                "byte_budget": None,
+                "used_bytes": used_bytes,
+            },
+            "provenance": {
+                "store": getattr(self.store, "backend_name", "unknown"),
+                "journal_head": self.store.last_event_hash(),
+                "ranker_profile_id": "amos.v1.self_awareness_structural",
+                "smp_processor_id": self.smp.processor_id,
+            },
+            "cache_policy": {"cacheable": True, "keyed_by_graph_version": True},
+        }
+        with self.store.transaction() as conn:
+            self.store.cache_packet(
+                conn,
+                packet_id=packet_id,
+                request=request,
+                response=packet,
+                graph_version=graph_version,
+            )
         return {
             "view": "self_awareness",
             "agent_id": agent_id,
-            "graph_version": packet["graph_version"],
+            "graph_version": graph_version,
             "generated_at": utc_now(),
             "self_model": by_type["self_model"],
             "capabilities": visible_capabilities,
             "limitations": by_type["limitation"],
-            "open_commitments": [
-                item
-                for item in by_type["commitment"]
-                if str(item["payload"].get("status", "open")).lower()
-                not in {"fulfilled", "cancelled", "canceled", "superseded"}
-            ],
+            "open_commitments": open_commitments,
             "runtime_state": latest_runtime,
             "assessments": by_type["self_assessment"],
             "calibration": self.calibrate_self_model(
                 agent_id=agent_id, scope=scope or {}, record=False
             )["calibration"],
             "omissions": omissions,
-            "conflicts": packet["conflicts"],
-            "source_packet_id": packet["packet_id"],
+            "conflicts": conflicts,
+            "source_packet_id": packet_id,
         }
 
     def calibrate_self_model(

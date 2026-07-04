@@ -1193,6 +1193,99 @@ def test_self_awareness_accepts_spec_native_subject_agent_aliases(amos):
     )
 
 
+def test_self_awareness_structurally_includes_role_facets_under_noisy_budget(amos):
+    scope = {"tenant": "qandl", "component": "training", "run_id": "flight-1"}
+    amos.commit_atom(
+        {
+            "id": "trainer_structural_self",
+            "type": "self_model",
+            "payload": {"agent_id": "trainer", "name": "Qandl trainer"},
+            "scope": {"tenant": "qandl", "component": "training"},
+        }
+    )
+    capability_refs = []
+    for index in range(12):
+        capability_refs.append(
+            amos.commit_atom(
+                {
+                    "id": f"trainer_structural_cap_{index}",
+                    "type": "capability",
+                    "payload": {
+                        "agent_id": "trainer",
+                        "name": f"trainer_capability_{index}",
+                        "description": "large capability detail " + ("x" * 1600),
+                    },
+                    "scope": {"tenant": "qandl", "component": "training"},
+                }
+            )["atom"]["id"]
+        )
+    limitation_refs = []
+    for index in range(6):
+        limitation_refs.append(
+            amos.commit_atom(
+                {
+                    "id": f"trainer_structural_limit_{index}",
+                    "type": "limitation",
+                    "payload": {
+                        "agent_id": "trainer",
+                        "name": f"trainer_limitation_{index}",
+                        "description": "large limitation detail " + ("y" * 1600),
+                    },
+                    "scope": {"tenant": "qandl", "component": "training"},
+                }
+            )["atom"]["id"]
+        )
+    commitment = amos.commit_atom(
+        {
+            "id": "trainer_structural_commitment",
+            "type": "commitment",
+            "payload": {
+                "agent_id": "trainer",
+                "description": "keep role self-awareness complete",
+                "status": "open",
+            },
+            "scope": {"tenant": "qandl", "component": "training"},
+        }
+    )["atom"]
+    runtime = amos.record_runtime_state(
+        agent_id="trainer",
+        capabilities={
+            f"trainer_capability_{index}": {"available": True}
+            for index in range(12)
+        },
+        constraints=["use structural self-awareness"],
+        scope=scope,
+    )["atom"]
+    for index in range(40):
+        amos.commit_atom(
+            {
+                "id": f"other_agent_noise_{index}",
+                "type": "runtime_state",
+                "payload": {
+                    "agent_id": "other-agent",
+                    "status": "available",
+                    "description": "noise " + ("z" * 2400),
+                },
+                "scope": scope,
+            }
+        )
+
+    view = amos.retrieve_self_awareness(agent_id="trainer", scope=scope)
+
+    assert {item["atom_ref"] for item in view["capabilities"]} == set(capability_refs)
+    assert {item["atom_ref"] for item in view["limitations"]} == set(limitation_refs)
+    assert commitment["id"] in {
+        item["atom_ref"] for item in view["open_commitments"]
+    }
+    assert view["runtime_state"]["atom_ref"] == runtime["id"]
+    assert not any(
+        omission["reason"] == "budget_exhausted"
+        for omission in view["omissions"]
+        if omission.get("atom_ref") in {*capability_refs, *limitation_refs, runtime["id"]}
+    )
+    assert view["source_packet_id"].startswith("pkt_")
+
+
 def test_self_awareness_tracks_open_commitments_and_calibrates_claims(amos):
     amos.commit_atom(
         {
