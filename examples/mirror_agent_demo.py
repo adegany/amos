@@ -915,31 +915,23 @@ class MirrorAgentDemo:
         steward = policy_results.get("steward", {})
         index = policy_results.get("index", {})
         maintenance_distiller = policy_results.get("maintenance_distiller", {})
-        demo_committed = [
-            item
-            for item in maintenance_distiller.get("committed", [])
-            if item.get("atom", {})
-            .get("payload", {})
-            .get("distillation_type")
-            == "mirror_demo_training_lesson"
-        ]
+        steward_action_counts = steward.get("action_counts", {})
+        committed_refs = maintenance_distiller.get("committed_refs", [])
         self.result(
             "non_llm_maintenance",
             smp["status"] == "completed"
             and steward["status"] == "completed"
-            and any(action["action"] == "deduplicate" for action in steward["actions"])
-            and bool(demo_committed)
+            and steward_action_counts.get("deduplicate", 0) > 0
+            and bool(committed_refs)
             and policy_event["payload"]["trigger"] == "retrieve_packet"
             and self.amos.llm_reviewer_policy()["enabled_by_default"] is False,
             {
-                "smp_output_count": len(smp["outputs"]),
-                "steward_actions": steward["actions"],
+                "smp_output_count": smp.get("output_count", 0),
+                "steward_action_counts": steward_action_counts,
                 "maintenance_distiller": {
                     "processors": maintenance_distiller.get("processors", []),
-                    "proposal_count": len(maintenance_distiller.get("proposals", [])),
-                    "committed": [
-                        item.get("atom", {}).get("id") for item in demo_committed
-                    ],
+                    "proposal_count": maintenance_distiller.get("proposal_count", 0),
+                    "committed": committed_refs,
                 },
                 "demo_source_refs": [
                     demo_directive["id"],

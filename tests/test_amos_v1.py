@@ -1806,6 +1806,42 @@ def test_memory_policy_worker_force_runs_without_manual_maintenance(amos):
     assert amos.memory_policy_status()["state"]["last_trigger"] == "test_worker"
 
 
+def test_memory_policy_journal_summarizes_large_smp_results(amos):
+    amos.configure_memory_policy(
+        schedule={"every_graph_versions": 100, "every_seconds": 0},
+        maintenance={"max_smp_atoms": 12},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+    )
+    for index in range(12):
+        amos.commit_atom(
+            {
+                "id": f"journal_policy_source_{index}",
+                "type": "belief",
+                "payload": {"claim": f"journal policy claim {index % 3}"},
+                "scope": {"tenant": "journal-policy"},
+            }
+        )
+
+    result = amos.run_memory_policy(
+        force=True,
+        trigger="test_journal_summary",
+        scope={"tenant": "journal-policy"},
+    )
+
+    assert result["results"]["smp"]["outputs"]
+    event = result["event"]
+    payload = event["payload"]
+    smp = payload["results"]["smp"]
+    assert "outputs" not in smp
+    assert smp["output_count"] == len(result["results"]["smp"]["outputs"])
+    assert smp["analyzed_atom_count"] == 12
+    assert smp["sample_output_ids"]
+    assert payload["results"]["steward"]["event_id"]
+    assert len(json.dumps(payload)) < 20000
+    assert amos.verify_replay()["status"] == "ok"
+
+
 def test_external_processor_distills_supported_control_lesson(amos):
     amos.register_maintenance_processor(ExampleTrainingFlightProcessor())
     scope = {"tenant": "example", "component": "training"}

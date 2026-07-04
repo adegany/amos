@@ -400,7 +400,7 @@ class Amos:
                 "policy": policy,
                 "started_graph_version": started_graph_version,
                 "completed_graph_version": policy_event_graph_version,
-                "results": results,
+                "results": self._memory_policy_journal_results(results),
             }
             with self.store.transaction() as conn:
                 event = self.store.append_event(
@@ -3017,6 +3017,183 @@ class Amos:
                     data.get("last_maintenance_distiller_refs", [])
                 ),
             }
+
+    def _memory_policy_journal_results(
+        self, results: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        journal: dict[str, Any] = {}
+        for key, value in results.items():
+            if key == "smp" and isinstance(value, Mapping):
+                journal[key] = self._summarize_smp_result(value)
+            elif key == "steward" and isinstance(value, Mapping):
+                journal[key] = self._summarize_steward_result(value)
+            elif key == "distillation" and isinstance(value, Mapping):
+                journal[key] = self._summarize_policy_distillation_result(value)
+            elif key == "maintenance_distiller" and isinstance(value, Mapping):
+                journal[key] = self._summarize_maintenance_distiller_result(value)
+            elif key in {"index", "packet_cache"} and isinstance(value, Mapping):
+                journal[key] = dict(value)
+            else:
+                journal[key] = self._bounded_json_summary(value)
+        return journal
+
+    def _summarize_smp_result(self, result: Mapping[str, Any]) -> dict[str, Any]:
+        outputs = [
+            output
+            for output in result.get("outputs", [])
+            if isinstance(output, Mapping)
+        ]
+        review_required = [
+            output
+            for output in result.get("review_required", [])
+            if isinstance(output, Mapping)
+        ]
+        return {
+            "status": result.get("status"),
+            "processor_id": result.get("processor_id"),
+            "processor_version": result.get("processor_version"),
+            "graph_version": result.get("graph_version"),
+            "scope": dict(result.get("scope") or {}),
+            "atom_count": result.get("atom_count", 0),
+            "analyzed_atom_count": result.get("analyzed_atom_count", 0),
+            "omitted_atom_count": result.get("omitted_atom_count", 0),
+            "output_count": len(outputs),
+            "review_required_count": len(review_required),
+            "output_type_counts": self._count_mapping_values(outputs, "output_type"),
+            "reason_code_counts": self._count_mapping_values(outputs, "reason_code"),
+            "risk_level_counts": self._count_mapping_values(outputs, "risk_level"),
+            "review_required_refs": self._bounded_refs(
+                ref
+                for output in review_required
+                for ref in output.get("input_refs", [])
+            ),
+            "sample_output_ids": self._bounded_refs(
+                output.get("output_id") for output in outputs
+            ),
+        }
+
+    def _summarize_steward_result(self, result: Mapping[str, Any]) -> dict[str, Any]:
+        actions = [
+            action
+            for action in result.get("actions", [])
+            if isinstance(action, Mapping)
+        ]
+        event = result.get("event")
+        event_ref = event.get("event_id") if isinstance(event, Mapping) else None
+        return {
+            "status": result.get("status"),
+            "graph_version": result.get("graph_version"),
+            "action_count": len(actions),
+            "action_counts": self._count_mapping_values(actions, "action"),
+            "target_refs": self._bounded_refs(
+                ref
+                for action in actions
+                for ref in [
+                    *list(action.get("atom_refs", [])),
+                    action.get("kept"),
+                    action.get("archived"),
+                ]
+            ),
+            "event_id": event_ref,
+        }
+
+    def _summarize_policy_distillation_result(
+        self, result: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        distilled = result.get("distilled")
+        distilled_atom = (
+            distilled.get("atom")
+            if isinstance(distilled, Mapping)
+            and isinstance(distilled.get("atom"), Mapping)
+            else None
+        )
+        return {
+            "status": result.get("status"),
+            "reason": result.get("reason"),
+            "candidate_count": result.get("candidate_count"),
+            "min_source_atoms": result.get("min_source_atoms"),
+            "source_refs": self._bounded_refs(result.get("source_refs", [])),
+            "distilled_atom_ref": distilled_atom.get("id") if distilled_atom else None,
+        }
+
+    def _summarize_maintenance_distiller_result(
+        self, result: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        committed = [
+            item for item in result.get("committed", []) if isinstance(item, Mapping)
+        ]
+        deferred = [
+            item for item in result.get("deferred", []) if isinstance(item, Mapping)
+        ]
+        proposals = [
+            item for item in result.get("proposals", []) if isinstance(item, Mapping)
+        ]
+        event = result.get("event")
+        event_ref = event.get("event_id") if isinstance(event, Mapping) else None
+        return {
+            "status": result.get("status"),
+            "reason": result.get("reason"),
+            "scope": dict(result.get("scope") or {}),
+            "domain": result.get("domain"),
+            "graph_version": result.get("graph_version"),
+            "window": dict(result.get("window") or {}),
+            "processors": list(result.get("processors", [])),
+            "missing_processors": list(result.get("missing_processors", [])),
+            "proposal_count": len(proposals),
+            "committed_count": len(committed),
+            "deferred_count": len(deferred),
+            "proposal_action_counts": self._count_mapping_values(proposals, "action"),
+            "committed_status_counts": self._count_mapping_values(committed, "status"),
+            "deferred_reason_counts": self._count_mapping_values(deferred, "reason"),
+            "committed_refs": self._bounded_refs(
+                item.get("atom", {}).get("id")
+                if isinstance(item.get("atom"), Mapping)
+                else item.get("edge", {}).get("edge_id")
+                if isinstance(item.get("edge"), Mapping)
+                else None
+                for item in committed
+            ),
+            "deferred_proposal_ids": self._bounded_refs(
+                item.get("proposal_id") for item in deferred
+            ),
+            "reviewer": dict(result.get("reviewer") or {}),
+            "event_id": event_ref,
+        }
+
+    def _count_mapping_values(
+        self, rows: Sequence[Mapping[str, Any]], key: str
+    ) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for row in rows:
+            value = str(row.get(key) or "unknown")
+            counts[value] = counts.get(value, 0) + 1
+        return dict(sorted(counts.items()))
+
+    def _bounded_refs(self, refs: Any, *, limit: int = 24) -> list[str]:
+        output: list[str] = []
+        for ref in refs or []:
+            if ref in (None, "", [], {}):
+                continue
+            text = str(ref)
+            if text in output:
+                continue
+            output.append(text)
+            if len(output) >= limit:
+                break
+        return output
+
+    def _bounded_json_summary(self, value: Any, *, max_bytes: int = 2048) -> Any:
+        try:
+            encoded = canonical_json(value)
+        except Exception:
+            return {"summary": str(value)[:max_bytes], "truncated": True}
+        if len(encoded.encode("utf-8")) <= max_bytes:
+            return value
+        return {
+            "summary_digest": digest(value),
+            "summary_bytes": len(encoded.encode("utf-8")),
+            "truncated": True,
+        }
 
     def _memory_policy_due(
         self,

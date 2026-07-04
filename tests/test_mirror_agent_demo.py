@@ -46,17 +46,10 @@ def test_mirror_agent_demo_runs_all_scenarios_and_emits_inspector_report(tmp_pat
     maintenance = report["maintenance_journal"]["latest"]
     assert maintenance["policy"]["trigger"] == "retrieve_packet"
     assert maintenance["policy"]["results"]["packet_cache"]["status"] == "invalidated"
-    assert maintenance["smp"]["outputs"]
-    assert maintenance["maintenance_distiller"]["proposals"]
-    assert any(
-        item.get("atom", {}).get("payload", {}).get("distillation_type")
-        == "mirror_demo_training_lesson"
-        for item in maintenance["maintenance_distiller"]["committed"]
-    )
-    assert any(
-        action["action"] == "deduplicate"
-        for action in maintenance["steward"]["actions"]
-    )
+    assert maintenance["smp"]["output_count"] > 0
+    assert maintenance["maintenance_distiller"]["proposal_count"] > 0
+    assert maintenance["maintenance_distiller"]["committed_refs"]
+    assert maintenance["steward"]["action_counts"]["deduplicate"] > 0
     assert (
         report["capacity"]["health"]["pressure_mode"] in {"orange", "red"}
     )
