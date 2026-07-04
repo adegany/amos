@@ -1,10 +1,79 @@
 # Amos
 
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-pytest-blue.svg)](tests)
+[![Storage](https://img.shields.io/badge/v1%20storage-SQLite-lightgrey.svg)](#roadmap)
+[![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#current-status)
+
+**A typed, auditable memory service for agents that need durable recall,
+provenance, self-models, and deterministic maintenance instead of prompt-only
+memory.**
+
 **Amos** stands for **Agent Memory Operating System**.
 
 Amos is a model-neutral, layered, associative, self-maintaining memory substrate for agentic AI systems. It treats agent memory as an operating-system-like service: capture evidence, maintain typed memory, preserve provenance, perform cleanup, promote and demote memories across tiers, and render task-specific memory packets for reasoners, planners, executors, critics, and future processors.
 
 The core thesis is that long-term agent memory should not be stored primarily as English summaries. English, embeddings, prompt snippets, and planner-specific payloads should be generated views over a canonical memory substrate composed of typed atoms, evidence links, associative edges, health states, and maintenance actions.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A[Agents and tools] -->|capture events, evidence, atoms| H[AMOS HTTP API]
+    H --> S[AMOS service]
+    S --> V[Schema validation and access policy]
+    V --> J[Append-only journal]
+    V --> M[Typed memory atoms]
+    V --> E[Evidence records]
+    V --> G[Associative graph edges]
+    J --> R[Replay and verification]
+    M --> P[Packet renderer]
+    E --> P
+    G --> P
+    S --> W[Memory policy worker]
+    W --> D[Deterministic distillation]
+    W --> SMP[Semantic Maintenance Processor]
+    W --> C[Capacity and cleanup]
+    D --> M
+    SMP --> G
+    C --> M
+    P -->|bounded memory packets| A
+    S --> DB[(SQLite v1-local\nPostgres planned)]
+```
+
+AMOS exposes memory as a service boundary. Agents submit structured evidence
+and receive bounded packets; the service owns canonical state, journal replay,
+maintenance policy, provenance, packet cache invalidation, and capacity
+pressure reporting.
+
+## Why Amos?
+
+The agent-memory ecosystem is moving quickly. Projects such as
+[Mem0](https://arxiv.org/abs/2504.19413), [Zep/Graphiti](https://arxiv.org/abs/2501.13956),
+[Letta/MemGPT](https://arxiv.org/abs/2310.08560), and
+[MemOS](https://arxiv.org/abs/2505.22101) have pushed long-term memory beyond
+plain RAG and short conversation buffers.
+
+AMOS is aimed at a narrower systems problem: making canonical agent memory
+auditable, typed, replayable, and maintainable across a coordinated system of
+agents.
+
+| System | Typical center of gravity | Amos emphasis |
+| --- | --- | --- |
+| Mem0 | Production long-term memory extraction and retrieval for agents and apps. | Typed atoms, evidence links, journal replay, deterministic maintenance, and explicit packet contracts. |
+| Zep / Graphiti | Temporal knowledge graph memory for conversational and enterprise context. | Service-owned canonical memory with lifecycle state, provenance, access policy, omissions, and capacity disclosure. |
+| Letta / MemGPT | Stateful agent runtime and virtual context management. | Memory substrate that can sit below multiple agents, including reasoners, planners, critics, and domain processors. |
+| MemOS | Research framing for memory as an operating-system resource across memory types. | A small Python implementation with concrete HTTP APIs, SQLite v1-local storage, schemas, tests, and maintenance workers. |
+
+Use AMOS when you want:
+
+- Canonical memory records instead of English-only summaries.
+- A shared memory service for a coordinated group of agents.
+- Per-agent self-models, capabilities, limitations, commitments, and runtime-state overlays.
+- Retrieval packets that disclose provenance, omissions, conflicts, degradation, and scope filtering.
+- Deterministic cleanup and distillation paths that do not require an LLM.
+- Replayable state changes through an append-only event journal.
 
 ## Current status
 
@@ -148,6 +217,37 @@ ambiguous or high-risk work for review.
 - Support reasoners, planners, executors, critics, and future non-LLM processors.
 - Model memory as dynamic: layered, associative, promotable, demotable, and self-maintaining.
 - Treat memory maintenance as a first-class internal system responsibility.
+
+## Roadmap
+
+### v1.0
+
+- Stabilize the V1 HTTP API envelopes and schema contracts.
+- Keep SQLite as the first supported shared-service deployment profile.
+- Expand replay verification and maintenance-worker acceptance tests.
+- Improve packet-ranking diagnostics, omissions reporting, and retrieval-outcome telemetry.
+- Harden the Mirror Agent demo as the reference self-awareness integration.
+
+### Storage and Scale
+
+- Add production Postgres support using the existing migration contract.
+- Add optional vector index integrations while keeping vector data as a rebuildable derived index.
+- Support larger multi-tenant deployments with clearer capacity budgets, pressure modes, and retention policy controls.
+- Add export/import tooling for moving v1-local SQLite stores into production deployments.
+
+### Memory Quality
+
+- Broaden deterministic SMP coverage for deduplication, contradiction detection, stale-memory demotion, and graph repair.
+- Add more domain-processor examples for task-specific distillation without changing AMOS core.
+- Improve self-model calibration reports and agentic-recall audits.
+- Add governance surfaces for reviewing deferred or high-risk maintenance proposals.
+
+### Ecosystem
+
+- Publish package artifacts when the API stabilizes.
+- Add GitHub Actions CI badges once repository CI is configured.
+- Document integration adapters for agent runtimes and orchestration frameworks.
+- Provide deployment recipes for local service, containerized service, and hosted Postgres-backed service profiles.
 
 ## Non-goals for this phase
 
