@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/deletion_and_capacity.schema.json",
+  "title": "AMOS Deletion and Capacity Schemas",
+  "$defs": {
+    "DeletionRequest": { "type": "object", "required": ["target_ref", "reason"], "properties": { "target_ref": { "type": "string" }, "reason": { "type": "string" }, "recreation_policy": { "type": "string" }, "requested_by": { "type": "string" } }, "additionalProperties": true },
+    "MemoryTombstone": { "type": "object", "required": ["tombstone_id", "target_ref", "recreation_policy", "reason", "created_at"], "properties": { "tombstone_id": { "type": "string" }, "target_ref": { "type": "string" }, "recreation_policy": { "type": "string" }, "reason": { "type": "string" }, "created_at": { "type": "string" } } },
+    "CapacityBudget": { "type": "object", "required": ["hard_capacity_bytes"], "properties": { "hard_capacity_bytes": { "type": "integer", "minimum": 1 }, "warning_ratio": { "type": "number", "minimum": 0, "maximum": 1 }, "critical_ratio": { "type": "number", "minimum": 0, "maximum": 1 } }, "additionalProperties": true },
+    "CapacityHealthReport": { "type": "object", "required": ["store", "size_bytes", "pressure_mode", "graph_version"], "properties": { "store": { "type": "string" }, "size_bytes": { "type": "integer", "minimum": 0 }, "pressure_mode": { "enum": ["green", "orange", "red"] }, "graph_version": { "type": "integer", "minimum": 0 }, "degradation": { "type": "object" } }, "additionalProperties": true }
+  }
+}

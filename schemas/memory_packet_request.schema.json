@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/memory_packet_request.schema.json",
+  "title": "AMOS MemoryPacketRequest",
+  "type": "object",
+  "properties": {
+    "request_id": { "type": "string" },
+    "client_identity": { "type": "string" },
+    "target_processor": { "type": "string" },
+    "retrieval_mode": { "enum": ["general", "self_awareness", "shared_coordination", "agentic_recall"] },
+    "task_context": { "type": "object" },
+    "scope": { "$ref": "scope.schema.json" },
+    "shared_view_ref": { "type": "string" },
+    "agentic_recall_subject": { "type": "string" },
+    "requested_memory_types": { "type": "array", "items": { "type": "string" } },
+    "max_items": { "type": "integer", "minimum": 1 },
+    "token_or_byte_budget": {},
+    "include_conflicts": { "type": "boolean" }
+  },
+  "additionalProperties": true
+}

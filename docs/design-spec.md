@@ -706,49 +706,59 @@ Level 3: Physical storage encoding
   Implementation-dependent: JSONB, Protobuf, CBOR, graph database, columnar snapshot, etc.
 ```
 
-A practical first implementation can use:
+A practical v1 implementation can use:
 
 ```text
+Shared Amos service
+  HTTP API process that owns the canonical store and serializes mutations
+
 Event Journal
-  JSON Lines or Protobuf events
+  SQLite append-only event journal table, with exportable JSON records
 
 Canonical Memory Graph
-  Postgres tables with JSONB payloads plus normalized indexes
+  SQLite tables with JSON payload columns plus normalized indexes
 
 Evidence Archive
   object storage or filesystem storage with checksums and retention metadata
 
 Derived Indexes
-  vector index, keyword index, graph adjacency tables, packet cache
+  keyword index, graph adjacency tables, packet cache, and replaceable vector index
 ```
 
-A relational MVP could map the canonical graph into these tables:
+Postgres is not required for v1. A later production-scale backend may replace
+SQLite with Postgres tables using JSONB payloads and stronger multi-process
+operational features, as long as it preserves the same journal, schema,
+authorization, deletion, replay, and packet contracts.
+
+A v1 relational MVP can map the canonical graph into these SQLite tables.
+Future Postgres migrations can keep the same logical columns and use JSONB
+where appropriate.
 
 ```text
 atoms
   id
   type
   schema_version
-  payload JSONB
-  evidence_refs JSONB
-  scope JSONB
-  confidence JSONB
-  salience JSONB
-  utility JSONB
+  payload JSON
+  evidence_refs JSON
+  scope JSON
+  confidence JSON
+  salience JSON
+  utility JSON
   layer
   health_status
   lifecycle_state
   retention_class
-  access_policy JSONB
+  access_policy JSON
   created_at
   observed_at
   updated_at
   last_accessed
-  decay_policy JSONB
+  decay_policy JSON
   version
-  supersedes JSONB
-  revision_history JSONB
-  index_refs JSONB
+  supersedes JSON
+  revision_history JSON
+  index_refs JSON
 
 edges
   id
@@ -756,12 +766,12 @@ edges
   target_id
   edge_type
   weight
-  evidence_refs JSONB
+  evidence_refs JSON
   direction
-  decay_policy JSONB
-  inhibition_policy JSONB
+  decay_policy JSON
+  inhibition_policy JSON
   lifecycle_state
-  access_policy JSONB
+  access_policy JSON
   created_at
   last_reinforced
   updated_at
@@ -770,27 +780,27 @@ evidence
   id
   source_type
   source_ref
-  span JSONB
+  span JSON
   checksum
   timestamp
-  access_policy JSONB
+  access_policy JSON
   retention_policy
-  deletion_policy JSONB
+  deletion_policy JSON
   encryption_key_ref
 
 event_journal
   event_id
   event_type
   schema_version
-  actor JSONB
-  target_refs JSONB
-  payload JSONB
-  payload_refs JSONB
-  evidence_refs JSONB
+  actor JSON
+  target_refs JSON
+  payload JSON
+  payload_refs JSON
+  evidence_refs JSON
   idempotency_key
-  causal_parent_ids JSONB
-  expected_versions JSONB
-  authorization_context JSONB
+  causal_parent_ids JSON
+  expected_versions JSON
+  authorization_context JSON
   occurred_at
   accepted_at
   result_status
@@ -2682,6 +2692,9 @@ POST /v1/atoms:commit
 POST /v1/packets:retrieve
 POST /v1/retrieval-outcomes
 POST /v1/maintenance:request
+GET  /v1/memory-policy
+POST /v1/memory-policy:configure
+POST /v1/memory-policy:run
 POST /v1/deletion-requests
 POST /v1/runtime-state
 POST /v1/self-assessments
@@ -2758,6 +2771,32 @@ POST /v1/maintenance:request
   request payload: target_refs, action_type, reason_code, risk_level
   response payload: maintenance event refs, review requirement, accepted action refs
   consistency: strong for high-risk actions, eventual for low-risk proposals
+
+GET /v1/memory-policy
+  response payload: configured policy, persisted policy state, due reasons,
+  graph_version
+  consistency: monotonic
+
+POST /v1/memory-policy:configure
+  request payload: enabled flag, schedule overrides, maintenance overrides,
+  distillation overrides, maintenance_distiller overrides
+  response payload: effective policy and policy status
+  consistency: strong
+
+POST /v1/memory-policy:run
+  request payload: optional force flag, trigger, scope
+  response payload: policy tick status,
+  SMP/steward/distillation/maintenance_distiller/index/cache results, journal
+  event ref when completed
+  consistency: strong when a tick runs
+
+POST /v1/maintenance-distiller:run
+  request payload: scope, domain, optional processor_ids, window limits,
+  auto_commit_low_risk, reviewer
+  response payload: evidence window summary, selected processors, proposal
+  records, committed low-risk atom refs, deferred review items, reviewer status,
+  journal event ref
+  consistency: strong when a tick runs
 
 POST /v1/deletion-requests
   request payload: DeletionRequest
@@ -3188,6 +3227,7 @@ retrieval.performed
 retrieval.outcome_recorded
 maintenance.action_proposed
 maintenance.action_committed
+memory_policy_run
 index.rebuilt
 ```
 
@@ -4165,41 +4205,54 @@ Generated Protobuf, Avro, or typed language models may be produced from the JSON
 V1 storage target:
 
 ```text
+service boundary:
+  HTTP API server owns one in-process SQLite database and is the shared Amos instance
+
 primary database:
-  Postgres
+  SQLite
 
 canonical graph:
-  normalized relational columns + JSONB payloads
+  normalized relational columns + JSON payloads
 
 event journal:
-  Postgres append-only event_journal table
+  SQLite append-only event_journal table
 
 evidence archive:
   filesystem or object storage referenced by EvidenceRecord.source_ref
 
 derived vector index:
-  Postgres pgvector if available, otherwise a replaceable external vector index
+  replaceable derived index; v1 does not require a bundled vector database
 
 packet cache:
-  Postgres table or Redis-compatible cache keyed by graph_version and request signature
+  SQLite table keyed by graph_version and request signature
 ```
 
 The first implementation must keep vector indexes, packet caches, generated summaries, and telemetry rollups rebuildable from canonical records and retained evidence.
+
+Postgres is a future TODO for scale-out deployments that need multiple API
+instances, independent writer processes, database-managed role separation,
+replication, point-in-time recovery, JSONB/GIN indexing, or stronger operational
+tooling. Postgres migration artifacts may be kept as a target contract, but
+they are not required to prove v1 correctness.
 
 ### 29.3 Deployment topology
 
 V1 strong-writer topology:
 
 ```text
-one Postgres primary writer per tenant/workspace shard
-serializable or repeatable-read transactions for strong canonical mutations
+one HTTP API service process owns the SQLite database for a shared Amos instance
+service-level locking plus SQLite transactions for strong canonical mutations
 row-level expected_version checks for atoms and edges
 unique constraints for idempotency keys
-transactional outbox for pub/sub events
-async workers for derived indexes and packet cache refresh
+event journal as the transactional outbox for later projections
+in-process or service-coordinated workers for derived indexes and packet cache refresh
 ```
 
-Cluster consensus, multi-primary writes, and cross-region active-active replication are post-v1 concerns. V1 may use read replicas for retrieval only when packets disclose graph version and derived-index freshness.
+Multiple API instances, direct multi-process writers, read replicas, cluster
+consensus, multi-primary writes, and cross-region active-active replication are
+post-v1 concerns. A v1 deployment should share AMOS by routing clients through
+the API service rather than by allowing several processes to write to the same
+SQLite file independently.
 
 ### 29.4 Initial ontology governance
 
@@ -4552,9 +4605,175 @@ capacity degradation:
 
 SMP authority:
   high-risk SMP recommendation requires review before mutation
+
+automatic memory policy:
+  scheduled retrieval or worker ticks run deterministic maintenance, create
+  provenance-linked distilled atoms, refresh derived indexes, invalidate packet
+  cache, persist policy state, and journal memory_policy_run events without an
+  LLM
 ```
 
-### 29.11 Procedural memory execution policy
+### 29.11 V1 automatic memory policy
+
+V1 memory maintenance is a service-owned policy, not an integration-specific
+manual bridge call.
+
+Default policy:
+
+```text
+enabled:
+  true
+
+schedule:
+  every_graph_versions: 25
+  every_seconds: 300
+  run_on_pressure: true
+
+maintenance:
+  run_smp: true
+  run_steward: true
+  rebuild_indexes: true
+  invalidate_packet_cache: true
+
+distillation:
+  enabled: true
+  min_source_atoms: 6
+  max_source_atoms: 10
+  candidate_types:
+    action_outcome
+    agentic_trace
+    belief
+    episode
+    preference
+  distillation_type: automatic_policy
+  archive_sources: false
+  approved_by: null
+
+maintenance_distiller:
+  enabled: true
+  auto_commit_low_risk: true
+  processor_ids: []
+  domain: generic
+  max_atoms: 128
+  max_events: 64
+  max_retrieval_outcomes: 64
+  reviewer:
+    enabled: false
+    authority: draft_only
+```
+
+The policy tick runs opportunistically inside the AMOS service on retrieval,
+memory-health observation, explicit worker ticks, and operator-forced runs. A
+v1 implementation may add a background timer, but the correctness contract is
+that connected agents do not own lifecycle maintenance themselves.
+
+When due, the policy should:
+
+```text
+run SMP analysis
+run the memory steward for low-risk reversible cleanup
+create provenance-linked semantic distillations when enough eligible source
+  atoms are available
+build a bounded evidence window and run registered maintenance processor packs
+commit only low-risk, policy-allowed proposals such as add_atom distillations
+defer medium/high-risk proposals, health changes, merges, archives, access
+  policy changes, and ambiguous claims to explicit review
+refresh rebuildable derived-index metadata
+invalidate packet cache
+persist memory_policy_state
+append a memory_policy_run event
+```
+
+Automatic distillation is non-LLM. It creates a canonical semantic memory with
+source refs, policy metadata, `layer = consolidated_long_term`, and
+`retention_class = distilled`. Source archival is disabled by default unless an
+explicit approval policy enables it.
+
+The memory policy is observable and tunable through the V1 HTTP API and CLI.
+Manual `run` operations are operator overrides or worker ticks; they are not
+the primary maintenance path.
+
+#### 29.11.1 Processor-pack distiller worker
+
+The V1 distiller worker generalizes SMP beyond the built-in AMOS cleanup
+heuristics. A processor pack receives a bounded `EvidenceWindow` and returns
+side-effect-free `MaintenanceProposal` records. The AMOS service, not the
+processor, applies policy gates and journaled mutations.
+
+Evidence window:
+
+```text
+atoms:
+  visible active atoms in scope
+edges:
+  visible graph neighborhood for selected atoms
+evidence:
+  visible supporting evidence records
+retrieval_outcomes:
+  recent packet-use telemetry
+events:
+  recent event-journal entries
+scope:
+  request scope
+domain:
+  generic or domain-specific label
+graph_version:
+  source graph version
+```
+
+Maintenance proposal:
+
+```text
+proposal_id:
+  stable id derived from processor, action, source refs, and payload digest
+processor_id:
+  registered deterministic processor pack supplied by AMOS or by an installed
+  client package
+processor_version:
+  pack version
+action:
+  add_atom | mark_health | review_cluster | review_conflict | review_required | ...
+risk_level:
+  low | medium | high
+confidence:
+  bounded numeric confidence
+reason_code:
+  machine-readable reason
+source_refs:
+  canonical refs that support the proposal
+target_refs:
+  refs that would be changed, if any
+evidence_refs:
+  supporting evidence refs
+payload:
+  proposed mutation or review details
+```
+
+Only `risk_level = low` and `action = add_atom` is auto-committable in V1.
+The committed atom must be a derived canonical atom with source refs,
+proposal id, processor id, and policy metadata. Other actions are returned as
+deferred proposals and journaled in `maintenance_distillation_run`; they are
+not silently discarded.
+
+The default registry in the AMOS package includes only generic AMOS
+maintenance:
+
+```text
+amos.maintenance.generic.v1:
+  adapter around the deterministic SMP for health, duplicate, and conflict
+  proposals
+```
+
+Client packages may register additional processors in-process or load them at
+service startup through import paths. Those processors must live in the client
+package, implement the generic `MaintenanceProcessor` contract, and return
+side-effect-free `MaintenanceProposal` records. This keeps AMOS reusable across
+agents: integrations write typed atoms and evidence into shared AMOS; client
+processors inspect those canonical records; low-risk derived memories are
+committed through the shared service policy; high-risk or ambiguous changes
+remain review items.
+
+### 29.12 Procedural memory execution policy
 
 V1 procedural memory is advisory by default.
 
@@ -4572,7 +4791,7 @@ autonomous execution:
 
 The executor may use procedures to choose actions only within its existing tool permissions and policy constraints.
 
-### 29.12 LLM reviewer default
+### 29.13 LLM reviewer default
 
 V1 LLM reviewer default:
 
@@ -4595,9 +4814,14 @@ forbidden:
 
 LLM reviewer output must use the same SMP output envelope: `processor_id`, `processor_version`, `input_refs`, `output_type`, `confidence`, `reason_code`, `evidence_refs`, `recommended_action`, and `risk_level`.
 
-### 29.13 Post-v1 extension points
+### 29.14 Post-v1 extension points
 
-Post-v1 work may revisit storage backends, multi-primary replication, learned ranking, generated Protobuf or Avro artifacts, executable procedures, and default LLM-review workflows. Those changes must preserve the v1 journal, replay, deletion, authorization, and packet contracts unless a versioned migration explicitly replaces them.
+Post-v1 work may add a production Postgres backend, multi-instance service
+deployment, direct worker processes, multi-primary replication, learned ranking,
+generated Protobuf or Avro artifacts, executable procedures, and default
+LLM-review workflows. Those changes must preserve the v1 journal, replay,
+deletion, authorization, and packet contracts unless a versioned migration
+explicitly replaces them.
 
 ---
 
@@ -4746,7 +4970,8 @@ optional LLM escalation policy
 Only after the design is stable, begin implementation planning:
 
 ```text
-Postgres migration sequence
+SQLite service migration sequence
+future Postgres migration sequence
 JSON Schema artifact layout
 generated validator/client layout
 indexing strategy
@@ -4782,6 +5007,8 @@ schema artifacts:
   SMP output schema
 
 storage artifacts:
+  SQLite migration for the v1 service-owned store
+  optional/future Postgres migration contract
   event_journal migration
   atoms migration
   edges migration
@@ -4822,6 +5049,7 @@ Required v1 acceptance gates:
 schema gate:
   payloads cannot duplicate envelope-only fields such as evidence_refs, confidence,
   lifecycle_state, health_status, retention_class, or access_policy
+  atom payloads must satisfy the required typed contract for their MemoryAtom.type
 
 journal gate:
   every canonical mutation is represented by an EventJournalEntry with idempotency,

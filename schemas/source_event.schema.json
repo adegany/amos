@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/source_event.schema.json",
+  "title": "AMOS SourceEvent",
+  "type": "object",
+  "required": ["source_type", "source_ref", "payload"],
+  "properties": {
+    "source_type": { "type": "string" },
+    "source_ref": { "type": "string" },
+    "payload": {},
+    "scope": { "$ref": "scope.schema.json" },
+    "access_policy": { "$ref": "access_policy.schema.json" }
+  },
+  "additionalProperties": true
+}

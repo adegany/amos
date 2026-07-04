@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/core_payloads.schema.json",
+  "title": "AMOS Core Typed Payloads",
+  "$defs": {
+    "BeliefAtom": {
+      "type": "object",
+      "anyOf": [
+        { "required": ["claim"] },
+        { "required": ["subject", "predicate", "value"] },
+        { "required": ["subject", "relation", "object"] }
+      ],
+      "properties": {
+        "claim": { "type": "string" },
+        "subject": {},
+        "predicate": { "type": "string" },
+        "relation": { "type": "string" },
+        "object": {},
+        "value": {},
+        "qualifiers": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "PreferenceAtom": {
+      "type": "object",
+      "required": ["holder", "polarity", "target", "applicability_scope", "strength"],
+      "properties": {
+        "holder": { "type": "string" },
+        "polarity": {
+          "enum": [
+            "prefer",
+            "prefers",
+            "avoid",
+            "avoids",
+            "require",
+            "requires",
+            "forbid",
+            "forbids"
+          ]
+        },
+        "target": {},
+        "applicability_scope": {},
+        "strength": {}
+      },
+      "additionalProperties": true
+    },
+    "Goal": {
+      "type": "object",
+      "anyOf": [
+        { "required": ["description"] },
+        { "required": ["objective"] },
+        { "required": ["desired_state"] }
+      ],
+      "properties": {
+        "description": { "type": "string" },
+        "objective": { "type": "string" },
+        "desired_state": {},
+        "goal_status": { "type": "string" },
+        "priority": {},
+        "status": { "type": "string" },
+        "owner": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "Commitment": {
+      "type": "object",
+      "anyOf": [
+        { "required": ["description"] },
+        { "required": ["promised_action"] }
+      ],
+      "properties": {
+        "agent_id": { "type": "string" },
+        "agent": { "type": "string" },
+        "description": { "type": "string" },
+        "promised_action": {},
+        "commitment_status": { "type": "string" },
+        "status": { "type": "string", "default": "open" },
+        "due": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "ProcedureAtom": {
+      "type": "object",
+      "required": ["trigger_context", "steps"],
+      "properties": {
+        "trigger_context": {},
+        "steps": { "type": "array", "items": {} },
+        "rollback_plan": {},
+        "review_status": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "Episode": {
+      "type": "object",
+      "anyOf": [
+        { "required": ["summary"] },
+        { "required": ["task"] }
+      ],
+      "properties": {
+        "summary": { "type": "string" },
+        "task": {},
+        "outcome": {},
+        "started_at": { "type": "string" },
+        "ended_at": { "type": "string" },
+        "participants": { "type": "array", "items": { "type": "string" } },
+        "external_refs": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": true
+    }
+  }
+}

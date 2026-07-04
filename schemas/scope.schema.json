@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/scope.schema.json",
+  "title": "AMOS Scope",
+  "type": "object",
+  "additionalProperties": {
+    "type": ["string", "number", "boolean", "null"]
+  }
+}

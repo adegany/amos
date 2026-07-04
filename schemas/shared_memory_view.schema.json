@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/shared_memory_view.schema.json",
+  "title": "AMOS SharedMemoryView",
+  "type": "object",
+  "required": ["view", "processor_ids", "common_graph_version", "items", "per_processor_overlays"],
+  "properties": {
+    "view": { "const": "shared_memory" },
+    "processor_ids": { "type": "array", "items": { "type": "string" } },
+    "common_graph_version": { "type": "integer", "minimum": 0 },
+    "generated_at": { "type": "string" },
+    "items": { "type": "array" },
+    "per_processor_overlays": { "type": "object" },
+    "source_packets": { "type": "object" }
+  },
+  "additionalProperties": true
+}

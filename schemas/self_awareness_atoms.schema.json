@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/self_awareness_atoms.schema.json",
+  "title": "AMOS Self Awareness Payloads",
+  "$defs": {
+    "SelfModelAtom": { "type": "object", "anyOf": [{ "required": ["agent_id"] }, { "required": ["subject_agent"] }], "properties": { "agent_id": { "type": "string" }, "subject_agent": { "type": "string" }, "name": { "type": "string" }, "role": { "type": "string" } }, "additionalProperties": true },
+    "CapabilityAtom": { "type": "object", "allOf": [{ "anyOf": [{ "required": ["agent_id"] }, { "required": ["subject_agent"] }] }, { "anyOf": [{ "required": ["name"] }, { "required": ["capability"] }] }], "properties": { "agent_id": { "type": "string" }, "subject_agent": { "type": "string" }, "name": { "type": "string" }, "capability": { "type": "string" }, "description": { "type": "string" } }, "additionalProperties": true },
+    "LimitationAtom": { "type": "object", "allOf": [{ "anyOf": [{ "required": ["agent_id"] }, { "required": ["subject_agent"] }] }, { "anyOf": [{ "required": ["name"] }, { "required": ["limitation"] }] }], "properties": { "agent_id": { "type": "string" }, "subject_agent": { "type": "string" }, "name": { "type": "string" }, "limitation": { "type": "string" }, "description": { "type": "string" } }, "additionalProperties": true },
+    "RuntimeStateSnapshot": { "type": "object", "anyOf": [{ "required": ["agent_id"] }, { "required": ["subject_agent"] }], "properties": { "agent_id": { "type": "string" }, "subject_agent": { "type": "string" }, "capabilities": { "type": "object" }, "denied_capabilities": { "type": "array", "items": { "type": "string" } }, "constraints": { "type": "array", "items": { "type": "string" } }, "load": { "type": "object" } }, "additionalProperties": true },
+    "SelfAssessmentRecord": { "type": "object", "allOf": [{ "anyOf": [{ "required": ["agent_id"] }, { "required": ["subject_agent"] }] }, { "required": ["claim", "calibration"] }], "properties": { "agent_id": { "type": "string" }, "subject_agent": { "type": "string" }, "claim": { "type": "string" }, "calibration": { "type": "object" } }, "additionalProperties": true }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/agentic_recall.schema.json",
+  "title": "AMOS Agentic Recall Payloads",
+  "$defs": {
+    "AgenticTrace": { "type": "object", "required": ["task", "action", "outcome"], "properties": { "agent_id": { "type": "string" }, "subject_agent": { "type": "string" }, "task": { "type": "string" }, "action": { "type": "string" }, "outcome": { "type": "string" }, "responsibility": { "type": "string" }, "lesson": { "type": ["string", "null"] }, "external_constraints": { "type": "array", "items": { "type": "string" } } }, "additionalProperties": true },
+    "ActionOutcomeRecord": { "type": "object", "allOf": [{ "anyOf": [{ "required": ["agent_id"] }, { "required": ["subject_agent"] }] }, { "required": ["action_ref", "status"] }], "properties": { "agent_id": { "type": "string" }, "subject_agent": { "type": "string" }, "action_ref": { "type": "string" }, "status": { "type": "string" }, "correction": { "type": ["string", "null"] }, "limitation": { "type": ["string", "null"] } }, "additionalProperties": true },
+    "SelfNarrative": { "type": "object", "allOf": [{ "anyOf": [{ "required": ["agent_id"] }, { "required": ["subject_agent"] }] }, { "required": ["narrative", "artifact"] }], "properties": { "agent_id": { "type": "string" }, "subject_agent": { "type": "string" }, "narrative": { "type": "string" }, "source_refs": { "type": "array", "items": { "type": "string" } }, "generated_from_graph_version": { "type": "integer", "minimum": 0 }, "artifact": { "const": true } }, "additionalProperties": true }
+  }
+}

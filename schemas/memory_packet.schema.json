@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/memory_packet.schema.json",
+  "title": "AMOS MemoryPacket",
+  "type": "object",
+  "required": [
+    "packet_id",
+    "schema_version",
+    "request",
+    "graph_version",
+    "generated_at",
+    "items",
+    "omissions",
+    "conflicts",
+    "degradation",
+    "provenance"
+  ],
+  "properties": {
+    "packet_id": { "type": "string" },
+    "schema_version": { "const": "amos.v1" },
+    "request": { "type": "object" },
+    "graph_version": { "type": "integer", "minimum": 0 },
+    "generated_at": { "type": "string" },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["atom_ref", "type", "payload", "confidence", "score"],
+        "properties": {
+          "atom_ref": { "type": "string" },
+          "type": { "type": "string" },
+          "payload": { "type": "object" },
+          "confidence": { "type": "object" },
+          "score": { "type": "number" },
+          "score_components": { "type": "object" },
+          "rendered_content": { "type": "object" },
+          "access_decision": { "type": "object" }
+        }
+      }
+    },
+    "omissions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["atom_ref", "reason"],
+        "properties": {
+          "atom_ref": { "type": "string" },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "conflicts": { "type": "array" },
+    "degradation": { "type": "object" },
+    "provenance": { "type": "object" }
+  }
+}

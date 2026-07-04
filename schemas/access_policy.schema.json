@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/access_policy.schema.json",
+  "title": "AMOS AccessPolicy",
+  "type": "object",
+  "properties": {
+    "visibility": { "type": "array", "items": { "type": "string" }, "default": ["all"] },
+    "evidence_visibility": { "type": "array", "items": { "type": "string" } },
+    "mutable_by": { "type": "array", "items": { "type": "string" }, "default": ["owner"] },
+    "min_trust_level": { "type": "integer", "minimum": 0 },
+    "requires_capability": { "type": "string" },
+    "sensitivity": { "type": "string", "default": "normal" }
+  },
+  "additionalProperties": true
+}

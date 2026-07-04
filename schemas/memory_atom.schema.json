@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/memory_atom.schema.json",
+  "title": "AMOS MemoryAtom",
+  "type": "object",
+  "required": ["type", "payload"],
+  "additionalProperties": true,
+  "properties": {
+    "id": { "type": "string" },
+    "schema_version": { "const": "amos.v1" },
+    "type": {
+      "type": "string",
+      "enum": [
+        "action_outcome",
+        "agentic_trace",
+        "belief",
+        "capability",
+        "commitment",
+        "episode",
+        "goal",
+        "limitation",
+        "policy",
+        "preference",
+        "procedure",
+        "runtime_state",
+        "self_assessment",
+        "self_model",
+        "self_narrative",
+        "semantic"
+      ]
+    },
+    "payload": {
+      "type": "object",
+      "not": {
+        "anyOf": [
+          { "required": ["access_policy"] },
+          { "required": ["confidence"] },
+          { "required": ["evidence_refs"] },
+          { "required": ["health_status"] },
+          { "required": ["lifecycle_state"] },
+          { "required": ["retention_class"] },
+          { "required": ["scope"] },
+          { "required": ["version"] }
+        ]
+      }
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": {
+        "type": ["string", "number", "boolean", "null"]
+      },
+      "default": {}
+    },
+    "confidence": {
+      "type": "object",
+      "properties": {
+        "level": {
+          "enum": ["low", "low-medium", "medium", "medium-high", "high"]
+        },
+        "score": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "lifecycle_state": {
+      "enum": ["active", "archived", "deleted", "proposed", "superseded", "tombstoned"]
+    },
+    "health_status": {
+      "enum": [
+        "confounding",
+        "contradicted",
+        "deleted",
+        "healthy",
+        "low_utility",
+        "merged",
+        "orphaned",
+        "stale"
+      ]
+    },
+    "access_policy": {
+      "type": "object",
+      "properties": {
+        "visibility": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["all"]
+        }
+      }
+    }
+  }
+}

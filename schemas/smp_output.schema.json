@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/smp_output.schema.json",
+  "title": "AMOS SMP Output",
+  "type": "object",
+  "required": [
+    "processor_id",
+    "processor_version",
+    "input_refs",
+    "output_type",
+    "confidence",
+    "reason_code",
+    "evidence_refs",
+    "recommended_action",
+    "risk_level",
+    "schema_version",
+    "output_id"
+  ],
+  "properties": {
+    "processor_id": { "type": "string" },
+    "processor_version": { "type": "string" },
+    "input_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "output_type": { "type": "string" },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "reason_code": {
+      "enum": [
+        "capacity_pressure",
+        "confounding_after_correction",
+        "contradiction_candidate",
+        "low_retrieval_utility",
+        "near_duplicate",
+        "policy_required",
+        "privacy_risk",
+        "scope_too_broad",
+        "scope_too_narrow",
+        "shape_invalid",
+        "stale_by_age",
+        "stale_by_external_change",
+        "valid_shape"
+      ]
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "recommended_action": { "type": "object" },
+    "risk_level": { "enum": ["low", "medium", "high"] },
+    "schema_version": { "const": "amos.v1" },
+    "output_id": { "type": "string" }
+  }
+}

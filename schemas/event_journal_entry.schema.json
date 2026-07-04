@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/event_journal_entry.schema.json",
+  "title": "AMOS EventJournalEntry",
+  "type": "object",
+  "required": ["event_id", "event_type", "schema_version", "actor", "target_refs", "payload", "payload_digest", "expected_versions", "authorization_context", "result_status", "projection_status", "previous_event_hash", "checksum", "graph_version"],
+  "properties": {
+    "event_id": { "type": "string" },
+    "event_type": { "type": "string" },
+    "schema_version": { "const": "amos.v1" },
+    "actor": { "type": "string" },
+    "target_refs": { "type": "array", "items": { "type": "string" } },
+    "payload": { "type": "object" },
+    "payload_refs": { "type": "array", "items": { "type": "string" } },
+    "evidence_refs": { "type": "array", "items": { "type": "string" } },
+    "idempotency_key": { "type": ["string", "null"] },
+    "payload_digest": { "type": "string" },
+    "causal_parent_ids": { "type": "array", "items": { "type": "string" } },
+    "expected_versions": { "type": "object" },
+    "authorization_context": { "type": "object" },
+    "result_status": { "type": "string" },
+    "projection_status": { "type": "string" },
+    "previous_event_hash": { "type": "string" },
+    "checksum": { "type": "string" },
+    "graph_version": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": true
+}
