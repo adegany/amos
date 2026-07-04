@@ -132,6 +132,7 @@ in-process SQLite store and serializes access through the service boundary:
 Start here:
 
 - [Amos Design Spec](docs/design-spec.md)
+- [Amos Developer Guide](docs/developer-guide.md)
 - [AMOS V1 Verification Matrix](docs/v1-verification.md)
 - [Amos Mirror Agent Demo Spec](docs/mirror-agent-demo-spec.md)
 
