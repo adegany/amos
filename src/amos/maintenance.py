@@ -17,7 +17,10 @@ from .schemas import SCHEMA_VERSION, digest, stable_id, utc_now
 from .smp import SemanticMaintenanceProcessor
 
 
-LOW_RISK_PROPOSAL_ACTIONS = {"add_atom"}
+LOW_RISK_PROPOSAL_ACTIONS = {"add_atom", "add_edge"}
+
+SEMANTIC_RELATION_PROCESSOR_ID = "amos.semantic_relations.v1"
+SEMANTIC_RELATION_PROCESSOR_VERSION = "amos.semantic_relations.v1"
 
 
 @dataclass(frozen=True)
@@ -91,6 +94,62 @@ class MaintenanceProposal:
                 "source_refs": body["source_refs"],
                 "payload_digest": digest(body["payload"]),
                 "reason_code": self.reason_code,
+            },
+        )
+        return body
+
+
+@dataclass(frozen=True)
+class SemanticFacet:
+    """Domain-normalized semantic shape used for generic edge proposals.
+
+    Domain processors may extract these facets from arbitrary atom payloads.
+    AMOS compares only the normalized fields here; it does not need to know the
+    domain meaning of a control, metric, asset, task, or outcome label.
+    """
+
+    atom_ref: str
+    subject: str
+    intent: str = ""
+    outcome: str = ""
+    outcome_direction: str = "neutral"
+    confidence: float = 0.5
+    evidence_refs: tuple[str, ...] = ()
+    controls: Mapping[str, Any] = field(default_factory=dict)
+    metrics: Mapping[str, Any] = field(default_factory=dict)
+    time_index: int | float | str | None = None
+    scope: Mapping[str, Any] = field(default_factory=dict)
+    attributes: Mapping[str, Any] = field(default_factory=dict)
+    facet_id: str | None = None
+    schema_version: str = SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        body = {
+            "atom_ref": str(self.atom_ref),
+            "subject": _normalize_facet_text(self.subject),
+            "intent": _normalize_facet_text(self.intent),
+            "outcome": _normalize_facet_text(self.outcome),
+            "outcome_direction": _normalize_outcome_direction(self.outcome_direction),
+            "confidence": round(max(0.0, min(1.0, float(self.confidence))), 4),
+            "evidence_refs": [str(ref) for ref in self.evidence_refs],
+            "controls": dict(self.controls),
+            "metrics": dict(self.metrics),
+            "time_index": self.time_index,
+            "scope": dict(self.scope),
+            "attributes": dict(self.attributes),
+            "schema_version": self.schema_version,
+        }
+        body["facet_id"] = self.facet_id or stable_id(
+            "facet",
+            {
+                "atom_ref": body["atom_ref"],
+                "subject": body["subject"],
+                "intent": body["intent"],
+                "outcome": body["outcome"],
+                "outcome_direction": body["outcome_direction"],
+                "controls": body["controls"],
+                "metrics": body["metrics"],
+                "time_index": body["time_index"],
             },
         )
         return body
@@ -226,6 +285,255 @@ class GenericMaintenanceProcessor:
                 )
             )
         return proposals
+
+
+def coerce_semantic_facet(value: SemanticFacet | Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize a processor-emitted facet into the stable wire shape."""
+
+    if isinstance(value, SemanticFacet):
+        facet = value.to_dict()
+    elif isinstance(value, Mapping):
+        facet = SemanticFacet(
+            atom_ref=str(value.get("atom_ref", "")),
+            subject=str(value.get("subject", "")),
+            intent=str(value.get("intent", "")),
+            outcome=str(value.get("outcome", "")),
+            outcome_direction=str(value.get("outcome_direction", "neutral")),
+            confidence=float(value.get("confidence", 0.5) or 0.5),
+            evidence_refs=tuple(str(ref) for ref in value.get("evidence_refs", ())),
+            controls=dict(value.get("controls") or {}),
+            metrics=dict(value.get("metrics") or {}),
+            time_index=value.get("time_index"),
+            scope=dict(value.get("scope") or {}),
+            attributes=dict(value.get("attributes") or {}),
+            facet_id=value.get("facet_id"),
+            schema_version=str(value.get("schema_version", SCHEMA_VERSION)),
+        ).to_dict()
+    else:
+        raise ValidationError("semantic facet must be a mapping or SemanticFacet")
+    if not facet["atom_ref"]:
+        raise ValidationError("semantic facet atom_ref is required")
+    if not facet["subject"]:
+        raise ValidationError("semantic facet subject is required")
+    return facet
+
+
+def semantic_relation_proposals_from_facets(
+    facets: Sequence[Mapping[str, Any]],
+    *,
+    existing_edges: Sequence[Mapping[str, Any]] = (),
+    processor_id: str = SEMANTIC_RELATION_PROCESSOR_ID,
+    processor_version: str = SEMANTIC_RELATION_PROCESSOR_VERSION,
+) -> list[MaintenanceProposal]:
+    """Convert domain-normalized facets into generic graph edge proposals."""
+
+    normalized = [coerce_semantic_facet(facet) for facet in facets]
+    normalized = sorted(
+        {
+            facet["facet_id"]: facet
+            for facet in normalized
+        }.values(),
+        key=lambda facet: (facet["subject"], facet["intent"], facet["atom_ref"]),
+    )
+    existing_keys = {
+        (
+            str(edge.get("source_ref", "")),
+            str(edge.get("target_ref", "")),
+            str(edge.get("relation", "")),
+        )
+        for edge in existing_edges
+        if not edge.get("deleted")
+    }
+    proposals: list[MaintenanceProposal] = []
+    seen: set[tuple[str, str, str]] = set()
+    for left_index, left in enumerate(normalized):
+        for right in normalized[left_index + 1 :]:
+            if left["atom_ref"] == right["atom_ref"]:
+                continue
+            pair = _semantic_relation_for_pair(left, right)
+            if pair is None:
+                continue
+            relation, source_ref, target_ref, risk_level, reason_code, confidence = pair
+            key = (source_ref, target_ref, relation)
+            reverse_key = (target_ref, source_ref, relation)
+            if key in existing_keys or key in seen:
+                continue
+            if relation in {"rel:supports", "rel:similar_to"} and reverse_key in existing_keys:
+                continue
+            seen.add(key)
+            scope = _common_scope(left.get("scope", {}), right.get("scope", {}))
+            evidence_refs = tuple(
+                dict.fromkeys(
+                    [
+                        *[str(ref) for ref in left.get("evidence_refs", [])],
+                        *[str(ref) for ref in right.get("evidence_refs", [])],
+                        left["atom_ref"],
+                        right["atom_ref"],
+                    ]
+                )
+            )
+            proposals.append(
+                MaintenanceProposal(
+                    processor_id=processor_id,
+                    processor_version=processor_version,
+                    action="add_edge",
+                    risk_level=risk_level,
+                    confidence=confidence,
+                    reason_code=reason_code,
+                    source_refs=(source_ref, target_ref),
+                    target_refs=(source_ref, target_ref),
+                    evidence_refs=evidence_refs,
+                    payload={
+                        "edge": {
+                            "source_ref": source_ref,
+                            "target_ref": target_ref,
+                            "relation": relation,
+                            "scope": scope,
+                            "confidence": {
+                                "level": _confidence_level(confidence),
+                                "score": confidence,
+                            },
+                            "evidence_refs": list(evidence_refs),
+                        },
+                        "facets": [left, right],
+                    },
+                    title=f"Add {relation} edge between semantic facets",
+                )
+            )
+    return proposals
+
+
+def _semantic_relation_for_pair(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> tuple[str, str, str, str, str, float] | None:
+    if left.get("subject") != right.get("subject"):
+        return None
+    confidence = round(
+        min(float(left.get("confidence", 0.5)), float(right.get("confidence", 0.5))), 4
+    )
+    same_intent = bool(left.get("intent")) and left.get("intent") == right.get("intent")
+    same_controls = (
+        bool(left.get("controls"))
+        and bool(right.get("controls"))
+        and _canonical_or_empty(left.get("controls"))
+        == _canonical_or_empty(right.get("controls"))
+    )
+    if same_intent or same_controls:
+        direction = _normalize_outcome_direction(left.get("outcome_direction"))
+        other_direction = _normalize_outcome_direction(right.get("outcome_direction"))
+        if direction in {"positive", "negative"} and other_direction in {
+            "positive",
+            "negative",
+        }:
+            if direction == other_direction:
+                return (
+                    "rel:supports",
+                    str(left["atom_ref"]),
+                    str(right["atom_ref"]),
+                    "low",
+                    "same_subject_same_outcome_direction",
+                    confidence,
+                )
+            return (
+                "rel:contradicts",
+                str(left["atom_ref"]),
+                str(right["atom_ref"]),
+                "low",
+                "same_subject_opposite_outcome_direction",
+                confidence,
+            )
+        return (
+            "rel:similar_to",
+            str(left["atom_ref"]),
+            str(right["atom_ref"]),
+            "low",
+            "same_subject_similar_intent_or_controls",
+            confidence,
+        )
+    if _is_later_stronger(left, right):
+        supersession_confidence = round(float(left.get("confidence", confidence)), 4)
+        return (
+            "rel:supersedes",
+            str(left["atom_ref"]),
+            str(right["atom_ref"]),
+            "low",
+            "newer_stronger_same_subject_evidence",
+            supersession_confidence,
+        )
+    if _is_later_stronger(right, left):
+        supersession_confidence = round(float(right.get("confidence", confidence)), 4)
+        return (
+            "rel:supersedes",
+            str(right["atom_ref"]),
+            str(left["atom_ref"]),
+            "low",
+            "newer_stronger_same_subject_evidence",
+            supersession_confidence,
+        )
+    return None
+
+
+def _normalize_facet_text(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _normalize_outcome_direction(value: Any) -> str:
+    direction = str(value or "neutral").strip().lower()
+    aliases = {
+        "supported": "positive",
+        "success": "positive",
+        "improved": "positive",
+        "positive": "positive",
+        "failed": "negative",
+        "failure": "negative",
+        "regressed": "negative",
+        "negative": "negative",
+        "mixed": "mixed",
+        "neutral": "neutral",
+    }
+    return aliases.get(direction, "neutral")
+
+
+def _common_scope(
+    left: Mapping[str, Any] | None, right: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    left = dict(left or {})
+    right = dict(right or {})
+    return {key: value for key, value in left.items() if right.get(key) == value}
+
+
+def _canonical_or_empty(value: Any) -> str:
+    if not value:
+        return ""
+    return digest(value)
+
+
+def _is_later_stronger(candidate: Mapping[str, Any], baseline: Mapping[str, Any]) -> bool:
+    candidate_time = candidate.get("time_index")
+    baseline_time = baseline.get("time_index")
+    if candidate_time is None or baseline_time is None:
+        return False
+    try:
+        if float(candidate_time) <= float(baseline_time):
+            return False
+    except (TypeError, ValueError):
+        if str(candidate_time) <= str(baseline_time):
+            return False
+    return float(candidate.get("confidence", 0.5)) >= float(
+        baseline.get("confidence", 0.5)
+    ) + 0.1
+
+
+def _confidence_level(score: float) -> str:
+    if score >= 0.85:
+        return "high"
+    if score >= 0.7:
+        return "medium-high"
+    if score >= 0.45:
+        return "medium"
+    if score >= 0.3:
+        return "low-medium"
+    return "low"
 
 
 def default_processor_registry(

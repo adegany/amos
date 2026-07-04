@@ -22,10 +22,12 @@ from amos import (
     MaintenanceProposal,
     PacketCacheInvalidator,
     SMPWorker,
+    SemanticFacet,
     SemanticMaintenanceProcessor,
     SelfModelCalibrator,
     ValidationError,
     ontology_snapshot,
+    semantic_relation_proposals_from_facets,
 )
 from amos.cli import main as cli_main
 from amos.http_api import AmosHTTPServer
@@ -133,6 +135,33 @@ class ExampleTrainingFlightProcessor:
                     )
                 )
         return proposals
+
+    def extract_facets(self, window):
+        facets = []
+        for atom in window.atoms:
+            payload = atom.get("payload", {})
+            if payload.get("example_kind") != "reflection":
+                continue
+            signature = payload.get("control_signature")
+            if not signature:
+                continue
+            outcome = payload.get("outcome", "neutral")
+            facets.append(
+                SemanticFacet(
+                    atom_ref=atom["id"],
+                    subject=f"example training controls {signature}",
+                    intent="evaluate sampled controls",
+                    outcome=str(outcome),
+                    outcome_direction=str(outcome),
+                    confidence=float(atom.get("confidence", {}).get("score", 0.75)),
+                    controls={"control_signature": signature},
+                    metrics={"score": payload.get("score")},
+                    time_index=payload.get("chunk"),
+                    scope=dict(atom.get("scope", {})),
+                    evidence_refs=tuple(atom.get("evidence_refs", [])),
+                )
+            )
+        return facets
 
 
 def test_schema_rejects_payload_envelope_duplication(amos):
@@ -675,6 +704,10 @@ def test_distillation_creates_provenance_linked_summary_and_gates_archival(amos)
         scope={"tenant": "qandl"},
     )
     assert distilled["atom"]["id"] in item_refs(packet)
+    archived = amos.archive_atom(distilled["atom"]["id"], reason="obsolete distillation")
+    assert archived["projected_edges"]
+    assert amos.store.list_edges() == []
+    assert amos.verify_replay()["status"] == "ok"
 
 
 def test_merge_atoms_requires_review_and_replays_projection(amos):
@@ -895,6 +928,148 @@ def test_steward_backfills_intrinsic_edges_for_existing_atoms(amos):
         for edge in amos.store.list_edges()
     }
     assert (semantic["id"], "rel:derived_from", source["id"]) in triples
+    assert amos.verify_replay()["status"] == "ok"
+
+
+def test_steward_archives_structured_reflection_and_runtime_duplicates(amos):
+    scope = {
+        "tenant": "qandl",
+        "component": "training",
+        "asset": "UPRO",
+        "run_id": "run1",
+    }
+    directive = amos.commit_atom(
+        {
+            "id": "directive_chunk_7",
+            "type": "agentic_trace",
+            "payload": {
+                "agent_id": "qandl.training.pilot",
+                "qandl_kind": "directive",
+                "target_chunk": 7,
+                "task": "UPRO training chunk 7",
+                "action": "issue directive",
+                "outcome": "issued",
+            },
+            "scope": scope,
+        }
+    )["atom"]
+    old_reflection = amos.commit_atom(
+        {
+            "id": "reflection_chunk_7_old",
+            "type": "agentic_trace",
+            "payload": {
+                "agent_id": "qandl.training.pilot",
+                "qandl_kind": "reflection",
+                "chunk": 7,
+                "task": "UPRO training chunk 7",
+                "action": "evaluate outcome",
+                "outcome": "supported",
+                "delta_multiple": 0.2,
+            },
+            "scope": scope,
+        }
+    )["atom"]
+    new_reflection = amos.commit_atom(
+        {
+            "id": "reflection_chunk_7_new",
+            "type": "agentic_trace",
+            "payload": {
+                "agent_id": "qandl.training.pilot",
+                "qandl_kind": "reflection",
+                "chunk": 7,
+                "task": "UPRO training chunk 7",
+                "action": "evaluate outcome",
+                "outcome": "supported",
+                "delta_multiple": 0.2,
+                "directive_atom_ref": directive["id"],
+            },
+            "scope": scope,
+        }
+    )["atom"]
+    runtime_old = amos.commit_atom(
+        {
+            "id": "runtime_old",
+            "type": "runtime_state",
+            "payload": {
+                "agent_id": "qandl.training.pilot",
+                "role_key": "pilot",
+                "status": "available",
+            },
+            "scope": scope,
+        }
+    )["atom"]
+    runtime_new = amos.commit_atom(
+        {
+            "id": "runtime_new",
+            "type": "runtime_state",
+            "payload": {
+                "agent_id": "qandl.training.pilot",
+                "role_key": "pilot",
+                "status": "available",
+                "runtime_capabilities": {
+                    "choose_next_chunk_directive": {"available": True}
+                },
+            },
+            "scope": scope,
+        }
+    )["atom"]
+
+    result = amos.run_steward(scope=scope)
+
+    archived_actions = [
+        action
+        for action in result["actions"]
+        if action["action"] == "archive_structured_duplicate"
+    ]
+    assert {
+        (action["kind"], action["kept"], action["archived"])
+        for action in archived_actions
+    } == {
+        ("agentic_trace.reflection", new_reflection["id"], old_reflection["id"]),
+        ("runtime_state.current", runtime_new["id"], runtime_old["id"]),
+    }
+    assert amos.store.get_atom(old_reflection["id"])["lifecycle_state"] == "archived"
+    assert amos.store.get_atom(runtime_old["id"])["lifecycle_state"] == "archived"
+    assert amos.store.get_atom(new_reflection["id"])["lifecycle_state"] == "active"
+    assert amos.store.get_atom(runtime_new["id"])["lifecycle_state"] == "active"
+    assert not any(
+        edge["source_ref"] in {old_reflection["id"], runtime_old["id"]}
+        or edge["target_ref"] in {old_reflection["id"], runtime_old["id"]}
+        for edge in amos.store.list_edges()
+    )
+    assert amos.verify_replay()["status"] == "ok"
+
+
+def test_steward_does_not_project_intrinsic_edges_for_archived_atoms(amos):
+    scope = {"tenant": "qandl"}
+    self_model = amos.commit_atom(
+        {
+            "id": "self_model_for_archive_projection",
+            "type": "self_model",
+            "payload": {"agent_id": "trainer"},
+            "scope": scope,
+        }
+    )["atom"]
+    runtime = amos.commit_atom(
+        {
+            "id": "runtime_for_archive_projection",
+            "type": "runtime_state",
+            "payload": {"agent_id": "trainer"},
+            "evidence_refs": [self_model["id"]],
+            "scope": scope,
+        }
+    )["atom"]
+    assert amos.store.list_edges()
+
+    amos.archive_atom(runtime["id"], reason="stale runtime")
+    assert amos.store.list_edges() == []
+
+    result = amos.run_steward(scope=scope)
+
+    assert not any(
+        action["action"] == "project_intrinsic_edges" for action in result["actions"]
+    )
+    assert amos.store.list_edges() == []
     assert amos.verify_replay()["status"] == "ok"
 
 
@@ -1508,6 +1683,11 @@ def test_automatic_memory_policy_distills_and_maintains_on_retrieval(amos):
         "policy_source_1",
         "policy_source_2",
     ]
+    summary = distilled["payload"]["summary"]
+    assert isinstance(summary, str)
+    assert summary.startswith("Automatic AMOS memory policy distilled 3 source atoms")
+    assert not summary.lstrip().startswith("{")
+    assert "automatic policy source memory 0" in summary
     assert distilled["layer"] == "consolidated_long_term"
     assert distilled["retention_class"] == "distilled"
     assert distilled["id"] in item_refs(packet)
@@ -1522,13 +1702,92 @@ def test_automatic_memory_policy_distills_and_maintains_on_retrieval(amos):
         for event in amos.store.list_events()
     )
 
+    original_summary = distilled["payload"]["summary"]
+    amos.archive_atom(distilled["id"], reason="replace obsolete policy summary")
+    amos._policy_distillation_summary = (  # type: ignore[method-assign]
+        lambda _atoms: f"{original_summary} Replacement renderer output."
+    )
+    rerun = amos.run_memory_policy(
+        force=True,
+        trigger="replace_archived_policy_summary",
+        scope={"tenant": "policy"},
+    )
+    assert rerun["results"]["distillation"]["status"] == "completed"
+    replacement = rerun["results"]["distillation"]["distilled"]["atom"]
+    assert replacement["lifecycle_state"] == "active"
+    assert replacement["payload"]["source_refs"] == distilled["payload"]["source_refs"]
+    assert not replacement["payload"]["summary"].lstrip().startswith("{")
+    assert "Replacement renderer output" in replacement["payload"]["summary"]
+
+
+def test_automatic_memory_policy_prioritizes_outcome_evidence_over_directives(amos):
+    scope = {"tenant": "policy-priority"}
+    amos.configure_memory_policy(
+        schedule={"every_graph_versions": 100, "every_seconds": 0},
+        distillation={"min_source_atoms": 3, "max_source_atoms": 3},
+    )
+    for index in range(3):
+        amos.commit_atom(
+            {
+                "id": f"priority_directive_{index}",
+                "type": "agentic_trace",
+                "payload": {
+                    "qandl_kind": "directive",
+                    "task": f"chunk {index}",
+                    "action": "issue directive",
+                    "outcome": "issued",
+                    "target_chunk": index,
+                    "applied_controls": {"exploration_eps_floor": 0.05},
+                },
+                "scope": scope,
+            }
+        )
+    for index in range(3):
+        amos.commit_atom(
+            {
+                "id": f"priority_reflection_{index}",
+                "type": "agentic_trace",
+                "payload": {
+                    "qandl_kind": "reflection",
+                    "task": f"chunk {index}",
+                    "action": "evaluate outcome",
+                    "outcome": "supported",
+                    "chunk": index,
+                    "directive_atom_ref": f"priority_directive_{index}",
+                    "delta_multiple": 0.1 + index,
+                    "delta_sharpe": -0.05 + index,
+                },
+                "scope": scope,
+            }
+        )
+
+    result = amos.run_memory_policy(
+        force=True,
+        trigger="test_priority",
+        scope=scope,
+    )
+
+    assert result["results"]["distillation"]["status"] == "completed"
+    source_refs = result["results"]["distillation"]["source_refs"]
+    assert source_refs == [
+        "priority_reflection_0",
+        "priority_reflection_1",
+        "priority_reflection_2",
+    ]
+    summary = result["results"]["distillation"]["distilled"]["atom"]["payload"][
+        "summary"
+    ]
+    assert "delta_multiple=+0.1" in summary
+    assert "delta_sharpe=-0.05" in summary
+
 
 def test_memory_policy_worker_force_runs_without_manual_maintenance(amos):
     amos.configure_memory_policy(
         schedule={"every_graph_versions": 100, "every_seconds": 0},
+        maintenance={"max_smp_atoms": 2},
         distillation={"min_source_atoms": 2, "max_source_atoms": 2},
     )
-    for index in range(2):
+    for index in range(5):
         amos.commit_atom(
             {
                 "id": f"worker_policy_source_{index}",
@@ -1540,6 +1799,9 @@ def test_memory_policy_worker_force_runs_without_manual_maintenance(amos):
     result = MemoryPolicyWorker(amos).tick(force=True, trigger="test_worker")
     assert result["status"] == "completed"
     assert result["trigger"] == "test_worker"
+    assert result["results"]["smp"]["atom_count"] == 5
+    assert result["results"]["smp"]["analyzed_atom_count"] == 2
+    assert result["results"]["smp"]["omitted_atom_count"] == 3
     assert result["results"]["distillation"]["status"] == "completed"
     assert amos.memory_policy_status()["state"]["last_trigger"] == "test_worker"
 
@@ -1621,12 +1883,361 @@ def test_external_processor_distills_supported_control_lesson(amos):
         for event in amos.store.list_events()
     )
 
+    event_count = len(amos.store.list_events())
     repeat = DistillerMaintenanceWorker(amos).tick(
         scope=scope,
         domain="example_training",
         processor_ids=["example.training.flight.v1"],
     )
+    assert repeat["status"] == "skipped"
+    assert repeat["reason"] == "all_proposals_already_committed"
     assert repeat["committed"][0]["status"] == "already_committed"
+    assert len(amos.store.list_events()) == event_count
+
+
+def test_external_processor_facets_project_generic_support_edge(amos):
+    amos.register_maintenance_processor(ExampleTrainingFlightProcessor())
+    scope = {"tenant": "example", "component": "training", "case": "support_edge"}
+    signature = "trainable_roles=encoder; replay_ratio=0.3"
+    for chunk in (1, 2):
+        amos.commit_atom(
+            {
+                "id": f"facet_outcome_supported_{chunk}",
+                "type": "agentic_trace",
+                "payload": {
+                    "example_kind": "reflection",
+                    "task": f"example chunk {chunk}",
+                    "action": "evaluate chunk outcome",
+                    "outcome": "supported",
+                    "chunk": chunk,
+                    "control_signature": signature,
+                    "score": 1.0 + chunk / 10.0,
+                },
+                "scope": scope,
+                "confidence": {"level": "medium-high", "score": 0.78},
+            }
+        )
+
+    result = amos.run_maintenance_distiller(
+        scope=scope,
+        domain="example_training",
+        processor_ids=["example.training.flight.v1"],
+        auto_commit_low_risk=True,
+    )
+
+    assert result["status"] == "completed"
+    assert any(
+        proposal["processor_id"] == "amos.semantic_relations.v1"
+        and proposal["action"] == "add_edge"
+        and proposal["payload"]["edge"]["relation"] == "rel:supports"
+        for proposal in result["proposals"]
+    )
+    committed_edges = [item["edge"] for item in result["committed"] if item.get("edge")]
+    assert {edge["relation"] for edge in committed_edges} == {"rel:supports"}
+    assert any(event["event_type"] == "edge_committed" for event in amos.store.list_events())
+    assert amos.verify_replay()["status"] == "ok"
+
+    event_count = len(amos.store.list_events())
+    repeat = amos.run_maintenance_distiller(
+        scope=scope,
+        domain="example_training",
+        processor_ids=["example.training.flight.v1"],
+        auto_commit_low_risk=True,
+    )
+    assert repeat["status"] == "skipped"
+    assert repeat["reason"] == "no_proposals"
+    assert len(amos.store.list_events()) == event_count
+
+
+def test_external_processor_facets_auto_commit_generic_contradiction_edge(amos):
+    amos.register_maintenance_processor(ExampleTrainingFlightProcessor())
+    scope = {"tenant": "example", "component": "training", "case": "conflict_edge"}
+    signature = "trainable_roles=head; replay_ratio=0.6"
+    for atom_id, outcome, chunk in (
+        ("facet_outcome_supported", "supported", 1),
+        ("facet_outcome_failed", "failed", 2),
+    ):
+        amos.commit_atom(
+            {
+                "id": atom_id,
+                "type": "agentic_trace",
+                "payload": {
+                    "example_kind": "reflection",
+                    "task": f"example chunk {chunk}",
+                    "action": "evaluate chunk outcome",
+                    "outcome": outcome,
+                    "chunk": chunk,
+                    "control_signature": signature,
+                    "score": 1.0,
+                },
+                "scope": scope,
+                "confidence": {"level": "medium-high", "score": 0.8},
+            }
+        )
+
+    result = amos.run_maintenance_distiller(
+        scope=scope,
+        domain="example_training",
+        processor_ids=["example.training.flight.v1"],
+        auto_commit_low_risk=True,
+        reviewer={"enabled": True},
+    )
+
+    assert result["status"] == "completed"
+    assert result["deferred"] == []
+    assert result["proposals"][0]["action"] == "add_edge"
+    assert result["proposals"][0]["risk_level"] == "low"
+    assert result["proposals"][0]["payload"]["edge"]["relation"] == "rel:contradicts"
+    committed_edges = [item["edge"] for item in result["committed"] if item.get("edge")]
+    assert {edge["relation"] for edge in committed_edges} == {"rel:contradicts"}
+    assert any(edge["relation"] == "rel:contradicts" for edge in amos.store.list_edges())
+    assert amos.store.get_atom("facet_outcome_supported")["health_status"] == "healthy"
+    assert amos.store.get_atom("facet_outcome_failed")["health_status"] == "healthy"
+    assert amos.verify_replay()["status"] == "ok"
+
+
+def test_generic_semantic_facets_propose_supersession_without_domain_rules():
+    proposals = semantic_relation_proposals_from_facets(
+        [
+            SemanticFacet(
+                atom_ref="old_lesson",
+                subject="shared planner budget policy",
+                intent="old budget interpretation",
+                outcome="mixed",
+                outcome_direction="mixed",
+                confidence=0.55,
+                time_index=1,
+                scope={"tenant": "example"},
+            ),
+            SemanticFacet(
+                atom_ref="new_lesson",
+                subject="shared planner budget policy",
+                intent="updated budget interpretation",
+                outcome="supported",
+                outcome_direction="positive",
+                confidence=0.8,
+                time_index=3,
+                scope={"tenant": "example"},
+            ),
+        ]
+    )
+
+    assert len(proposals) == 1
+    proposal = proposals[0].to_dict()
+    assert proposal["action"] == "add_edge"
+    assert proposal["risk_level"] == "low"
+    assert proposal["payload"]["edge"]["relation"] == "rel:supersedes"
+    assert proposal["payload"]["edge"]["confidence"]["score"] == 0.8
+    assert proposal["payload"]["edge"]["source_ref"] == "new_lesson"
+    assert proposal["payload"]["edge"]["target_ref"] == "old_lesson"
+
+
+def test_external_processor_facets_auto_commit_generic_supersession_edge(amos):
+    class SupersessionFacetProcessor:
+        processor_id = "example.supersession_facets.v1"
+        processor_version = "example.supersession_facets.v1"
+
+        def supports(self, window):
+            return window.domain == "example_supersession"
+
+        def propose(self, window):
+            return []
+
+        def extract_facets(self, window):
+            facets = []
+            for atom in window.atoms:
+                payload = atom["payload"]
+                facets.append(
+                    SemanticFacet(
+                        atom_ref=atom["id"],
+                        subject=payload["subject"],
+                        intent=payload["intent"],
+                        outcome=payload.get("outcome", "neutral"),
+                        outcome_direction=payload.get("outcome_direction", "neutral"),
+                        confidence=atom["confidence"]["score"],
+                        time_index=payload["time_index"],
+                        scope=atom["scope"],
+                    )
+                )
+            return facets
+
+    amos.register_maintenance_processor(SupersessionFacetProcessor())
+    scope = {"tenant": "example", "case": "supersession_edge"}
+    for atom_id, confidence, time_index in (
+        ("old_policy_memory", 0.55, 1),
+        ("new_policy_memory", 0.82, 3),
+    ):
+        amos.commit_atom(
+            {
+                "id": atom_id,
+                "type": "semantic",
+                "payload": {
+                    "summary": f"{atom_id} for shared planner budget policy.",
+                    "subject": "shared planner budget policy",
+                    "intent": f"{atom_id} interpretation",
+                    "outcome": "supported",
+                    "outcome_direction": "positive",
+                    "time_index": time_index,
+                },
+                "scope": scope,
+                "confidence": {"level": "medium-high", "score": confidence},
+            }
+        )
+
+    result = amos.run_maintenance_distiller(
+        scope=scope,
+        domain="example_supersession",
+        processor_ids=["example.supersession_facets.v1"],
+        auto_commit_low_risk=True,
+    )
+
+    assert result["status"] == "completed"
+    assert result["deferred"] == []
+    committed_edges = [item["edge"] for item in result["committed"] if item.get("edge")]
+    assert len(committed_edges) == 1
+    edge = committed_edges[0]
+    assert edge["relation"] == "rel:supersedes"
+    assert edge["source_ref"] == "new_policy_memory"
+    assert edge["target_ref"] == "old_policy_memory"
+    assert edge["confidence"]["score"] == 0.82
+    assert amos.store.get_atom("old_policy_memory")["lifecycle_state"] == "active"
+    assert amos.verify_replay()["status"] == "ok"
+
+
+def test_generic_semantic_facets_propose_similarity_for_neutral_matches():
+    proposals = semantic_relation_proposals_from_facets(
+        [
+            SemanticFacet(
+                atom_ref="first_note",
+                subject="shared retrieval budget",
+                intent="inspect packet budget",
+                outcome="observed",
+                outcome_direction="neutral",
+                controls={"packet_budget": 5},
+                confidence=0.7,
+                scope={"tenant": "example"},
+            ),
+            SemanticFacet(
+                atom_ref="second_note",
+                subject="shared retrieval budget",
+                intent="inspect packet budget",
+                outcome="observed",
+                outcome_direction="neutral",
+                controls={"packet_budget": 5},
+                confidence=0.72,
+                scope={"tenant": "example"},
+            ),
+        ]
+    )
+
+    assert len(proposals) == 1
+    proposal = proposals[0].to_dict()
+    assert proposal["action"] == "add_edge"
+    assert proposal["risk_level"] == "low"
+    assert proposal["payload"]["edge"]["relation"] == "rel:similar_to"
+
+
+def test_maintenance_distiller_skips_empty_windows_without_journal_event(amos):
+    event_count = len(amos.store.list_events())
+
+    result = amos.run_maintenance_distiller(scope={"tenant": "empty"})
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "no_proposals"
+    assert result["event"] is None
+    assert len(amos.store.list_events()) == event_count
+
+
+def test_maintenance_distiller_skips_unchanged_deferred_proposals(amos):
+    amos.register_maintenance_processor(ExampleTrainingFlightProcessor())
+    scope = {"tenant": "example", "component": "training", "case": "deferred"}
+    normal_signature = "trainable_roles=encoder; replay_ratio=0.3"
+    sanitized_signature = "trainable_roles=head; replay_ratio=0.6"
+    for atom in (
+        {
+            "id": "deferred_directive_normal",
+            "type": "agentic_trace",
+            "payload": {
+                "example_kind": "directive",
+                "task": "normal directive",
+                "action": "issue directive",
+                "outcome": "issued",
+                "control_signature": normal_signature,
+            },
+            "scope": scope,
+        },
+        {
+            "id": "deferred_outcome_normal",
+            "type": "agentic_trace",
+            "payload": {
+                "example_kind": "reflection",
+                "task": "normal reflection",
+                "action": "evaluate outcome",
+                "outcome": "supported",
+                "control_signature": normal_signature,
+                "previous_score": 1.0,
+                "score": 1.2,
+            },
+            "scope": scope,
+        },
+        {
+            "id": "deferred_directive_sanitized",
+            "type": "agentic_trace",
+            "payload": {
+                "example_kind": "directive",
+                "task": "sanitized directive",
+                "action": "issue directive",
+                "outcome": "issued",
+                "control_signature": sanitized_signature,
+                "sanitized_controls": True,
+            },
+            "scope": scope,
+        },
+        {
+            "id": "deferred_outcome_sanitized",
+            "type": "agentic_trace",
+            "payload": {
+                "example_kind": "reflection",
+                "task": "sanitized reflection",
+                "action": "evaluate outcome",
+                "outcome": "failed",
+                "control_signature": sanitized_signature,
+                "previous_score": 1.0,
+                "score": 0.8,
+            },
+            "scope": scope,
+        },
+    ):
+        amos.commit_atom(atom)
+
+    first = amos.run_maintenance_distiller(
+        scope=scope,
+        domain="example_training",
+        processor_ids=["example.training.flight.v1"],
+        auto_commit_low_risk=True,
+        reviewer={"enabled": True},
+    )
+    event_count = len(amos.store.list_events())
+
+    assert first["status"] == "completed"
+    assert first["committed"][0]["status"] == "committed"
+    assert len(first["deferred"]) == 1
+    assert first["event"] is not None
+    assert first["deferred_fingerprint"]
+
+    repeat = amos.run_maintenance_distiller(
+        scope=scope,
+        domain="example_training",
+        processor_ids=["example.training.flight.v1"],
+        auto_commit_low_risk=True,
+        reviewer={"enabled": True},
+    )
+
+    assert repeat["status"] == "skipped"
+    assert repeat["reason"] == "deferred_proposals_unchanged"
+    assert repeat["deferred_fingerprint"] == first["deferred_fingerprint"]
+    assert repeat["event"] is None
+    assert len(amos.store.list_events()) == event_count
 
 
 def test_external_processor_defers_sanitized_control_claim(amos):

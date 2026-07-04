@@ -12,9 +12,12 @@ from .errors import AccessDenied, CASConflict, IdempotencyConflict, ValidationEr
 from .maintenance import (
     EvidenceWindow,
     MaintenanceProcessor,
+    SEMANTIC_RELATION_PROCESSOR_ID,
+    SEMANTIC_RELATION_PROCESSOR_VERSION,
     default_processor_registry,
     load_maintenance_processor,
     proposal_is_auto_committable,
+    semantic_relation_proposals_from_facets,
 )
 from .schemas import (
     EDGE_RELATIONS,
@@ -61,6 +64,7 @@ DEFAULT_MEMORY_POLICY = {
     "maintenance": {
         "enabled": True,
         "run_smp": True,
+        "max_smp_atoms": 128,
         "run_steward": True,
         "rebuild_indexes": True,
         "invalidate_packet_cache": True,
@@ -327,7 +331,10 @@ class Amos:
         try:
             maintenance = policy["maintenance"]
             if maintenance["enabled"] and maintenance["run_smp"]:
-                results["smp"] = self.run_smp_analysis(scope=scope)
+                results["smp"] = self.run_smp_analysis(
+                    scope=scope,
+                    max_atoms=maintenance["max_smp_atoms"],
+                )
             if maintenance["enabled"] and maintenance["run_steward"]:
                 results["steward"] = self.run_steward(scope=scope, actor=actor)
                 for action in results["steward"].get("actions", []):
@@ -653,11 +660,22 @@ class Amos:
             updated["version"] = int(current["version"]) + 1
             updated["updated_at"] = utc_now()
             updated = normalize_atom(updated, require_id=True)
+            projected_edges = []
+            if (
+                current.get("lifecycle_state") == "active"
+                and updated.get("lifecycle_state") != "active"
+            ):
+                projected_edges = self.store.mark_edges_deleted_for_ref(conn, atom_id)
             event = self.store.append_event(
                 conn,
                 event_type="atom_updated",
                 actor=actor,
-                payload={"operation": "update_atom", "before": current, "after": updated},
+                payload={
+                    "operation": "update_atom",
+                    "before": current,
+                    "after": updated,
+                    "projected_edges": projected_edges,
+                },
                 target_refs=[atom_id],
                 evidence_refs=updated["evidence_refs"],
                 idempotency_key=idempotency_key,
@@ -668,7 +686,12 @@ class Amos:
             )
             self.store.replace_atom(conn, updated)
             self.store.clear_packet_cache(conn)
-            response = {"status": "updated", "atom": updated, "event": event}
+            response = {
+                "status": "updated",
+                "atom": updated,
+                "event": event,
+                "projected_edges": projected_edges,
+            }
             self._record_idempotency(conn, actor, idempotency_key, op_payload, event, response)
             return response
 
@@ -1856,8 +1879,22 @@ class Amos:
         }
         missing_processors = sorted(set(processor_ids) - known_processor_ids)
         proposals = []
+        semantic_facets = []
         for processor in processors:
             proposals.extend(proposal.to_dict() for proposal in processor.propose(window))
+            extract_facets = getattr(processor, "extract_facets", None)
+            if callable(extract_facets):
+                semantic_facets.extend(extract_facets(window))
+        relation_proposals = []
+        if semantic_facets:
+            relation_proposals = [
+                proposal.to_dict()
+                for proposal in semantic_relation_proposals_from_facets(
+                    semantic_facets,
+                    existing_edges=window.edges,
+                )
+            ]
+            proposals.extend(relation_proposals)
         proposals.sort(
             key=lambda proposal: (
                 proposal["risk_level"] != "low",
@@ -1865,6 +1902,37 @@ class Amos:
                 proposal["proposal_id"],
             )
         )
+        processor_records = [
+            {
+                "processor_id": processor.processor_id,
+                "processor_version": processor.processor_version,
+            }
+            for processor in processors
+        ]
+        if relation_proposals:
+            processor_records.append(
+                {
+                    "processor_id": SEMANTIC_RELATION_PROCESSOR_ID,
+                    "processor_version": SEMANTIC_RELATION_PROCESSOR_VERSION,
+                }
+            )
+        reviewer_status = self._maintenance_reviewer_status(reviewer)
+        if not proposals and not missing_processors:
+            return {
+                "status": "skipped",
+                "reason": "no_proposals",
+                "scope": scope,
+                "domain": domain,
+                "window": window.to_dict(),
+                "processors": processor_records,
+                "missing_processors": missing_processors,
+                "proposals": [],
+                "committed": [],
+                "deferred": [],
+                "reviewer": reviewer_status,
+                "event": None,
+                "graph_version": self.store.graph_version(),
+            }
 
         committed: list[dict[str, Any]] = []
         deferred: list[dict[str, Any]] = []
@@ -1886,6 +1954,66 @@ class Amos:
                     }
                 )
 
+        committed_count = len(
+            [item for item in committed if item.get("status") == "committed"]
+        )
+        already_committed_count = len(
+            [item for item in committed if item.get("status") == "already_committed"]
+        )
+        blocked_fingerprint = self._maintenance_distiller_blocked_fingerprint(
+            scope=scope,
+            domain=domain,
+            processor_ids=processor_ids,
+            missing_processors=missing_processors,
+            committed=committed,
+            deferred=deferred,
+            reviewer_status=reviewer_status,
+            auto_commit_low_risk=auto_commit_low_risk,
+        )
+        if proposals and committed_count == 0 and not deferred:
+            return {
+                "status": "skipped",
+                "reason": "all_proposals_already_committed",
+                "scope": scope,
+                "domain": domain,
+                "window": window.to_dict(),
+                "processors": processor_records,
+                "missing_processors": missing_processors,
+                "proposals": proposals,
+                "committed": committed,
+                "deferred": deferred,
+                "reviewer": reviewer_status,
+                "event": None,
+                "graph_version": self.store.graph_version(),
+            }
+        if (
+            proposals
+            and committed_count == 0
+            and deferred
+            and self.store.get_meta(
+                self._maintenance_distiller_blocked_state_key(
+                    scope=scope, domain=domain, processor_ids=processor_ids
+                )
+            )
+            == blocked_fingerprint
+        ):
+            return {
+                "status": "skipped",
+                "reason": "deferred_proposals_unchanged",
+                "scope": scope,
+                "domain": domain,
+                "window": window.to_dict(),
+                "processors": processor_records,
+                "missing_processors": missing_processors,
+                "proposals": proposals,
+                "committed": committed,
+                "deferred": deferred,
+                "reviewer": reviewer_status,
+                "deferred_fingerprint": blocked_fingerprint,
+                "event": None,
+                "graph_version": self.store.graph_version(),
+            }
+
         target_refs = [
             ref
             for proposal in proposals
@@ -1896,33 +2024,33 @@ class Amos:
             for committed_item in committed
             if committed_item.get("atom")
         )
+        target_refs.extend(
+            ref
+            for committed_item in committed
+            if committed_item.get("edge")
+            for ref in (
+                committed_item["edge"].get("source_ref"),
+                committed_item["edge"].get("target_ref"),
+            )
+            if ref
+        )
         event_payload = {
             "operation": "run_maintenance_distiller",
             "scope": scope,
             "domain": domain,
             "window": window.to_dict(),
-            "processors": [
-                {
-                    "processor_id": processor.processor_id,
-                    "processor_version": processor.processor_version,
-                }
-                for processor in processors
-            ],
+            "processors": processor_records,
             "missing_processors": missing_processors,
             "proposal_count": len(proposals),
-            "committed_count": len(
-                [item for item in committed if item.get("status") == "committed"]
-            ),
-            "already_committed_count": len(
-                [
-                    item
-                    for item in committed
-                    if item.get("status") == "already_committed"
-                ]
-            ),
+            "committed_count": committed_count,
+            "already_committed_count": already_committed_count,
             "deferred_count": len(deferred),
             "auto_commit_low_risk": auto_commit_low_risk,
-            "reviewer": self._maintenance_reviewer_status(reviewer),
+            "reviewer": reviewer_status,
+            "deferred_fingerprint": blocked_fingerprint if deferred else None,
+            "deferred_proposal_ids": [
+                item["proposal_id"] for item in deferred if item.get("proposal_id")
+            ],
         }
         with self.store.transaction() as conn:
             event = self.store.append_event(
@@ -1936,6 +2064,14 @@ class Amos:
                     "reviewer_authority": event_payload["reviewer"]["authority"],
                 },
             )
+            if deferred:
+                self.store._set_meta(
+                    conn,
+                    self._maintenance_distiller_blocked_state_key(
+                        scope=scope, domain=domain, processor_ids=processor_ids
+                    ),
+                    blocked_fingerprint,
+                )
         return {
             "status": "completed",
             "scope": scope,
@@ -1947,6 +2083,7 @@ class Amos:
             "committed": committed,
             "deferred": deferred,
             "reviewer": event_payload["reviewer"],
+            "deferred_fingerprint": event_payload["deferred_fingerprint"],
             "event": event,
             "graph_version": self.store.graph_version(),
         }
@@ -1956,6 +2093,7 @@ class Amos:
         *,
         scope: Mapping[str, Any] | None = None,
         target_refs: Sequence[str] | None = None,
+        max_atoms: int | None = None,
     ) -> dict[str, Any]:
         scope = dict(scope or {})
         atoms = [
@@ -1966,6 +2104,21 @@ class Amos:
         if target_refs:
             allowed = set(target_refs)
             atoms = [atom for atom in atoms if atom["id"] in allowed]
+        total_atom_count = len(atoms)
+        if max_atoms is not None:
+            atoms.sort(
+                key=lambda atom: (
+                    str(
+                        atom.get("observed_at")
+                        or atom.get("updated_at")
+                        or atom.get("created_at")
+                        or ""
+                    ),
+                    str(atom.get("id") or ""),
+                ),
+                reverse=True,
+            )
+            atoms = atoms[: max(1, int(max_atoms or 1))]
         shape_reports = [self.smp.validate_shape(atom) for atom in atoms]
         clusters = self.smp.cluster(atoms)
         conflicts = self.smp.detect_conflicts(atoms)
@@ -1980,6 +2133,9 @@ class Amos:
             "processor_version": self.smp.processor_version,
             "graph_version": self.store.graph_version(),
             "scope": scope,
+            "atom_count": total_atom_count,
+            "analyzed_atom_count": len(atoms),
+            "omitted_atom_count": max(0, total_atom_count - len(atoms)),
             "outputs": outputs,
             "review_required": [
                 output
@@ -2004,7 +2160,9 @@ class Amos:
             atoms = [
                 atom
                 for atom in self.store.list_atoms()
-                if not atom.get("deleted") and scope_visible(atom["scope"], scope)
+                if not atom.get("deleted")
+                and atom.get("lifecycle_state") == "active"
+                and scope_visible(atom["scope"], scope)
             ]
             smp_outputs = self.smp.cluster(atoms) + self.smp.detect_conflicts(atoms)
             existing_edge_ids = {
@@ -2040,20 +2198,15 @@ class Amos:
                 if existing is None:
                     seen[key] = atom
                     continue
-                duplicate = dict(atom)
-                duplicate["lifecycle_state"] = "archived"
-                duplicate["health_status"] = "merged"
-                duplicate["version"] = int(duplicate["version"]) + 1
-                duplicate["updated_at"] = utc_now()
-                duplicate["supersedes"] = list(duplicate["supersedes"]) + [existing["id"]]
-                duplicate = normalize_atom(duplicate, require_id=True)
-                self.store.replace_atom(conn, duplicate)
-                projected_atoms.append(duplicate)
-                edge = self._edge(
-                    existing["id"], duplicate["id"], "rel:similar_to", scope
+                duplicate, deleted_edges = self._archive_atom_projection(
+                    conn,
+                    atom,
+                    reason="exact_duplicate",
+                    superseded_by=existing["id"],
+                    actor=actor,
                 )
-                self.store.insert_edge(conn, edge)
-                projected_edges.append(edge)
+                projected_atoms.append(duplicate)
+                projected_edges.extend(deleted_edges)
                 actions.append(
                     {
                         "action": "deduplicate",
@@ -2067,9 +2220,60 @@ class Amos:
                         ],
                     }
                 )
+            structured_groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+            archived_ids = {atom["id"] for atom in projected_atoms}
+            for atom in atoms:
+                if atom["id"] in archived_ids:
+                    continue
+                key = self._structured_duplicate_key(atom)
+                if key is None:
+                    continue
+                structured_groups.setdefault(key, []).append(atom)
+            for key, group in structured_groups.items():
+                active_group = [
+                    atom
+                    for atom in group
+                    if atom["id"] not in archived_ids
+                    and atom.get("lifecycle_state") == "active"
+                    and not atom.get("deleted")
+                ]
+                if len(active_group) < 2:
+                    continue
+                kept = max(
+                    active_group,
+                    key=lambda atom: (
+                        self._structured_duplicate_quality(atom),
+                        str(atom.get("updated_at") or ""),
+                        str(atom.get("id") or ""),
+                    ),
+                )
+                for atom in active_group:
+                    if atom["id"] == kept["id"]:
+                        continue
+                    duplicate, deleted_edges = self._archive_atom_projection(
+                        conn,
+                        atom,
+                        reason=f"structured_duplicate:{key[0]}",
+                        superseded_by=kept["id"],
+                        actor=actor,
+                    )
+                    archived_ids.add(duplicate["id"])
+                    projected_atoms.append(duplicate)
+                    projected_edges.extend(deleted_edges)
+                    actions.append(
+                        {
+                            "action": "archive_structured_duplicate",
+                            "kind": key[0],
+                            "kept": kept["id"],
+                            "archived": duplicate["id"],
+                            "deleted_edge_count": len(deleted_edges),
+                        }
+                    )
 
             contradiction_groups: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = {}
             for atom in atoms:
+                if atom["id"] in archived_ids:
+                    continue
                 signature = self._contradiction_signature(atom)
                 if signature is None:
                     continue
@@ -2268,6 +2472,12 @@ class Amos:
                         edges.pop(edge["edge_id"], None)
                     else:
                         edges[edge["edge_id"]] = edge
+            elif event_type == "edge_committed":
+                for edge in payload.get("projected_edges", []):
+                    if edge.get("deleted"):
+                        edges.pop(edge["edge_id"], None)
+                    else:
+                        edges[edge["edge_id"]] = edge
             elif event_type in {"atom_merged", "steward_run"}:
                 for atom in payload.get("projected_atoms", []):
                     if atom.get("deleted"):
@@ -2383,6 +2593,8 @@ class Amos:
     def _commit_maintenance_proposal(
         self, proposal: Mapping[str, Any], *, actor: str
     ) -> dict[str, Any]:
+        if proposal.get("action") == "add_edge":
+            return self._commit_maintenance_edge_proposal(proposal, actor=actor)
         atom_payload = proposal.get("payload", {}).get("atom")
         if not isinstance(atom_payload, Mapping):
             return {
@@ -2432,6 +2644,93 @@ class Amos:
             "source_refs": list(proposal.get("source_refs", [])),
         }
 
+    def _commit_maintenance_edge_proposal(
+        self, proposal: Mapping[str, Any], *, actor: str
+    ) -> dict[str, Any]:
+        edge_payload = proposal.get("payload", {}).get("edge")
+        if not isinstance(edge_payload, Mapping):
+            return {
+                "status": "skipped",
+                "reason": "proposal_has_no_edge_payload",
+                "proposal_id": proposal["proposal_id"],
+                "source_refs": list(proposal.get("source_refs", [])),
+            }
+        source_ref = str(edge_payload.get("source_ref", ""))
+        target_ref = str(edge_payload.get("target_ref", ""))
+        relation = normalize_relation(str(edge_payload.get("relation", "")))
+        if not source_ref or not target_ref or source_ref == target_ref:
+            return {
+                "status": "skipped",
+                "reason": "invalid_edge_endpoints",
+                "proposal_id": proposal["proposal_id"],
+                "source_refs": list(proposal.get("source_refs", [])),
+            }
+        source = self.store.get_atom(source_ref)
+        target = self.store.get_atom(target_ref)
+        if (
+            source is None
+            or target is None
+            or source.get("deleted")
+            or target.get("deleted")
+            or source.get("lifecycle_state") != "active"
+            or target.get("lifecycle_state") != "active"
+        ):
+            return {
+                "status": "skipped",
+                "reason": "edge_endpoint_not_active",
+                "proposal_id": proposal["proposal_id"],
+                "source_refs": list(proposal.get("source_refs", [])),
+            }
+        edge = self._edge(
+            source_ref,
+            target_ref,
+            relation,
+            dict(edge_payload.get("scope") or {}),
+        )
+        edge["evidence_refs"] = [
+            str(ref) for ref in edge_payload.get("evidence_refs", [])
+        ]
+        edge["confidence"] = dict(
+            edge_payload.get("confidence")
+            or {"level": "medium-high", "score": proposal.get("confidence", 0.75)}
+        )
+        if any(existing["edge_id"] == edge["edge_id"] for existing in self.store.list_edges()):
+            return {
+                "status": "already_committed",
+                "proposal_id": proposal["proposal_id"],
+                "edge": edge,
+                "source_refs": list(proposal.get("source_refs", [])),
+            }
+        with self.store.transaction() as conn:
+            self.store.insert_edge(conn, edge)
+            event = self.store.append_event(
+                conn,
+                event_type="edge_committed",
+                actor=actor,
+                payload={
+                    "operation": "commit_maintenance_edge",
+                    "edge": edge,
+                    "projected_edges": [edge],
+                    "maintenance_proposal_id": proposal["proposal_id"],
+                    "maintenance_reason_code": proposal["reason_code"],
+                },
+                target_refs=[source_ref, target_ref],
+                authorization_context={
+                    "maintenance_proposal_id": proposal["proposal_id"],
+                    "maintenance_processor_id": proposal["processor_id"],
+                    "risk_level": proposal["risk_level"],
+                    "auto_commit_gate": "low_risk_add_edge",
+                },
+            )
+            self.store.clear_packet_cache(conn)
+        return {
+            "status": "committed",
+            "proposal_id": proposal["proposal_id"],
+            "edge": edge,
+            "event": event,
+            "source_refs": list(proposal.get("source_refs", [])),
+        }
+
     def _maintenance_reviewer_status(
         self, reviewer: Mapping[str, Any] | None
     ) -> dict[str, Any]:
@@ -2449,6 +2748,73 @@ class Amos:
                 "contradiction_analysis_draft",
             ],
         }
+
+    def _maintenance_distiller_blocked_state_key(
+        self,
+        *,
+        scope: Mapping[str, Any],
+        domain: str,
+        processor_ids: Sequence[str],
+    ) -> str:
+        return "maintenance_distiller_blocked:" + stable_id(
+            "mdblk",
+            {
+                "scope": dict(scope),
+                "domain": domain,
+                "processor_ids": sorted(str(item) for item in processor_ids),
+            },
+        )
+
+    def _maintenance_distiller_blocked_fingerprint(
+        self,
+        *,
+        scope: Mapping[str, Any],
+        domain: str,
+        processor_ids: Sequence[str],
+        missing_processors: Sequence[str],
+        committed: Sequence[Mapping[str, Any]],
+        deferred: Sequence[Mapping[str, Any]],
+        reviewer_status: Mapping[str, Any],
+        auto_commit_low_risk: bool,
+    ) -> str:
+        return digest(
+            {
+                "scope": dict(scope),
+                "domain": domain,
+                "processor_ids": sorted(str(item) for item in processor_ids),
+                "missing_processors": sorted(str(item) for item in missing_processors),
+                "commit_eligible": sorted(
+                    str(item.get("proposal_id"))
+                    for item in committed
+                    if item.get("proposal_id")
+                ),
+                "deferred": sorted(
+                    (
+                        {
+                            "proposal_id": str(item.get("proposal_id")),
+                            "action": str(item.get("action")),
+                            "risk_level": str(item.get("risk_level")),
+                            "reason": str(item.get("reason")),
+                            "source_refs": sorted(
+                                str(ref) for ref in item.get("source_refs", [])
+                            ),
+                        }
+                        for item in deferred
+                    ),
+                    key=lambda item: (
+                        item["proposal_id"],
+                        item["action"],
+                        item["risk_level"],
+                    ),
+                ),
+                "reviewer_status": {
+                    "enabled": bool(reviewer_status.get("enabled", False)),
+                    "authority": str(reviewer_status.get("authority", "")),
+                    "status": str(reviewer_status.get("status", "")),
+                },
+                "auto_commit_low_risk": bool(auto_commit_low_risk),
+            }
+        )
 
     def _idempotency_hit(
         self,
@@ -2572,8 +2938,18 @@ class Amos:
         )
         schedule["run_on_pressure"] = bool(schedule.get("run_on_pressure", True))
         maintenance = normalized["maintenance"]
-        for key in ["enabled", "run_smp", "run_steward", "rebuild_indexes", "invalidate_packet_cache"]:
+        for key in [
+            "enabled",
+            "run_smp",
+            "run_steward",
+            "rebuild_indexes",
+            "invalidate_packet_cache",
+        ]:
             maintenance[key] = bool(maintenance.get(key, True))
+        maintenance["max_smp_atoms"] = max(
+            1,
+            int(maintenance.get("max_smp_atoms", 128) or 128),
+        )
         distillation = normalized["distillation"]
         distillation["enabled"] = bool(distillation.get("enabled", True))
         distillation["min_source_atoms"] = max(
@@ -2718,6 +3094,7 @@ class Amos:
                 "distillation_type": distillation["distillation_type"],
                 "target_refs": target_refs,
                 "source_digests": source_digests,
+                "summary_digest": digest(summary),
                 "scope": scope,
             },
         )
@@ -2762,6 +3139,8 @@ class Amos:
         for atom in self.store.list_atoms():
             if atom.get("deleted") or atom["type"] != "semantic":
                 continue
+            if atom.get("lifecycle_state") != "active":
+                continue
             payload = atom.get("payload", {})
             if payload.get("created_by") != "svc:memory_policy":
                 continue
@@ -2783,35 +3162,136 @@ class Amos:
             if scope and not scope_visible(atom["scope"], scope):
                 continue
             candidates.append(atom)
-        candidates.sort(key=lambda atom: (atom.get("observed_at") or atom["created_at"], atom["id"]))
+        candidates.sort(
+            key=lambda atom: (
+                -self._policy_distillation_priority(atom),
+                atom.get("observed_at") or atom["created_at"],
+                atom["id"],
+            )
+        )
         return candidates
+
+    def _policy_distillation_priority(self, atom: Mapping[str, Any]) -> int:
+        payload = atom.get("payload", {})
+        payload = payload if isinstance(payload, Mapping) else {}
+        score = 0
+        kind = str(payload.get("qandl_kind") or payload.get("kind") or "").lower()
+        outcome = str(
+            payload.get("outcome") or payload.get("status") or payload.get("result") or ""
+        ).lower()
+        if kind in {"reflection", "outcome", "evaluation"}:
+            score += 6
+        if outcome and outcome not in {"issued", "pending", "planned", "started"}:
+            score += 4
+        for key in (
+            "directive_atom_ref",
+            "source_directive_ref",
+            "metric_deltas",
+            "deltas",
+            "lesson",
+            "correction",
+        ):
+            if payload.get(key) not in (None, "", [], {}):
+                score += 2
+        if self._payload_delta_fields(payload):
+            score += 2
+        if payload.get("summary") or payload.get("claim"):
+            score += 1
+        if payload.get("applied_controls") or payload.get("requested_controls"):
+            score += 1
+        return score
 
     def _policy_distillation_summary(
         self, atoms: Sequence[Mapping[str, Any]]
-    ) -> dict[str, Any]:
+    ) -> str:
         type_counts = self._counts(atoms, "type")
-        scopes = sorted({canonical_json(atom["scope"]) for atom in atoms})
-        highlights = []
-        for atom in atoms[:8]:
-            rendered = self._render_atom(atom)
-            highlights.append(
-                {
-                    "atom_ref": atom["id"],
-                    "type": atom["type"],
-                    "text": rendered["text"],
-                }
+        type_phrase = ", ".join(
+            f"{count} {atom_type}" for atom_type, count in sorted(type_counts.items())
+        )
+        highlights = [self._policy_distillation_highlight(atom) for atom in atoms[:6]]
+        highlights = [highlight for highlight in highlights if highlight]
+        if highlights:
+            source_phrase = " Key memories: " + "; ".join(highlights) + "."
+        else:
+            source_phrase = ""
+        return (
+            "Automatic AMOS memory policy distilled "
+            f"{len(atoms)} source atoms"
+            f" ({type_phrase or 'mixed types'}) into a reusable memory packet."
+            f"{source_phrase}"
+        )
+
+    def _policy_distillation_highlight(self, atom: Mapping[str, Any]) -> str:
+        payload = atom.get("payload", {})
+        atom_id = str(atom.get("id", "unknown"))
+        atom_type = str(atom.get("type", "memory"))
+        if not isinstance(payload, Mapping):
+            return self._truncate_text(f"{atom_id}: {payload}", 180)
+        if payload.get("summary"):
+            return self._truncate_text(f"{atom_id}: {payload['summary']}", 180)
+        if payload.get("claim"):
+            return self._truncate_text(f"{atom_id}: {payload['claim']}", 180)
+        chunk = payload.get("chunk", payload.get("target_chunk"))
+        outcome = (
+            payload.get("outcome") or payload.get("status") or payload.get("result")
+        )
+        deltas = self._payload_delta_fields(payload)
+        controls = payload.get("applied_controls") or payload.get("requested_controls")
+        prefix = f"{atom_id}"
+        if chunk is not None:
+            prefix += f" chunk {chunk}"
+        if outcome:
+            prefix += f" {outcome}"
+        if controls:
+            controls_text = canonical_json(controls)
+            detail = f"controls {controls_text}"
+            if deltas:
+                detail = f"deltas {self._format_delta_fields(deltas)}; {detail}"
+            return self._truncate_text(f"{prefix}: {detail}", 220)
+        if deltas:
+            return self._truncate_text(
+                f"{prefix}: deltas {self._format_delta_fields(deltas)}",
+                220,
             )
-        return {
-            "summary": (
-                "Automatic AMOS memory policy distillation over "
-                f"{len(atoms)} source atoms."
-            ),
-            "source_count": len(atoms),
-            "source_types": type_counts,
-            "scope_fingerprints": scopes,
-            "highlights": highlights,
-            "policy": "amos.v1.automatic_memory_policy",
-        }
+        task = payload.get("task")
+        action = payload.get("action")
+        if task or action or outcome:
+            parts = [str(part) for part in (task, action, outcome) if part]
+            return self._truncate_text(f"{atom_id}: {'; '.join(parts)}", 180)
+        rendered = self._render_atom(atom)["text"]
+        return self._truncate_text(f"{atom_id} {atom_type}: {rendered}", 180)
+
+    def _payload_delta_fields(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        deltas: dict[str, Any] = {}
+        for key in ("metric_deltas", "deltas"):
+            value = payload.get(key)
+            if isinstance(value, Mapping):
+                deltas.update(
+                    {
+                        str(delta_key): delta_value
+                        for delta_key, delta_value in value.items()
+                        if delta_value not in (None, "", [], {})
+                    }
+                )
+        for key, value in payload.items():
+            if str(key).startswith("delta_") and value not in (None, "", [], {}):
+                deltas[str(key)] = value
+        return deltas
+
+    def _format_delta_fields(self, deltas: Mapping[str, Any]) -> str:
+        formatted = []
+        for key, value in sorted(deltas.items()):
+            if isinstance(value, (int, float)):
+                formatted.append(f"{key}={value:+.6g}")
+            else:
+                formatted.append(f"{key}={value}")
+        return ", ".join(formatted)
+
+    def _truncate_text(self, text: str, limit: int) -> str:
+        text = " ".join(str(text).split())
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)].rstrip() + "..."
 
     def _rebuild_derived_indexes(
         self, *, graph_version: int | None = None
@@ -3190,6 +3670,103 @@ class Amos:
                 if float(calibration.get("overconfident_claim_rate", 0.0) or 0.0) > 0:
                     return True
         return False
+
+    def _archive_atom_projection(
+        self,
+        conn: Any,
+        atom: Mapping[str, Any],
+        *,
+        reason: str,
+        superseded_by: str,
+        actor: str,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        archived = dict(atom)
+        archived["lifecycle_state"] = "archived"
+        archived["health_status"] = "merged"
+        archived["version"] = int(archived["version"]) + 1
+        archived["updated_at"] = utc_now()
+        archived["supersedes"] = list(archived.get("supersedes") or []) + [
+            superseded_by
+        ]
+        archived["decay_policy"] = {
+            **dict(archived.get("decay_policy") or {}),
+            "archive_reason": reason,
+            "superseded_by": superseded_by,
+        }
+        archived["revision_history"] = list(archived.get("revision_history") or [])
+        archived["revision_history"].append(
+            {
+                "version": atom["version"],
+                "digest": digest(self._atom_projection(atom)),
+                "changed_at": utc_now(),
+                "actor": actor,
+                "reason": reason,
+            }
+        )
+        archived = normalize_atom(archived, require_id=True)
+        self.store.replace_atom(conn, archived)
+        deleted_edges = self.store.mark_edges_deleted_for_ref(conn, archived["id"])
+        return archived, deleted_edges
+
+    def _structured_duplicate_key(
+        self, atom: Mapping[str, Any]
+    ) -> tuple[Any, ...] | None:
+        if atom.get("deleted") or atom.get("lifecycle_state") != "active":
+            return None
+        payload = atom.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        scope = atom.get("scope")
+        scope = scope if isinstance(scope, Mapping) else {}
+        tenant = scope.get("tenant")
+        component = scope.get("component")
+        asset = scope.get("asset") or payload.get("asset")
+        run_id = scope.get("run_id") or payload.get("run_id")
+        agent_id = payload.get("agent_id")
+        if atom.get("type") == "agentic_trace":
+            kind = payload.get("qandl_kind") or payload.get("kind")
+            chunk = payload.get("chunk")
+            if kind == "reflection" and chunk not in (None, ""):
+                return (
+                    "agentic_trace.reflection",
+                    tenant,
+                    component,
+                    asset,
+                    run_id,
+                    agent_id,
+                    chunk,
+                )
+        if atom.get("type") == "runtime_state":
+            role_key = payload.get("role_key") or payload.get("role")
+            if agent_id:
+                return (
+                    "runtime_state.current",
+                    tenant,
+                    component,
+                    asset,
+                    run_id,
+                    agent_id,
+                    role_key,
+                )
+        return None
+
+    def _structured_duplicate_quality(self, atom: Mapping[str, Any]) -> int:
+        payload = atom.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        score = 0
+        for key in (
+            "directive_atom_ref",
+            "source_directive_ref",
+            "control_signature",
+            "metric_deltas",
+            "tool_surface",
+            "runtime_capabilities",
+            "runtime_constraints",
+        ):
+            value = payload.get(key)
+            if value not in (None, "", [], {}):
+                score += 1
+        score += min(5, len(canonical_json(payload)) // 1000)
+        return score
 
     def _intrinsic_edges_for_atom(self, atom: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Project deterministic graph edges encoded by structured atom fields."""

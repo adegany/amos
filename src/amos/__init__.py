@@ -15,7 +15,9 @@ from .maintenance import (
     MaintenanceProposal,
     MaintenanceProcessor,
     ProcessorRegistry,
+    SemanticFacet,
     load_maintenance_processor,
+    semantic_relation_proposals_from_facets,
 )
 from .smp import SemanticMaintenanceProcessor
 from .store import SQLiteStore
@@ -52,10 +54,12 @@ __all__ = [
     "PacketCacheInvalidator",
     "ProcessorRegistry",
     "SMPWorker",
+    "SemanticFacet",
     "SemanticMaintenanceProcessor",
     "SelfModelCalibrator",
     "SQLiteStore",
     "ValidationError",
     "load_maintenance_processor",
     "ontology_snapshot",
+    "semantic_relation_proposals_from_facets",
 ]

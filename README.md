@@ -198,6 +198,35 @@ PYTHONPATH=src python -m amos.cli \
   --processor-id my.training.flight.v1
 ```
 
+## Benchmark
+
+AMOS includes a dependency-free local benchmark for the v1 SQLite service path:
+
+```bash
+python benchmarks/benchmark_amos.py --markdown --run-policy
+```
+
+The benchmark commits typed atoms through the in-process service API, retrieves
+planner packets, verifies replay, and optionally runs the automatic memory
+policy once. It measures the current v1-local SQLite baseline, not HTTP or
+network overhead.
+
+Reference result from a local workstation run on 2026-07-04:
+
+| Benchmark | Result |
+| --- | ---: |
+| Atoms committed | 100 |
+| Retrievals | 20 |
+| Commit throughput | 478.07 atoms/s |
+| Commit latency p50 / p95 | 2.071 ms / 2.582 ms |
+| Retrieval latency p50 / p95 | 73.79 ms / 83.206 ms |
+| Average packet items | 9 |
+| Replay verification | 11.206 ms (ok) |
+| Forced memory policy run | 1460.163 ms (completed) |
+| Final atoms / edges | 101 / 60 |
+| SQLite DB size | 2424832 bytes |
+| Environment | Python 3.12.2; 24 CPUs; Linux-6.17.0-35-generic-x86_64-with-glibc2.39 |
+
 ## Integration boundary
 
 AMOS owns canonical memory, recall, provenance, cleanup metadata, self-awareness
