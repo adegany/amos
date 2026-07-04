@@ -99,6 +99,7 @@ DEFAULT_MEMORY_POLICY = {
     },
 }
 SEARCH_INDEX_REF = "amos.v1.search"
+ATTENTION_POLICY_ID = "amos.v1.attention.default"
 RETRIEVAL_WEIGHTS = {
     "direct_cue_match": 0.22,
     "semantic_similarity": 0.14,
@@ -110,6 +111,10 @@ RETRIEVAL_WEIGHTS = {
     "scope_specificity": 0.06,
     "goal_relevance": 0.08,
     "procedural_applicability": 0.04,
+    "attention_focus": 0.18,
+    "attention_type_boost": 0.08,
+    "attention_counterevidence": 0.08,
+    "attention_suppression_penalty": -0.20,
     "contradiction_penalty": -0.30,
     "staleness_penalty": -0.18,
     "redundancy_penalty": -0.15,
@@ -1041,6 +1046,7 @@ class Amos:
         include_archived: bool = False,
         include_low_health: bool = False,
         type_filter: Sequence[str] | None = None,
+        attention_context: Mapping[str, Any] | None = None,
         run_policy: bool = True,
     ) -> dict[str, Any]:
         if run_policy:
@@ -1061,6 +1067,7 @@ class Amos:
             max_items = max(1, max_items // 2)
         elif pressure_mode == "red":
             max_items = max(1, min(max_items, 3))
+        attention_policy = self._attention_policy(attention_context)
         request = {
             "cues": list(cues or []),
             "scope": dict(scope or {}),
@@ -1073,6 +1080,7 @@ class Amos:
             "include_archived": include_archived,
             "include_low_health": include_low_health,
             "type_filter": list(type_filter or []),
+            "attention_context": attention_policy["context"],
             "pressure_mode": pressure_mode,
             "run_policy": bool(run_policy),
         }
@@ -1125,6 +1133,7 @@ class Amos:
                 cue_tokens=cue_tokens,
                 cue_vector=cue_vector,
                 edge_degrees=edge_degrees,
+                attention_policy=attention_policy,
             )
             if request["cues"] and not matched:
                 omissions.append({"atom_ref": atom_ref, "reason": "low_relevance"})
@@ -1203,6 +1212,12 @@ class Amos:
                 "byte_budget": byte_budget,
                 "used_bytes": used_bytes,
             },
+            "attention_trace": self._attention_trace(
+                attention_policy=attention_policy,
+                items=items,
+                candidates=candidates,
+                omissions=omissions,
+            ),
             "provenance": {
                 "store": getattr(self.store, "backend_name", "unknown"),
                 "journal_head": self.store.last_event_hash(),
@@ -3789,6 +3804,216 @@ class Amos:
             ),
         }
 
+    def _attention_policy(
+        self, attention_context: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        context = self._normalize_attention_context(attention_context)
+        return {
+            "policy_id": ATTENTION_POLICY_ID,
+            "context": context,
+            "focus_terms": context.get("focus_terms", []),
+            "suppress_terms": context.get("suppress_terms", []),
+            "boost_memory_types": context.get("boost_memory_types", []),
+            "suppress_memory_types": context.get("suppress_memory_types", []),
+            "counterevidence_required": bool(
+                context.get("counterevidence_required", False)
+            ),
+            "weight_adjustments": {
+                "attention_focus": RETRIEVAL_WEIGHTS["attention_focus"],
+                "attention_type_boost": RETRIEVAL_WEIGHTS["attention_type_boost"],
+                "attention_counterevidence": RETRIEVAL_WEIGHTS[
+                    "attention_counterevidence"
+                ],
+                "attention_suppression_penalty": RETRIEVAL_WEIGHTS[
+                    "attention_suppression_penalty"
+                ],
+            },
+        }
+
+    def _normalize_attention_context(
+        self, attention_context: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        if not isinstance(attention_context, Mapping):
+            return {}
+        context: dict[str, Any] = {}
+        scalar_keys = (
+            "active_task",
+            "mission",
+            "goal",
+            "role",
+            "risk_posture",
+            "time_horizon",
+        )
+        for key in scalar_keys:
+            value = attention_context.get(key)
+            if value not in (None, "", [], {}):
+                context[key] = value
+
+        focus_terms = self._attention_terms(attention_context.get("focus_terms"))
+        suppress_terms = self._attention_terms(attention_context.get("suppress_terms"))
+        for key in ("active_task", "mission", "goal", "role", "task_context"):
+            focus_terms.extend(self._attention_terms(attention_context.get(key)))
+
+        context["focus_terms"] = sorted(set(focus_terms))
+        context["suppress_terms"] = sorted(set(suppress_terms))
+        context["boost_memory_types"] = sorted(
+            set(self._attention_type_terms(attention_context.get("boost_memory_types")))
+        )
+        context["suppress_memory_types"] = sorted(
+            set(
+                self._attention_type_terms(
+                    attention_context.get("suppress_memory_types")
+                )
+            )
+        )
+        risk_posture = str(context.get("risk_posture", "")).lower()
+        context["counterevidence_required"] = bool(
+            attention_context.get("counterevidence_required", False)
+            or risk_posture in {"cautious", "high_risk", "high-risk", "critical"}
+        )
+        novelty = attention_context.get("novelty_preference")
+        if novelty not in (None, ""):
+            try:
+                context["novelty_preference"] = max(0.0, min(1.0, float(novelty)))
+            except (TypeError, ValueError):
+                pass
+        return {
+            key: value
+            for key, value in context.items()
+            if value not in (None, "", [], {})
+        }
+
+    def _attention_terms(self, value: Any) -> list[str]:
+        if value in (None, "", [], {}):
+            return []
+        if isinstance(value, Mapping):
+            terms: list[str] = []
+            for item in value.values():
+                terms.extend(self._attention_terms(item))
+            return terms
+        if isinstance(value, (list, tuple, set)):
+            terms = []
+            for item in value:
+                terms.extend(self._attention_terms(item))
+            return terms
+        text = str(value).lower()
+        return [token for token in re.findall(r"[a-z0-9_]+", text) if token]
+
+    def _attention_type_terms(self, value: Any) -> list[str]:
+        known_types = {
+            "belief",
+            "preference",
+            "goal",
+            "commitment",
+            "procedure",
+            "capability",
+            "limitation",
+            "episode",
+            "agentic_trace",
+            "action_outcome",
+            "self_model",
+            "runtime_state",
+            "self_assessment",
+            "semantic",
+            "policy",
+        }
+        return [
+            token
+            for token in self._attention_terms(value)
+            if token in known_types
+        ]
+
+    def _attention_score_components(
+        self,
+        atom: Mapping[str, Any],
+        *,
+        text: str,
+        text_tokens: set[str],
+        attention_policy: Mapping[str, Any] | None,
+    ) -> dict[str, float]:
+        policy = attention_policy if isinstance(attention_policy, Mapping) else {}
+        focus_terms = set(policy.get("focus_terms", []) or [])
+        suppress_terms = set(policy.get("suppress_terms", []) or [])
+        atom_type = str(atom.get("type", ""))
+        focus_overlap = len(focus_terms.intersection(text_tokens))
+        suppress_overlap = len(suppress_terms.intersection(text_tokens))
+        direct_focus = any(term and term in text for term in focus_terms)
+        direct_suppress = any(term and term in text for term in suppress_terms)
+        attention_focus = 0.0
+        if focus_terms:
+            attention_focus = min(1.0, focus_overlap / max(1, len(focus_terms)))
+            if direct_focus:
+                attention_focus = max(attention_focus, 0.75)
+        attention_suppression = 0.0
+        if suppress_terms:
+            attention_suppression = min(
+                1.0, suppress_overlap / max(1, len(suppress_terms))
+            )
+            if direct_suppress:
+                attention_suppression = max(attention_suppression, 0.75)
+        attention_type_boost = (
+            1.0 if atom_type in set(policy.get("boost_memory_types", []) or []) else 0.0
+        )
+        if atom_type in set(policy.get("suppress_memory_types", []) or []):
+            attention_suppression = max(attention_suppression, 1.0)
+        counterevidence = 0.0
+        if policy.get("counterevidence_required"):
+            if atom.get("health_status") == "contradicted":
+                counterevidence = 1.0
+            elif atom_type in {"limitation", "self_assessment", "action_outcome"}:
+                counterevidence = 0.6
+            elif any(
+                term in text_tokens
+                for term in {
+                    "failure",
+                    "correction",
+                    "blocked",
+                    "risk",
+                    "contradiction",
+                }
+            ):
+                counterevidence = 0.5
+        return {
+            "attention_focus": attention_focus,
+            "attention_type_boost": attention_type_boost,
+            "attention_counterevidence": counterevidence,
+            "attention_suppression_penalty": attention_suppression,
+        }
+
+    def _attention_trace(
+        self,
+        *,
+        attention_policy: Mapping[str, Any],
+        items: Sequence[Mapping[str, Any]],
+        candidates: Sequence[tuple[float, Mapping[str, Any]]],
+        omissions: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        selected = {str(item.get("atom_ref")) for item in items if item.get("atom_ref")}
+        inhibited = []
+        for _, atom in candidates:
+            atom_ref = str(atom.get("id", ""))
+            if not atom_ref or atom_ref in selected:
+                continue
+            components = atom.get("_score_components", {})
+            if float(components.get("attention_suppression_penalty", 0.0) or 0.0) > 0:
+                inhibited.append(atom_ref)
+        omitted_reasons: dict[str, int] = {}
+        for omission in omissions:
+            reason = str(omission.get("reason", "unknown"))
+            omitted_reasons[reason] = omitted_reasons.get(reason, 0) + 1
+        return {
+            "policy_id": attention_policy.get("policy_id", ATTENTION_POLICY_ID),
+            "context": dict(attention_policy.get("context", {})),
+            "focus_terms": list(attention_policy.get("focus_terms", []) or []),
+            "suppress_terms": list(attention_policy.get("suppress_terms", []) or []),
+            "weight_adjustments": dict(
+                attention_policy.get("weight_adjustments", {})
+            ),
+            "selected_item_refs": [item["atom_ref"] for item in items],
+            "inhibited_refs": inhibited[:50],
+            "omitted_reasons": omitted_reasons,
+        }
+
     def _rank_atom(
         self,
         atom: Mapping[str, Any],
@@ -3800,6 +4025,7 @@ class Amos:
         cue_tokens: set[str] | None = None,
         cue_vector: Sequence[float] | None = None,
         edge_degrees: Mapping[str, int] | None = None,
+        attention_policy: Mapping[str, Any] | None = None,
     ) -> tuple[float, bool, dict[str, float]]:
         search_index = self._atom_search_index(atom)
         text = str(search_index["text"])
@@ -3857,6 +4083,14 @@ class Amos:
         }
         if retrieval_mode == "agentic_recall":
             components.update(self._agentic_score_components(atom))
+        components.update(
+            self._attention_score_components(
+                atom,
+                text=text,
+                text_tokens=text_tokens,
+                attention_policy=attention_policy,
+            )
+        )
         score = 0.0
         weights = dict(RETRIEVAL_WEIGHTS)
         if retrieval_mode == "agentic_recall":

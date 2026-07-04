@@ -38,14 +38,17 @@ flowchart LR
     D --> M
     SMP --> G
     C --> M
-    P -->|bounded memory packets| A
+    P --> AT[Attention policy and trace]
+    AT -->|bounded memory packets| A
     S --> DB[(SQLite v1-local\nPostgres planned)]
 ```
 
 AMOS exposes memory as a service boundary. Agents submit structured evidence
 and receive bounded packets; the service owns canonical state, journal replay,
 maintenance policy, provenance, packet cache invalidation, and capacity
-pressure reporting.
+pressure reporting. Packet retrieval can include an attention context so AMOS
+can foreground task-relevant memory, inhibit distracting material, reserve space
+for counterevidence, and report the effective attention trace.
 
 ## Why Amos?
 
@@ -92,6 +95,9 @@ in-process SQLite store and serializes access through the service boundary:
 - Idempotent capture/commit operations and compare-and-swap update checks.
 - Memory packets with scope isolation, access filtering, omissions, conflicts,
   provenance, and degradation metadata.
+- Attention-aware packet ranking with explicit focus, type-boost,
+  counterevidence, and suppression score components plus packet-level
+  `attention_trace` diagnostics.
 - Self-awareness and agentic-recall views for self models, capabilities,
   limitations, runtime state, self-assessments, traces, outcomes, corrections,
   and blocked actions.
@@ -149,6 +155,18 @@ PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 commit-atom \
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 retrieve \
   --cue "Codex outage fallback"
 ```
+
+Retrieve with an explicit attention context:
+
+```bash
+PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 retrieve \
+  --cue "training policy" \
+  --attention-context '{"active_task":"performance search","focus_terms":["mission","routing"],"boost_memory_types":["policy"],"counterevidence_required":true}'
+```
+
+The returned packet includes `attention_trace` and item-level
+`score_components` such as `attention_focus`, `attention_type_boost`,
+`attention_counterevidence`, and `attention_suppression_penalty`.
 
 Run the Amos Mirror Agent integration demo:
 
@@ -225,14 +243,14 @@ Reference result from a local workstation run on 2026-07-04:
 | --- | ---: |
 | Atoms committed | 100 |
 | Retrievals | 20 |
-| Commit throughput | 1039.42 atoms/s |
-| Commit latency p50 / p95 | 0.947 ms / 1.241 ms |
-| Retrieval latency p50 / p95 | 0.256 ms / 14.754 ms |
+| Commit throughput | 1096.26 atoms/s |
+| Commit latency p50 / p95 | 0.898 ms / 1.139 ms |
+| Retrieval latency p50 / p95 | 0.28 ms / 14.229 ms |
 | Average packet items | 9 |
-| Replay verification | 21.761 ms (ok) |
-| Forced memory policy run | 175.669 ms (completed) |
+| Replay verification | 22.519 ms (ok) |
+| Forced memory policy run | 205.419 ms (completed) |
 | Final atoms / edges | 101 / 60 |
-| SQLite DB size | 876544 bytes |
+| SQLite DB size | 884736 bytes |
 | Environment | Python 3.12.2; 24 CPUs; Linux-6.17.0-35-generic-x86_64-with-glibc2.39 |
 
 ## Integration boundary
@@ -262,7 +280,8 @@ ambiguous or high-risk work for review.
 - Stabilize the V1 HTTP API envelopes and schema contracts.
 - Keep SQLite as the first supported shared-service deployment profile.
 - Expand replay verification and background-maintenance acceptance tests.
-- Improve packet-ranking diagnostics, omissions reporting, and retrieval-outcome telemetry.
+- Improve attention policy diagnostics, packet-ranking diagnostics, omissions
+  reporting, and retrieval-outcome telemetry.
 - Harden the Mirror Agent demo as the reference self-awareness integration.
 
 ### Storage and Scale

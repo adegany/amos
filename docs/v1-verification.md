@@ -24,6 +24,7 @@ runtime backend for this repository state is SQLite behind the service boundary.
 | Worker artifacts | `src/amos/workers.py` |
 | Non-generative SMP | `src/amos/smp.py` |
 | Automatic memory policy | `src/amos/service.py`, `src/amos/workers.py`, `src/amos/http_api.py`, `src/amos/cli.py`, `tests/test_amos_v1.py::test_automatic_memory_policy_distills_and_maintains_on_retrieval`, `tests/test_amos_v1.py::test_health_memory_can_skip_foreground_policy_tick`, `tests/test_amos_v1.py::test_background_memory_policy_worker_runs_queued_tick`, `tests/test_amos_v1.py::test_memory_policy_worker_force_runs_without_manual_maintenance` |
+| Attention-aware packet ranking | `src/amos/service.py::retrieve_packet`, `src/amos/service.py::_attention_policy`, `tests/test_amos_v1.py::test_retrieve_packet_attention_context_shapes_ranking_and_trace`, `tests/test_amos_v1.py::test_attention_context_is_part_of_packet_cache_key` |
 | Generic maintenance distiller and external processor packs | `src/amos/maintenance.py`, `src/amos/service.py`, `src/amos/workers.py`, `tests/test_amos_v1.py::test_external_processor_distills_supported_control_lesson`, `tests/test_amos_v1.py::test_external_processor_defers_sanitized_control_claim`, `tests/test_amos_v1.py::test_external_processor_import_path_loading` |
 | Mirror Agent integration demo spec | `docs/mirror-agent-demo-spec.md` |
 | Mirror Agent integration demo | `examples/mirror_agent_demo.py` |
@@ -38,6 +39,7 @@ runtime backend for this repository state is SQLite behind the service boundary.
 | Projection gate | Mutations append events and project graph changes in one transaction |
 | Replay gate | `verify_journal_chain`, `verify_replay`, replay/cache invalidation tests |
 | Retrieval gate | Packet graph version, provenance, omissions, degradation, score components, budgets |
+| Attention gate | Optional `attention_context` changes packet ranking through explicit focus/type/counterevidence/suppression score components, emits `attention_trace`, and participates in graph-version packet cache keys |
 | Self-awareness gate | Capability suppression, runtime state, limitations, open commitments, calibration tests |
 | Agentic recall gate | Success/failure/blocked/correction/limitation/external constraint, self/other/shared/external/unknown attribution, counterevidence, self-narrative drift tests |
 | Shared-memory gate | Shared common graph version with per-processor overlays, identity-specific omissions, and least-common-denominator evidence in common items |

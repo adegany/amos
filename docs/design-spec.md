@@ -1197,6 +1197,7 @@ MemoryPacketRequest
   client_identity
   target_processor
   retrieval_mode: general | self_awareness | shared_coordination | agentic_recall
+  attention_context
   task_context
   scope
   shared_view_ref
@@ -1228,8 +1229,42 @@ MemoryPacket
   items
   conflicts
   omissions
+  attention_trace
   provenance
   cache_policy
+```
+
+Attention is runtime policy over canonical memory, not a canonical memory type.
+It lets the caller disclose the current task, role, mission, risk posture,
+focus terms, suppression terms, and desired counterevidence posture so Amos can
+allocate packet budget deliberately.
+
+```text
+AttentionContext
+  active_task
+  mission
+  goal
+  role
+  risk_posture: normal | cautious | high_risk
+  time_horizon: immediate | short | long
+  focus_terms
+  suppress_terms
+  boost_memory_types
+  suppress_memory_types
+  counterevidence_required
+  novelty_preference
+```
+
+```text
+AttentionTrace
+  policy_id
+  context
+  focus_terms
+  suppress_terms
+  weight_adjustments
+  selected_item_refs
+  inhibited_refs
+  omitted_reasons
 ```
 
 Packet item shape:
@@ -1836,11 +1871,15 @@ activation =
 + salience
 + goal relevance
 + procedural applicability
++ attention focus
++ attention type boost
++ attention counterevidence boost
 + agency match
 + attribution confidence
 + correction/learning relevance
 - contradiction penalty
 - staleness penalty
+- attention suppression penalty
 - privacy/access penalty
 - redundancy penalty
 - over-attribution penalty
@@ -1860,6 +1899,10 @@ score_components
   salience: 0.0..1.0
   goal_relevance: 0.0..1.0
   procedural_applicability: 0.0..1.0
+  attention_focus: 0.0..1.0
+  attention_type_boost: 0.0..1.0
+  attention_counterevidence: 0.0..1.0
+  attention_suppression_penalty: 0.0..1.0
   agency_match: 0.0..1.0
   attribution_confidence: 0.0..1.0
   correction_learning_relevance: 0.0..1.0
@@ -1873,6 +1916,13 @@ score_components
 ```
 
 The first implementation may use hand-tuned weights, but every packet item must expose enough components to debug why it appeared, why it was suppressed, or why a stronger scoped memory inhibited a generic one.
+
+Attention does not replace cues. Cues describe what the caller is asking about;
+attention describes what should be foregrounded, reserved, or inhibited while
+answering. For example, a pilot can ask about current training policy while
+attention reserves budget for active mission rules and recent corrective
+failures, and a critic can ask the same cue while reserving more budget for
+counterevidence and contradictions.
 
 ### 11.3 Diversity requirement
 
@@ -4491,9 +4541,13 @@ utility: 0.12
 salience: 0.08
 goal_relevance: 0.08
 procedural_applicability: 0.04
+attention_focus: 0.18
+attention_type_boost: 0.08
+attention_counterevidence: 0.08
 
 contradiction_penalty: -0.30
 staleness_penalty: -0.18
+attention_suppression_penalty: -0.20
 access_penalty: suppress
 redundancy_penalty: -0.15
 confounding_penalty: suppress unless explicitly requested
@@ -5277,6 +5331,12 @@ retrieval gate:
   retrieval uses graph-version-aware packet caching, materialized search
   metadata, filtered atom reads, bounded edge activation, and ref-scoped conflict
   checks without changing packet correctness
+
+attention gate:
+  optional AttentionContext affects packet ranking through explicit score
+  components for focus, type boost, counterevidence, and suppression; every
+  packet includes an AttentionTrace showing the effective policy, selected refs,
+  inhibited refs, and omission reasons
 
 self-awareness gate:
   self-awareness packets distinguish durable self-knowledge from volatile runtime state,

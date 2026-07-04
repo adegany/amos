@@ -439,6 +439,86 @@ def test_retrieve_packet_uses_graph_version_packet_cache(amos, monkeypatch):
     assert "cache_hit_atom" in item_refs(second)
 
 
+def test_retrieve_packet_attention_context_shapes_ranking_and_trace(amos):
+    amos.commit_atom(
+        {
+            "id": "attention_mission_policy",
+            "type": "policy",
+            "payload": {
+                "rule": "System policy for performance search mission routing",
+            },
+            "salience": 0.5,
+            "utility": 0.5,
+        }
+    )
+    amos.commit_atom(
+        {
+            "id": "attention_archive_policy",
+            "type": "policy",
+            "payload": {
+                "rule": "System policy for archive cleanup and cold storage",
+            },
+            "salience": 0.5,
+            "utility": 0.5,
+        }
+    )
+
+    packet = amos.retrieve_packet(
+        cues=["system policy"],
+        max_items=2,
+        attention_context={
+            "active_task": "performance search",
+            "mission": "mission routing",
+            "focus_terms": ["performance", "routing"],
+            "suppress_terms": ["archive"],
+            "boost_memory_types": ["policy"],
+        },
+        run_policy=False,
+    )
+
+    assert packet["items"][0]["atom_ref"] == "attention_mission_policy"
+    mission_components = packet["items"][0]["score_components"]
+    archive_components = packet["items"][1]["score_components"]
+    assert mission_components["attention_focus"] > 0
+    assert mission_components["attention_type_boost"] == 1.0
+    assert archive_components["attention_suppression_penalty"] > 0
+    assert packet["attention_trace"]["policy_id"] == "amos.v1.attention.default"
+    assert "performance" in packet["attention_trace"]["focus_terms"]
+    assert packet["attention_trace"]["selected_item_refs"] == [
+        item["atom_ref"] for item in packet["items"]
+    ]
+    assert packet["request"]["attention_context"]["boost_memory_types"] == ["policy"]
+
+
+def test_attention_context_is_part_of_packet_cache_key(amos):
+    amos.commit_atom(
+        {
+            "id": "attention_cache_atom",
+            "type": "belief",
+            "payload": {"claim": "Cache attention context retrieval"},
+        }
+    )
+
+    first = amos.retrieve_packet(
+        cues=["attention context"],
+        attention_context={"focus_terms": ["first"]},
+        run_policy=False,
+    )
+    second = amos.retrieve_packet(
+        cues=["attention context"],
+        attention_context={"focus_terms": ["second"]},
+        run_policy=False,
+    )
+    repeated = amos.retrieve_packet(
+        cues=["attention context"],
+        attention_context={"focus_terms": ["first"]},
+        run_policy=False,
+    )
+
+    assert first["packet_id"] != second["packet_id"]
+    assert repeated["packet_id"] == first["packet_id"]
+
+
 def test_procedural_memory_is_advisory_and_autonomous_execution_denied(amos):
     procedure = amos.commit_atom(
         {

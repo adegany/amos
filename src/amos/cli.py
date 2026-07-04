@@ -75,6 +75,7 @@ def _parser() -> argparse.ArgumentParser:
     retrieve.add_argument("--max-items", type=int, default=8)
     retrieve.add_argument("--include-conflicts", action="store_true")
     retrieve.add_argument("--include-archived", action="store_true")
+    retrieve.add_argument("--attention-context", default="{}")
     retrieve.set_defaults(func=_retrieve)
 
     self_view = sub.add_parser("self-awareness", help="render a self-awareness view")
@@ -232,6 +233,7 @@ def _retrieve(amos: Amos, args: argparse.Namespace) -> dict[str, Any]:
         max_items=args.max_items,
         include_conflicts=args.include_conflicts,
         include_archived=args.include_archived,
+        attention_context=parse_json_arg(args.attention_context),
     )
 
 
