@@ -2,7 +2,7 @@
 
 **Amos** stands for **Agent Memory Operating System**.
 
-Amos is a design project for a model-neutral, layered, associative, self-maintaining memory substrate for agentic AI systems. It treats agent memory as an operating-system-like service: capture evidence, maintain typed memory, preserve provenance, perform cleanup, promote and demote memories across tiers, and render task-specific memory packets for reasoners, planners, executors, critics, and future processors.
+Amos is a model-neutral, layered, associative, self-maintaining memory substrate for agentic AI systems. It treats agent memory as an operating-system-like service: capture evidence, maintain typed memory, preserve provenance, perform cleanup, promote and demote memories across tiers, and render task-specific memory packets for reasoners, planners, executors, critics, and future processors.
 
 The core thesis is that long-term agent memory should not be stored primarily as English summaries. English, embeddings, prompt snippets, and planner-specific payloads should be generated views over a canonical memory substrate composed of typed atoms, evidence links, associative edges, health states, and maintenance actions.
 
@@ -34,8 +34,9 @@ in-process SQLite store and serializes access through the service boundary:
   using the required audit envelope.
 - Generic maintenance proposal records, a processor registry, and a policy gate
   that auto-commits only low-risk derived atoms while deferring review items.
-- A Qandl training-flight processor pack that distills supported control/outcome
-  lessons and defers sanitized or confounded claims.
+- A generic maintenance processor registry. AMOS ships the built-in generic SMP
+  adapter; domain-specific processors are loaded from client packages with
+  explicit import paths.
 - Advisory maintenance for deduplication and contradiction marking, with
   high-risk mutation requests gated behind explicit approval.
 - Capacity pressure reporting and degraded packet disclosure.
@@ -113,7 +114,19 @@ Inspect or tune the automatic memory policy:
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy --configure --schedule '{"every_graph_versions": 10, "every_seconds": 300}'
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy --run --force --trigger operator_check
-PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 maintenance-distiller --domain qandl_training --processor-id amos.maintenance.qandl.flight.v1
+PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 maintenance-processors
+PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 maintenance-distiller --domain generic --processor-id amos.maintenance.generic.v1
+```
+
+Load an external maintenance processor pack from another package:
+
+```bash
+PYTHONPATH=src python -m amos.cli \
+  --db /tmp/amos.sqlite3 \
+  --maintenance-processor my_package.processors:training_flight_processor \
+  maintenance-distiller \
+  --domain training_flight \
+  --processor-id my.training.flight.v1
 ```
 
 ## Integration boundary
@@ -122,6 +135,10 @@ AMOS owns canonical memory, recall, provenance, cleanup metadata, self-awareness
 views, and advisory maintenance. It does not directly execute external actions.
 Integrations such as the Mirror Agent demo should keep live control authority,
 validation, approval checks, and runtime packet application outside AMOS.
+Domain-specific maintenance packs should follow the same boundary: they inspect
+bounded AMOS evidence windows and return side-effect-free proposals; the AMOS
+service applies policy gates, journals accepted low-risk mutations, and defers
+ambiguous or high-risk work for review.
 
 ## Design goals
 

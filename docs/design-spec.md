@@ -2689,12 +2689,16 @@ V1 API surface:
 POST /v1/events:capture
 POST /v1/atoms:propose
 POST /v1/atoms:commit
+POST /v1/atoms:archive
+POST /v1/atoms:merge
 POST /v1/packets:retrieve
 POST /v1/retrieval-outcomes
 POST /v1/maintenance:request
+GET  /v1/maintenance-processors
 GET  /v1/memory-policy
 POST /v1/memory-policy:configure
 POST /v1/memory-policy:run
+POST /v1/maintenance-distiller:run
 POST /v1/deletion-requests
 POST /v1/runtime-state
 POST /v1/self-assessments
@@ -2702,8 +2706,13 @@ POST /v1/self-awareness:retrieve
 POST /v1/agentic-recall:retrieve
 POST /v1/shared-views:retrieve
 POST /v1/shared-views:refresh
+POST /v1/procedures:execution-policy
+POST /v1/capacity:configure
+POST /v1/smp:analyze
 GET  /v1/health/memory
 GET  /v1/health/capacity
+GET  /v1/llm-reviewer/policy
+GET  /v1/verify
 ```
 
 The boundary is:
@@ -2757,6 +2766,16 @@ POST /v1/atoms:commit
   response payload: committed atom refs, graph_version, projection_status
   consistency: strong
 
+POST /v1/atoms:archive
+  request payload: atom_id, reason, optional expected_version, authorization_context
+  response payload: archived atom ref, journal event ref
+  consistency: strong
+
+POST /v1/atoms:merge
+  request payload: source_refs, merged type/payload, scope, approved_by
+  response payload: merged atom ref, archived source refs, journal event refs
+  consistency: strong when approved
+
 POST /v1/packets:retrieve
   request payload: MemoryPacketRequest
   response payload: MemoryPacket
@@ -2771,6 +2790,10 @@ POST /v1/maintenance:request
   request payload: target_refs, action_type, reason_code, risk_level
   response payload: maintenance event refs, review requirement, accepted action refs
   consistency: strong for high-risk actions, eventual for low-risk proposals
+
+GET /v1/maintenance-processors
+  response payload: registered processor ids and versions
+  consistency: monotonic
 
 GET /v1/memory-policy
   response payload: configured policy, persisted policy state, due reasons,
@@ -2838,11 +2861,36 @@ POST /v1/shared-views:refresh
   response payload: refreshed SharedMemoryView, invalidated packet refs
   consistency: same as original convergence_policy
 
+POST /v1/procedures:execution-policy
+  request payload: procedure_ref, actor, scope, execution_context
+  response payload: advisory/executable eligibility, required approvals,
+  denial reasons, and policy notes
+  consistency: monotonic
+
+POST /v1/capacity:configure
+  request payload: hard_capacity_bytes, warning_ratio, critical_ratio
+  response payload: accepted capacity budget
+  consistency: strong
+
+POST /v1/smp:analyze
+  request payload: scope, optional target refs
+  response payload: deterministic SMP envelope outputs and review requirements
+  consistency: monotonic over the source graph version
+
 GET /v1/health/memory
   response payload: memory health metrics by scope, lifecycle_state, health_status, and atom type
 
 GET /v1/health/capacity
   response payload: CapacityHealthReport
+
+GET /v1/llm-reviewer/policy
+  response payload: reviewer default state, allowed uses, forbidden uses,
+  required output envelope
+  consistency: monotonic
+
+GET /v1/verify
+  response payload: journal chain verification and replay verification status
+  consistency: strong for the local store snapshot
 ```
 
 Error codes:
@@ -4773,6 +4821,13 @@ processors inspect those canonical records; low-risk derived memories are
 committed through the shared service policy; high-risk or ambiguous changes
 remain review items.
 
+V1 local tooling exposes this boundary through the CLI and HTTP service
+constructor. Operators pass external processors as `module:attribute` import
+paths, list registered processors before running a domain-specific distiller,
+and select processors by stable `processor_id`. The AMOS package itself should
+not claim to bundle client-domain packs such as training-flight processors
+unless those processors live in the package and are registered by default.
+
 ### 29.12 Procedural memory execution policy
 
 V1 procedural memory is advisory by default.
@@ -4967,7 +5022,9 @@ optional LLM escalation policy
 
 ### Iteration 11: Implementation planning
 
-Only after the design is stable, begin implementation planning:
+The v1-local repository now includes the first implementation slice. Remaining
+planning should track gaps between the verified SQLite service profile and later
+production deployment targets:
 
 ```text
 SQLite service migration sequence
@@ -4980,6 +5037,8 @@ maintenance scheduler
 capacity governor
 semantic maintenance processor
 retrieval/ranking experiments
+external processor-pack packaging
+multi-instance/Postgres operational plan
 ```
 
 ---
@@ -5021,16 +5080,28 @@ service artifacts:
   capture_event endpoint
   propose_memory_atoms endpoint
   commit_memory_atoms endpoint
+  archive_atom and merge_atoms endpoints
   retrieve_memory_packet endpoint
   record_retrieval_outcome endpoint
   request_maintenance endpoint
+  memory-policy status/configure/run endpoints
+  maintenance-processor listing endpoint
+  maintenance-distiller endpoint
   deletion endpoint
   runtime-state endpoint
   self-assessments endpoint
   self-awareness retrieval endpoint
   agentic-recall retrieval endpoint
   shared-view retrieval and refresh endpoints
+  procedure execution-policy endpoint
+  capacity configure endpoint
   capacity health endpoint
+  memory health endpoint
+  deterministic SMP analysis endpoint
+  LLM reviewer policy endpoint
+  journal/replay verification endpoint
+  stdlib HTTP adapter
+  CLI commands for init, capture, commit, retrieve, maintenance, policy, health, and verify
 
 worker artifacts:
   journal projector
@@ -5041,6 +5112,8 @@ worker artifacts:
   self-model calibrator
   agentic recall auditor
   SMP worker
+  memory policy worker
+  distiller maintenance worker
 ```
 
 Required v1 acceptance gates:
@@ -5090,6 +5163,17 @@ capacity gate:
 
 SMP gate:
   non-generative processors can recommend actions, but high-risk mutations require authorization and review
+
+memory policy gate:
+  scheduled retrieval, health checks, worker ticks, and forced operator runs can
+  perform deterministic maintenance, distillation, processor-pack proposal
+  evaluation, index refresh, packet-cache invalidation, and journaled
+  memory_policy_run events without an LLM
+
+processor-pack gate:
+  built-in generic processors and imported external processors return
+  side-effect-free proposals; only low-risk add_atom proposals auto-commit, and
+  all other proposals remain visible as deferred review work
 
 observability gate:
   health, capacity, projection lag, index freshness, deletion residuals, and retrieval outcomes are reportable
