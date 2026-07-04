@@ -185,7 +185,10 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
-            self.wfile.write(raw)
+            try:
+                self.wfile.write(raw)
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
     return AmosHandler
 

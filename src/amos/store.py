@@ -659,13 +659,26 @@ class SQLiteStore:
         request: Mapping[str, Any],
         outcome: Mapping[str, Any],
     ) -> dict[str, Any]:
+        outcome_payload = dict(outcome)
+        outcome_id = str(
+            outcome_payload.get("outcome_id")
+            or f"rto_{digest({'packet_id': packet_id, 'request': request, 'outcome': outcome_payload})[:32]}"
+        )
         record = {
-            "outcome_id": f"rto_{uuid.uuid4().hex}",
+            "outcome_id": outcome_id,
             "packet_id": packet_id,
             "request": dict(request),
-            "outcome": dict(outcome),
+            "outcome": outcome_payload,
             "created_at": utc_now(),
         }
+        existing = conn.execute(
+            "SELECT * FROM amos_retrieval_outcomes WHERE outcome_id = ?",
+            (outcome_id,),
+        ).fetchone()
+        if existing is not None:
+            existing_record = self._row_dict(existing)
+            existing_record["status"] = "already_recorded"
+            return existing_record
         conn.execute(
             """
             INSERT INTO amos_retrieval_outcomes(
@@ -681,6 +694,7 @@ class SQLiteStore:
                 record["created_at"],
             ),
         )
+        record["status"] = "recorded"
         return record
 
     def upsert_derived_index_metadata(

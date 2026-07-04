@@ -715,6 +715,189 @@ def test_merge_atoms_requires_review_and_replays_projection(amos):
     assert amos.verify_replay()["status"] == "ok"
 
 
+def test_commit_atom_projects_structured_graph_edges_and_replay(amos):
+    source = amos.commit_atom(
+        {
+            "id": "source_memory",
+            "type": "agentic_trace",
+            "payload": {
+                "task": "source task",
+                "action": "record source memory",
+                "outcome": "observed",
+            },
+            "scope": {"tenant": "graph"},
+        }
+    )["atom"]
+    cited = amos.commit_atom(
+        {
+            "id": "cited_memory",
+            "type": "semantic",
+            "payload": {"summary": "cited memory"},
+            "scope": {"tenant": "graph"},
+        }
+    )["atom"]
+    directive = amos.commit_atom(
+        {
+            "id": "directive_with_refs",
+            "type": "agentic_trace",
+            "payload": {
+                "task": "directive task",
+                "action": "use retrieved memory",
+                "outcome": "issued",
+                "memory_references": [{"id": cited["id"]}],
+            },
+            "scope": {"tenant": "graph"},
+        }
+    )["atom"]
+    distilled = amos.commit_atom(
+        {
+            "id": "distilled_with_source",
+            "type": "semantic",
+            "payload": {
+                "summary": "distilled from source",
+                "source_refs": [source["id"]],
+            },
+            "scope": {"tenant": "graph"},
+        }
+    )["atom"]
+    outcome = amos.commit_atom(
+        {
+            "id": "directive_outcome",
+            "type": "agentic_trace",
+            "payload": {
+                "task": "directive task",
+                "action": "evaluate directive outcome",
+                "outcome": "supported",
+                "directive_atom_ref": directive["id"],
+            },
+            "scope": {"tenant": "graph"},
+        }
+    )["atom"]
+
+    triples = {
+        (edge["source_ref"], edge["relation"], edge["target_ref"])
+        for edge in amos.store.list_edges()
+    }
+    assert (distilled["id"], "rel:derived_from", source["id"]) in triples
+    assert (directive["id"], "rel:uses", cited["id"]) in triples
+    assert (directive["id"], "rel:produced_outcome", outcome["id"]) in triples
+    assert amos.verify_replay()["status"] == "ok"
+
+
+def test_commit_atom_projects_self_model_profile_edges(amos):
+    self_model = amos.commit_atom(
+        {
+            "id": "agent_self_model",
+            "type": "self_model",
+            "payload": {"agent_id": "agent:demo", "role": "demo"},
+            "scope": {"tenant": "graph"},
+        }
+    )["atom"]
+    capability = amos.commit_atom(
+        {
+            "id": "agent_capability",
+            "type": "capability",
+            "payload": {"agent_id": "agent:demo", "name": "plan"},
+            "evidence_refs": [self_model["id"]],
+            "scope": {"tenant": "graph"},
+        }
+    )["atom"]
+    limitation = amos.commit_atom(
+        {
+            "id": "agent_limitation",
+            "type": "limitation",
+            "payload": {"agent_id": "agent:demo", "name": "no_shell"},
+            "evidence_refs": [self_model["id"]],
+            "scope": {"tenant": "graph"},
+        }
+    )["atom"]
+    commitment = amos.commit_atom(
+        {
+            "id": "agent_commitment",
+            "type": "commitment",
+            "payload": {"agent_id": "agent:demo", "description": "cite memory"},
+            "evidence_refs": [self_model["id"]],
+            "scope": {"tenant": "graph"},
+        }
+    )["atom"]
+    runtime = amos.commit_atom(
+        {
+            "id": "agent_runtime",
+            "type": "runtime_state",
+            "payload": {"agent_id": "agent:demo", "status": "available"},
+            "evidence_refs": [self_model["id"]],
+            "scope": {"tenant": "graph"},
+        }
+    )["atom"]
+
+    triples = {
+        (edge["source_ref"], edge["relation"], edge["target_ref"])
+        for edge in amos.store.list_edges()
+    }
+    assert (self_model["id"], "rel:has_capability", capability["id"]) in triples
+    assert (self_model["id"], "rel:has_limitation", limitation["id"]) in triples
+    assert (self_model["id"], "rel:made_commitment", commitment["id"]) in triples
+    assert (self_model["id"], "rel:attributed_to", runtime["id"]) in triples
+    assert amos.verify_replay()["status"] == "ok"
+
+
+def test_retrieval_outcome_accepts_stable_outcome_id(amos):
+    first = amos.record_retrieval_outcome(
+        packet_id="pkt_demo",
+        request={"scope": {"tenant": "graph"}},
+        outcome={"outcome_id": "rto_demo", "cited_atom_ref": "atom_a"},
+    )
+    second = amos.record_retrieval_outcome(
+        packet_id="pkt_demo",
+        request={"scope": {"tenant": "graph"}},
+        outcome={"outcome_id": "rto_demo", "cited_atom_ref": "atom_a"},
+    )
+
+    assert first["status"] == "recorded"
+    assert second["status"] == "already_recorded"
+    assert amos.store.retrieval_outcome_count() == 1
+
+
+def test_steward_backfills_intrinsic_edges_for_existing_atoms(amos):
+    semantic = amos.commit_atom(
+        {
+            "id": "early_semantic",
+            "type": "semantic",
+            "payload": {
+                "summary": "semantic arrived before source",
+                "source_refs": ["late_source"],
+            },
+            "scope": {"tenant": "graph"},
+        }
+    )["atom"]
+    source = amos.commit_atom(
+        {
+            "id": "late_source",
+            "type": "agentic_trace",
+            "payload": {
+                "task": "late task",
+                "action": "record late source",
+                "outcome": "observed",
+            },
+            "scope": {"tenant": "graph"},
+        }
+    )["atom"]
+    assert amos.store.list_edges() == []
+
+    result = amos.run_steward(scope={"tenant": "graph"})
+
+    assert any(
+        action["action"] == "project_intrinsic_edges" and action["edge_count"] == 1
+        for action in result["actions"]
+    )
+    triples = {
+        (edge["source_ref"], edge["relation"], edge["target_ref"])
+        for edge in amos.store.list_edges()
+    }
+    assert (semantic["id"], "rel:derived_from", source["id"]) in triples
+    assert amos.verify_replay()["status"] == "ok"
+
+
 def test_self_awareness_suppresses_runtime_unavailable_capability(amos):
     amos.commit_atom(
         {

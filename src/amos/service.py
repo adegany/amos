@@ -142,6 +142,27 @@ def payload_capability_name(payload: Mapping[str, Any]) -> str:
     return str(payload.get("name") or payload.get("capability") or "")
 
 
+def _structured_ref_list(value: Any) -> list[str]:
+    refs: list[str] = []
+
+    def add(ref: Any) -> None:
+        text = str(ref or "").strip()
+        if text and text not in refs:
+            refs.append(text)
+
+    if isinstance(value, str):
+        add(value)
+    elif isinstance(value, Mapping):
+        for key in ("id", "atom_ref", "atom_id", "source_ref", "target_ref", "ref"):
+            if value.get(key):
+                add(value.get(key))
+                break
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for item in value:
+            refs.extend(ref for ref in _structured_ref_list(item) if ref not in refs)
+    return refs
+
+
 class Amos:
     """AMOS v1-local service facade."""
 
@@ -500,7 +521,12 @@ class Amos:
             prior = self._idempotency_hit(conn, actor, idempotency_key, request_payload)
             if prior is not None:
                 return prior
-            op_payload = {"operation": "commit_atom", "atom": normalized}
+            projected_edges = self._intrinsic_edges_for_atom(normalized)
+            op_payload = {
+                "operation": "commit_atom",
+                "atom": normalized,
+                "projected_edges": projected_edges,
+            }
             content_digest = self._memory_identity_digest(normalized)
             tombstone = self.store.get_tombstone(
                 normalized["id"], content_digest=content_digest
@@ -522,8 +548,15 @@ class Amos:
                 authorization_context=authorization_context,
             )
             self.store.insert_atom(conn, normalized)
+            for edge in projected_edges:
+                self.store.insert_edge(conn, edge)
             self.store.clear_packet_cache(conn)
-            response = {"status": "committed", "atom": normalized, "event": event}
+            response = {
+                "status": "committed",
+                "atom": normalized,
+                "edges": projected_edges,
+                "event": event,
+            }
             self._record_idempotency(
                 conn, actor, idempotency_key, request_payload, event, response
             )
@@ -1142,11 +1175,24 @@ class Amos:
             distilled["created_at"] = now
             distilled["observed_at"] = now
             distilled["updated_at"] = now
+            edges = [
+                self._edge(
+                    distilled["id"],
+                    source["id"],
+                    "rel:derived_from",
+                    dict(scope or {}),
+                )
+                for source in source_atoms
+            ]
             event = self.store.append_event(
                 conn,
                 event_type="memories_distilled",
                 actor=actor,
-                payload={"operation": "distill_memories", "atom": distilled},
+                payload={
+                    "operation": "distill_memories",
+                    "atom": distilled,
+                    "projected_edges": edges,
+                },
                 target_refs=[distilled["id"], *target_refs],
                 idempotency_key=idempotency_key,
                 authorization_context={"approved_by": approved_by}
@@ -1154,16 +1200,8 @@ class Amos:
                 else {},
             )
             self.store.insert_atom(conn, distilled)
-            edges = []
-            for source in source_atoms:
-                edge = self._edge(
-                    distilled["id"],
-                    source["id"],
-                    "rel:derived_from",
-                    dict(scope or {}),
-                )
+            for edge, source in zip(edges, source_atoms):
                 self.store.insert_edge(conn, edge)
-                edges.append(edge)
                 if archive_sources:
                     changed = dict(source)
                     changed["lifecycle_state"] = "archived"
@@ -1969,6 +2007,26 @@ class Amos:
                 if not atom.get("deleted") and scope_visible(atom["scope"], scope)
             ]
             smp_outputs = self.smp.cluster(atoms) + self.smp.detect_conflicts(atoms)
+            existing_edge_ids = {
+                edge["edge_id"] for edge in self.store.list_edges()
+            }
+            intrinsic_edge_count = 0
+            for atom in atoms:
+                for edge in self._intrinsic_edges_for_atom(atom):
+                    if edge["edge_id"] in existing_edge_ids:
+                        continue
+                    self.store.insert_edge(conn, edge)
+                    existing_edge_ids.add(edge["edge_id"])
+                    projected_edges.append(edge)
+                    intrinsic_edge_count += 1
+            if intrinsic_edge_count:
+                actions.append(
+                    {
+                        "action": "project_intrinsic_edges",
+                        "edge_count": intrinsic_edge_count,
+                        "policy": "deterministic_structured_atom_refs",
+                    }
+                )
             seen: dict[str, dict[str, Any]] = {}
             for atom in sorted(atoms, key=lambda row: row["created_at"]):
                 key = digest(
@@ -2181,9 +2239,19 @@ class Amos:
             if event_type == "atom_committed":
                 atom = payload["atom"]
                 atoms[atom["id"]] = atom
+                for edge in payload.get("projected_edges", []):
+                    if edge.get("deleted"):
+                        edges.pop(edge["edge_id"], None)
+                    else:
+                        edges[edge["edge_id"]] = edge
             elif event_type == "atom_updated":
                 atom = payload["after"]
                 atoms[atom["id"]] = atom
+                for edge in payload.get("projected_edges", []):
+                    if edge.get("deleted"):
+                        edges.pop(edge["edge_id"], None)
+                    else:
+                        edges[edge["edge_id"]] = edge
             elif event_type == "atom_deleted":
                 before = payload["before"]
                 atom_id = before["id"]
@@ -2195,6 +2263,11 @@ class Amos:
             elif event_type == "memories_distilled":
                 atom = payload["atom"]
                 atoms[atom["id"]] = atom
+                for edge in payload.get("projected_edges", []):
+                    if edge.get("deleted"):
+                        edges.pop(edge["edge_id"], None)
+                    else:
+                        edges[edge["edge_id"]] = edge
             elif event_type in {"atom_merged", "steward_run"}:
                 for atom in payload.get("projected_atoms", []):
                     if atom.get("deleted"):
@@ -2221,6 +2294,7 @@ class Amos:
             if not atom.get("deleted")
         }
         replayed_atoms = replayed["atoms"]
+        replayed_edges = replayed["edges"]
         missing = sorted(set(stored_atoms) - set(replayed_atoms))
         unexpected = sorted(set(replayed_atoms) - set(stored_atoms))
         mismatched = []
@@ -2229,16 +2303,37 @@ class Amos:
                 self._atom_projection(replayed_atoms[atom_id])
             ):
                 mismatched.append(atom_id)
+        stored_edges = {
+            edge["edge_id"]: edge
+            for edge in self.store.list_edges()
+            if not edge.get("deleted")
+        }
+        missing_edges = sorted(set(stored_edges) - set(replayed_edges))
+        unexpected_edges = sorted(set(replayed_edges) - set(stored_edges))
+        mismatched_edges = []
+        for edge_id in sorted(set(stored_edges).intersection(replayed_edges)):
+            if digest(stored_edges[edge_id]) != digest(replayed_edges[edge_id]):
+                mismatched_edges.append(edge_id)
         return {
             "status": "ok"
-            if not missing and not unexpected and not mismatched
+            if not missing
+            and not unexpected
+            and not mismatched
+            and not missing_edges
+            and not unexpected_edges
+            and not mismatched_edges
             else "failed",
             "graph_version": self.store.graph_version(),
             "missing_in_replay": missing,
             "unexpected_in_replay": unexpected,
             "mismatched_atoms": mismatched,
+            "missing_edges_in_replay": missing_edges,
+            "unexpected_edges_in_replay": unexpected_edges,
+            "mismatched_edges": mismatched_edges,
             "replayed_atom_count": len(replayed_atoms),
             "stored_atom_count": len(stored_atoms),
+            "replayed_edge_count": len(replayed_edges),
+            "stored_edge_count": len(stored_edges),
         }
 
     def _maintenance_evidence_window(
@@ -3095,6 +3190,76 @@ class Amos:
                 if float(calibration.get("overconfident_claim_rate", 0.0) or 0.0) > 0:
                     return True
         return False
+
+    def _intrinsic_edges_for_atom(self, atom: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Project deterministic graph edges encoded by structured atom fields."""
+
+        atom_id = str(atom["id"])
+        scope = dict(atom.get("scope") or {})
+        payload = atom.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        edges: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        def active_atom(ref: Any) -> dict[str, Any] | None:
+            ref_id = str(ref or "")
+            if not ref_id or ref_id == atom_id:
+                return None
+            existing = self.store.get_atom(ref_id)
+            if existing is None or existing.get("deleted"):
+                return None
+            if existing.get("lifecycle_state") != "active":
+                return None
+            return existing
+
+        def add(source_ref: Any, target_ref: Any, relation: str) -> None:
+            source = str(source_ref or "")
+            target = str(target_ref or "")
+            if not source or not target or source == target:
+                return
+            if source != atom_id and active_atom(source) is None:
+                return
+            if target != atom_id and active_atom(target) is None:
+                return
+            key = (source, target, relation)
+            if key in seen:
+                return
+            seen.add(key)
+            edges.append(self._edge(source, target, relation, scope))
+
+        for ref in _structured_ref_list(payload.get("source_refs")):
+            add(atom_id, ref, "rel:derived_from")
+
+        for ref in _structured_ref_list(payload.get("memory_references")):
+            add(atom_id, ref, "rel:uses")
+
+        directive_ref = payload.get("directive_atom_ref") or payload.get(
+            "source_directive_ref"
+        )
+        if atom.get("type") == "agentic_trace" and directive_ref:
+            add(directive_ref, atom_id, "rel:produced_outcome")
+
+        if atom.get("type") in {
+            "capability",
+            "limitation",
+            "commitment",
+            "runtime_state",
+            "self_assessment",
+        }:
+            relation_by_type = {
+                "capability": "rel:has_capability",
+                "limitation": "rel:has_limitation",
+                "commitment": "rel:made_commitment",
+                "runtime_state": "rel:attributed_to",
+                "self_assessment": "rel:attributed_to",
+            }
+            relation = relation_by_type[str(atom["type"])]
+            for ref in _structured_ref_list(atom.get("evidence_refs")):
+                source = active_atom(ref)
+                if source and source.get("type") == "self_model":
+                    add(source["id"], atom_id, relation)
+
+        return edges
 
     def _edge(
         self,
