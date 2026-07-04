@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Any, Mapping, Sequence
 
 from .service import Amos
@@ -116,6 +117,164 @@ class MemoryPolicyWorker:
             scope=scope,
             actor="svc:memory_policy",
         )
+
+
+class BackgroundMemoryPolicyWorker:
+    """Daemon worker for service-owned automatic memory policy maintenance."""
+
+    def __init__(
+        self,
+        amos: Amos,
+        *,
+        interval_seconds: float = 5.0,
+        actor: str = "svc:memory_policy",
+    ):
+        self.amos = amos
+        self.interval_seconds = max(0.1, float(interval_seconds))
+        self.actor = actor
+        self._condition = threading.Condition()
+        self._pending: list[dict[str, Any]] = []
+        self._running = False
+        self._stop = False
+        self._thread: threading.Thread | None = None
+        self._last_result: dict[str, Any] | None = None
+        self._last_error: str | None = None
+        self._run_count = 0
+        self._error_count = 0
+
+    def start(self) -> dict[str, Any]:
+        with self._condition:
+            if self._thread is not None and self._thread.is_alive():
+                return self.status()
+            self._stop = False
+            self._thread = threading.Thread(
+                target=self._loop,
+                name="amos-memory-policy-worker",
+                daemon=True,
+            )
+            self._thread.start()
+            return self.status()
+
+    def stop(self, *, timeout: float = 5.0) -> dict[str, Any]:
+        with self._condition:
+            self._stop = True
+            self._condition.notify_all()
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+        return self.status()
+
+    def request_tick(
+        self,
+        *,
+        trigger: str = "background_request",
+        scope: Mapping[str, Any] | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        request = {
+            "trigger": str(trigger or "background_request"),
+            "scope": dict(scope or {}),
+            "force": bool(force),
+        }
+        with self._condition:
+            if self._stop:
+                return {
+                    "status": "skipped",
+                    "reason": "worker_stopping",
+                    "trigger": request["trigger"],
+                }
+            if any(
+                pending["trigger"] == request["trigger"]
+                and pending["scope"] == request["scope"]
+                and pending["force"] == request["force"]
+                for pending in self._pending
+            ):
+                return {
+                    "status": "queued",
+                    "reason": "already_queued",
+                    "trigger": request["trigger"],
+                    "pending_count": len(self._pending),
+                }
+            self._pending.append(request)
+            self._condition.notify_all()
+            return {
+                "status": "queued",
+                "trigger": request["trigger"],
+                "pending_count": len(self._pending),
+            }
+
+    def status(self) -> dict[str, Any]:
+        with self._condition:
+            thread_alive = self._thread is not None and self._thread.is_alive()
+            return {
+                "status": "active" if thread_alive and not self._stop else "stopped",
+                "interval_seconds": self.interval_seconds,
+                "running": self._running,
+                "pending_count": len(self._pending),
+                "run_count": self._run_count,
+                "error_count": self._error_count,
+                "last_result": self._last_result,
+                "last_error": self._last_error,
+            }
+
+    def _loop(self) -> None:
+        while True:
+            with self._condition:
+                if not self._pending and not self._stop:
+                    self._condition.wait(timeout=self.interval_seconds)
+                if self._stop:
+                    return
+                if self._pending:
+                    request = self._pending.pop(0)
+                else:
+                    request = {
+                        "trigger": "background_interval",
+                        "scope": {},
+                        "force": False,
+                    }
+                self._running = True
+            try:
+                result = self.amos.run_memory_policy(
+                    force=bool(request["force"]),
+                    trigger=str(request["trigger"]),
+                    scope=dict(request["scope"]),
+                    actor=self.actor,
+                )
+                compact = self._compact_result(result)
+                with self._condition:
+                    self._last_result = compact
+                    self._last_error = None
+                    self._run_count += 1
+            except Exception as exc:  # pragma: no cover - defensive service guard
+                with self._condition:
+                    self._last_error = str(exc)
+                    self._error_count += 1
+            finally:
+                with self._condition:
+                    self._running = False
+
+    def _compact_result(self, result: Mapping[str, Any]) -> dict[str, Any]:
+        compact = {
+            "status": result.get("status"),
+            "reason": result.get("reason"),
+            "trigger": result.get("trigger"),
+            "graph_version": result.get("graph_version"),
+        }
+        due = result.get("due")
+        if isinstance(due, Mapping):
+            compact["due"] = {
+                "due": due.get("due"),
+                "reasons": list(due.get("reasons", [])),
+                "graph_delta": due.get("graph_delta"),
+                "elapsed_seconds": due.get("elapsed_seconds"),
+            }
+        results = result.get("results")
+        if isinstance(results, Mapping):
+            compact["result_keys"] = sorted(str(key) for key in results)
+        event = result.get("event")
+        if isinstance(event, Mapping):
+            compact["event_id"] = event.get("event_id")
+        return compact
 
 
 class DistillerMaintenanceWorker:

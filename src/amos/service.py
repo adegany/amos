@@ -98,6 +98,7 @@ DEFAULT_MEMORY_POLICY = {
         },
     },
 }
+SEARCH_INDEX_REF = "amos.v1.search"
 RETRIEVAL_WEIGHTS = {
     "direct_cue_match": 0.22,
     "semantic_similarity": 0.14,
@@ -287,6 +288,67 @@ class Amos:
             "due": due,
             "graph_version": self.store.graph_version(),
         }
+
+    def _search_text_for_atom(self, atom: Mapping[str, Any]) -> str:
+        return (
+            str(atom.get("id") or "")
+            + " "
+            + str(atom.get("type") or "")
+            + " "
+            + canonical_json(atom.get("payload", {}))
+        ).lower()
+
+    def _search_index_for_atom(self, atom: Mapping[str, Any]) -> dict[str, Any]:
+        text = self._search_text_for_atom(atom)
+        tokens = sorted({token for token in re.findall(r"[a-z0-9_]+", text) if token})
+        return {
+            "text": text,
+            "tokens": tokens,
+            "vector": self.smp.encode(text),
+            "processor_id": self.smp.processor_id,
+            "processor_version": self.smp.processor_version,
+        }
+
+    def _attach_search_index(self, atom: Mapping[str, Any]) -> dict[str, Any]:
+        indexed = dict(atom)
+        index_refs = dict(indexed.get("index_refs") or {})
+        index_refs[SEARCH_INDEX_REF] = self._search_index_for_atom(indexed)
+        indexed["index_refs"] = index_refs
+        return indexed
+
+    def _atom_search_index(self, atom: Mapping[str, Any]) -> dict[str, Any]:
+        index_refs = atom.get("index_refs", {})
+        if isinstance(index_refs, Mapping):
+            stored = index_refs.get(SEARCH_INDEX_REF)
+            if isinstance(stored, Mapping):
+                text = stored.get("text")
+                tokens = stored.get("tokens")
+                vector = stored.get("vector")
+                if isinstance(text, str) and isinstance(tokens, list) and isinstance(vector, list):
+                    return {
+                        "text": text,
+                        "tokens": [str(token) for token in tokens],
+                        "vector": [float(value) for value in vector],
+                    }
+        return self._search_index_for_atom(atom)
+
+    def _prepare_committed_atom(self, atom: Mapping[str, Any]) -> dict[str, Any]:
+        normalized = normalize_atom(atom)
+        now = utc_now()
+        normalized["id"] = normalized["id"] or stable_id(
+            "atom",
+            {
+                "type": normalized["type"],
+                "payload": normalized["payload"],
+                "scope": normalized["scope"],
+                "evidence_refs": normalized["evidence_refs"],
+            },
+        )
+        normalized["created_at"] = normalized["created_at"] or now
+        normalized["observed_at"] = normalized["observed_at"] or now
+        normalized["updated_at"] = normalized["updated_at"] or now
+        normalized["version"] = 1
+        return normalize_atom(self._attach_search_index(normalized), require_id=True)
 
     def run_memory_policy(
         self,
@@ -509,21 +571,7 @@ class Amos:
         authorization_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         request_payload = {"operation": "commit_atom", "atom": dict(atom)}
-        normalized = normalize_atom(atom)
-        now = utc_now()
-        normalized["id"] = normalized["id"] or stable_id(
-            "atom",
-            {
-                "type": normalized["type"],
-                "payload": normalized["payload"],
-                "scope": normalized["scope"],
-                "evidence_refs": normalized["evidence_refs"],
-            },
-        )
-        normalized["created_at"] = normalized["created_at"] or now
-        normalized["observed_at"] = normalized["observed_at"] or now
-        normalized["updated_at"] = normalized["updated_at"] or now
-        normalized["version"] = 1
+        normalized = self._prepare_committed_atom(atom)
         with self.store.transaction() as conn:
             prior = self._idempotency_hit(conn, actor, idempotency_key, request_payload)
             if prior is not None:
@@ -596,7 +644,52 @@ class Amos:
         *,
         actor: str = "system",
     ) -> dict[str, Any]:
-        committed = [self.commit_atom(atom, actor=actor) for atom in atoms]
+        prepared = [self._prepare_committed_atom(atom) for atom in atoms]
+        seen_ids: set[str] = set()
+        for atom in prepared:
+            if atom["id"] in seen_ids:
+                raise ValidationError(f"duplicate atom in batch: {atom['id']}")
+            seen_ids.add(atom["id"])
+        committed = []
+        with self.store.transaction() as conn:
+            for normalized in prepared:
+                projected_edges = self._intrinsic_edges_for_atom(normalized)
+                op_payload = {
+                    "operation": "commit_atom",
+                    "atom": normalized,
+                    "projected_edges": projected_edges,
+                }
+                content_digest = self._memory_identity_digest(normalized)
+                tombstone = self.store.get_tombstone(
+                    normalized["id"], content_digest=content_digest
+                )
+                if tombstone and tombstone["recreation_policy"] != "allow_recreate":
+                    raise ValidationError(
+                        f"memory is tombstoned: {normalized['id']} / {content_digest}"
+                    )
+                if self.store.get_atom(normalized["id"]) is not None:
+                    raise ValidationError(f"atom already exists: {normalized['id']}")
+                event = self.store.append_event(
+                    conn,
+                    event_type="atom_committed",
+                    actor=actor,
+                    payload=op_payload,
+                    target_refs=[normalized["id"]],
+                    evidence_refs=normalized["evidence_refs"],
+                )
+                self.store.insert_atom(conn, normalized)
+                for edge in projected_edges:
+                    self.store.insert_edge(conn, edge)
+                committed.append(
+                    {
+                        "status": "committed",
+                        "atom": normalized,
+                        "edges": projected_edges,
+                        "event": event,
+                    }
+                )
+            if committed:
+                self.store.clear_packet_cache(conn)
         return {
             "status": "committed",
             "committed": committed,
@@ -659,7 +752,9 @@ class Amos:
             )
             updated["version"] = int(current["version"]) + 1
             updated["updated_at"] = utc_now()
-            updated = normalize_atom(updated, require_id=True)
+            updated = normalize_atom(
+                self._attach_search_index(updated), require_id=True
+            )
             projected_edges = []
             if (
                 current.get("lifecycle_state") == "active"
@@ -761,7 +856,9 @@ class Amos:
                     "reason": reason,
                 }
             )
-            updated = normalize_atom(updated, require_id=True)
+            updated = normalize_atom(
+                self._attach_search_index(updated), require_id=True
+            )
             updated["deleted"] = 1
             tombstone = self.store.insert_tombstone(
                 conn,
@@ -883,6 +980,7 @@ class Amos:
             merged["created_at"] = now
             merged["observed_at"] = now
             merged["updated_at"] = now
+            merged = normalize_atom(self._attach_search_index(merged), require_id=True)
             self.store.insert_atom(conn, merged)
             projected_atoms = [merged]
             projected_edges = []
@@ -901,7 +999,9 @@ class Amos:
                     **dict(archived.get("decay_policy") or {}),
                     "merged_into": merged["id"],
                 }
-                archived = normalize_atom(archived, require_id=True)
+                archived = normalize_atom(
+                    self._attach_search_index(archived), require_id=True
+                )
                 self.store.replace_atom(conn, archived)
                 projected_atoms.append(archived)
             event = self.store.append_event(
@@ -976,29 +1076,37 @@ class Amos:
             "pressure_mode": pressure_mode,
             "run_policy": bool(run_policy),
         }
+        graph_version = self.store.graph_version()
+        cached = self.store.get_cached_packet(
+            request=request, graph_version=graph_version
+        )
+        if cached is not None:
+            return cached
+
         candidates: list[tuple[float, dict[str, Any]]] = []
         omissions: list[dict[str, Any]] = []
         allowed_types = set(type_filter or [])
-        for atom in self.store.list_atoms():
+        lifecycle_states = ["active", "proposed"]
+        if include_archived:
+            lifecycle_states.append("archived")
+        atoms = self.store.list_atoms_filtered(
+            types=sorted(allowed_types) if allowed_types else None,
+            lifecycle_states=lifecycle_states,
+        )
+        edge_degrees = self.store.edge_degree_counts()
+        cue_text = " ".join(request["cues"]).lower()
+        cue_tokens = {token for token in re.findall(r"[a-z0-9_]+", cue_text) if token}
+        cue_vector = self.smp.encode(cue_text) if cue_text else []
+        for atom in atoms:
             atom_ref = atom["id"]
             if atom.get("deleted"):
                 omissions.append({"atom_ref": atom_ref, "reason": "deleted"})
-                continue
-            if allowed_types and atom["type"] not in allowed_types:
                 continue
             if not scope_visible(atom["scope"], request["scope"]):
                 omissions.append({"atom_ref": atom_ref, "reason": "scope_hidden"})
                 continue
             if not access_visible(atom["access_policy"], requester, target_processor):
                 omissions.append({"atom_ref": atom_ref, "reason": "access_hidden"})
-                continue
-            if atom["lifecycle_state"] == "archived" and not include_archived:
-                omissions.append({"atom_ref": atom_ref, "reason": "archived"})
-                continue
-            if atom["lifecycle_state"] not in {"active", "proposed", "archived"}:
-                omissions.append(
-                    {"atom_ref": atom_ref, "reason": f"lifecycle:{atom['lifecycle_state']}"}
-                )
                 continue
             if atom["health_status"] == "contradicted" and not include_conflicts:
                 omissions.append({"atom_ref": atom_ref, "reason": "contradicted"})
@@ -1013,6 +1121,10 @@ class Amos:
                 request["cues"],
                 request_scope=request["scope"],
                 retrieval_mode=retrieval_mode,
+                cue_text=cue_text,
+                cue_tokens=cue_tokens,
+                cue_vector=cue_vector,
+                edge_degrees=edge_degrees,
             )
             if request["cues"] and not matched:
                 omissions.append({"atom_ref": atom_ref, "reason": "low_relevance"})
@@ -1051,13 +1163,12 @@ class Amos:
         conflicts = []
         if include_conflicts and items:
             selected = {item["atom_ref"] for item in items}
-            for edge in self.store.list_edges():
+            for edge in self.store.list_edges_for_refs(sorted(selected)):
                 if edge["relation"] not in CONFLICT_RELATIONS:
                     continue
                 if edge["source_ref"] in selected or edge["target_ref"] in selected:
                     conflicts.append(edge)
 
-        graph_version = self.store.graph_version()
         packet = {
             "packet_id": stable_id(
                 "pkt",
@@ -1198,6 +1309,9 @@ class Amos:
             distilled["created_at"] = now
             distilled["observed_at"] = now
             distilled["updated_at"] = now
+            distilled = normalize_atom(
+                self._attach_search_index(distilled), require_id=True
+            )
             edges = [
                 self._edge(
                     distilled["id"],
@@ -1235,7 +1349,9 @@ class Amos:
                         **dict(changed.get("decay_policy") or {}),
                         "archived_by_distillation": distilled["id"],
                     }
-                    changed = normalize_atom(changed, require_id=True)
+                    changed = normalize_atom(
+                        self._attach_search_index(changed), require_id=True
+                    )
                     self.store.replace_atom(conn, changed)
             self.store.clear_packet_cache(conn)
             response = {
@@ -2206,7 +2322,7 @@ class Amos:
         scope = dict(scope or {})
         atoms = [
             atom
-            for atom in self.store.list_atoms()
+            for atom in self.store.list_atoms_filtered()
             if not atom.get("deleted") and scope_visible(atom["scope"], scope)
         ]
         if target_refs:
@@ -2233,7 +2349,12 @@ class Amos:
         health = [self.smp.propose_health(atom) for atom in atoms]
         links = []
         for index, atom in enumerate(atoms):
-            links.extend(self.smp.propose_links(atom, atoms[index + 1 :]))
+            links.extend(
+                self.smp.propose_links(
+                    atom,
+                    self._smp_link_candidates(atom, atoms[index + 1 :]),
+                )
+            )
         outputs = shape_reports + clusters + conflicts + health + links
         return {
             "status": "completed",
@@ -2253,6 +2374,28 @@ class Amos:
             ],
         }
 
+    def _smp_link_candidates(
+        self,
+        atom: Mapping[str, Any],
+        candidates: Sequence[Mapping[str, Any]],
+        *,
+        limit: int = 24,
+    ) -> list[Mapping[str, Any]]:
+        if len(candidates) <= limit:
+            return list(candidates)
+        atom_index = self._atom_search_index(atom)
+        atom_tokens = set(atom_index["tokens"])
+        scored = []
+        for candidate in candidates:
+            candidate_tokens = set(self._atom_search_index(candidate)["tokens"])
+            overlap = len(atom_tokens.intersection(candidate_tokens))
+            same_type = 1 if candidate.get("type") == atom.get("type") else 0
+            if overlap <= 0 and not same_type:
+                continue
+            scored.append((same_type, overlap, str(candidate.get("updated_at") or ""), candidate))
+        scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        return [item[3] for item in scored[:limit]]
+
     def run_steward(
         self,
         *,
@@ -2267,7 +2410,9 @@ class Amos:
         with self.store.transaction() as conn:
             atoms = [
                 atom
-                for atom in self.store.list_atoms()
+                for atom in self.store.list_atoms_filtered(
+                    lifecycle_states=["active"],
+                )
                 if not atom.get("deleted")
                 and atom.get("lifecycle_state") == "active"
                 and scope_visible(atom["scope"], scope)
@@ -2397,7 +2542,9 @@ class Amos:
                         changed["health_status"] = "contradicted"
                         changed["version"] = int(changed["version"]) + 1
                         changed["updated_at"] = utc_now()
-                        changed = normalize_atom(changed, require_id=True)
+                        changed = normalize_atom(
+                            self._attach_search_index(changed), require_id=True
+                        )
                         self.store.replace_atom(conn, changed)
                         projected_atoms.append(changed)
                     for source in group_atoms:
@@ -2456,18 +2603,25 @@ class Amos:
             "graph_version": self.store.graph_version(),
         }
 
-    def health_memory(self) -> dict[str, Any]:
-        policy_tick = self.run_memory_policy(trigger="health_memory")
-        atoms = self.store.list_atoms()
-        events = self.store.list_events()
+    def health_memory(self, *, run_policy: bool = True) -> dict[str, Any]:
+        policy_tick = (
+            self.run_memory_policy(trigger="health_memory")
+            if run_policy
+            else {
+                "status": "skipped",
+                "reason": "policy_not_run_for_health",
+                "trigger": "health_memory",
+                "graph_version": self.store.graph_version(),
+            }
+        )
         indexes = self.store.list_derived_index_metadata()
-        by_type = self._counts(atoms, "type")
-        by_health = self._counts(atoms, "health_status")
-        by_lifecycle = self._counts(atoms, "lifecycle_state")
+        by_type = self.store.atom_counts_by("type")
+        by_health = self.store.atom_counts_by("health_status")
+        by_lifecycle = self.store.atom_counts_by("lifecycle_state")
         return {
             "graph_version": self.store.graph_version(),
-            "journal_events": len(events),
-            "atoms": len(atoms),
+            "journal_events": self.store.event_count(),
+            "atoms": self.store.atom_count(),
             "by_type": by_type,
             "by_health": by_health,
             "by_lifecycle": by_lifecycle,
@@ -2665,9 +2819,9 @@ class Amos:
     ) -> EvidenceWindow:
         atoms = [
             atom
-            for atom in self.store.list_atoms()
+            for atom in self.store.list_atoms_filtered(limit=max(1, int(max_atoms or 1)))
             if not atom.get("deleted") and scope_visible(atom["scope"], scope)
-        ][: max(1, int(max_atoms or 1))]
+        ]
         atom_refs = {atom["id"] for atom in atoms}
         edges = [
             edge
@@ -2680,10 +2834,10 @@ class Amos:
             if scope_visible(record.get("scope", {}), scope)
         ]
         event_limit = max(0, int(max_events or 0))
-        events = self.store.list_events()[-event_limit:] if event_limit else []
+        events = self.store.list_events(limit=event_limit) if event_limit else []
         list_outcomes = getattr(self.store, "list_retrieval_outcomes", None)
         retrieval_outcomes = (
-            list_outcomes()[: max(0, int(max_retrieval_outcomes or 0))]
+            list_outcomes(limit=max(0, int(max_retrieval_outcomes or 0)))
             if list_outcomes
             else []
         )
@@ -3421,7 +3575,10 @@ class Amos:
         distillation = dict(policy["distillation"])
         candidate_types = set(distillation["candidate_types"])
         covered_sources: set[str] = set()
-        for atom in self.store.list_atoms():
+        for atom in self.store.list_atoms_filtered(
+            types=["semantic"],
+            lifecycle_states=["active"],
+        ):
             if atom.get("deleted") or atom["type"] != "semantic":
                 continue
             if atom.get("lifecycle_state") != "active":
@@ -3433,7 +3590,11 @@ class Amos:
                 continue
             covered_sources.update(str(ref) for ref in payload.get("source_refs", []))
         candidates = []
-        for atom in self.store.list_atoms():
+        for atom in self.store.list_atoms_filtered(
+            types=sorted(candidate_types) if candidate_types else None,
+            lifecycle_states=["active"],
+            included_health=["healthy", "low_utility"],
+        ):
             if atom.get("deleted"):
                 continue
             if atom["id"] in covered_sources:
@@ -3581,8 +3742,6 @@ class Amos:
     def _rebuild_derived_indexes(
         self, *, graph_version: int | None = None
     ) -> dict[str, Any]:
-        atoms = self.store.list_atoms()
-        edges = self.store.list_edges()
         graph_version = (
             graph_version if graph_version is not None else self.store.graph_version()
         )
@@ -3593,7 +3752,7 @@ class Amos:
                 graph_version=graph_version,
                 freshness="fresh",
                 details={
-                    "atom_count": len([atom for atom in atoms if not atom.get("deleted")]),
+                    "atom_count": self.store.atom_count(),
                     "processor_id": self.smp.processor_id,
                     "rebuildable_from_canonical": True,
                     "maintained_by": "memory_policy",
@@ -3605,7 +3764,7 @@ class Amos:
                 graph_version=graph_version,
                 freshness="fresh",
                 details={
-                    "edge_count": len(edges),
+                    "edge_count": self.store.edge_count(),
                     "rebuildable_from_canonical": True,
                     "maintained_by": "memory_policy",
                 },
@@ -3637,25 +3796,29 @@ class Amos:
         *,
         request_scope: Mapping[str, Any] | None = None,
         retrieval_mode: str = "general",
+        cue_text: str | None = None,
+        cue_tokens: set[str] | None = None,
+        cue_vector: Sequence[float] | None = None,
+        edge_degrees: Mapping[str, int] | None = None,
     ) -> tuple[float, bool, dict[str, float]]:
-        text = (
-            atom["id"]
-            + " "
-            + atom["type"]
-            + " "
-            + canonical_json(atom["payload"])
-        ).lower()
-        cue_text = " ".join(cues).lower()
-        cue_tokens = {token for token in re.findall(r"[a-z0-9_]+", cue_text) if token}
-        text_tokens = set(re.findall(r"[a-z0-9_]+", text))
+        search_index = self._atom_search_index(atom)
+        text = str(search_index["text"])
+        cue_text = " ".join(cues).lower() if cue_text is None else cue_text
+        cue_tokens = (
+            {token for token in re.findall(r"[a-z0-9_]+", cue_text) if token}
+            if cue_tokens is None
+            else cue_tokens
+        )
+        text_tokens = set(str(token) for token in search_index["tokens"])
         direct = any(cue.lower() in text for cue in cues if cue)
         overlap = len(cue_tokens.intersection(text_tokens))
         matched = direct or overlap > 0 or not cue_tokens
         semantic_similarity = 0.0
         if cue_text:
-            semantic_similarity = cosine(self.smp.encode(cue_text), self.smp.encode(atom))
+            cue_vector = self.smp.encode(cue_text) if cue_vector is None else cue_vector
+            semantic_similarity = cosine(cue_vector, search_index["vector"])
         direct_score = 1.0 if direct else min(1.0, overlap / max(1, len(cue_tokens)))
-        edge_activation = self._edge_activation(atom["id"])
+        edge_activation = self._edge_activation(atom["id"], edge_degrees=edge_degrees)
         recency = 1.0 if atom.get("updated_at") else 0.5
         confidence = confidence_score(atom["confidence"])
         utility = min(1.0, float(atom["utility"]))
@@ -3806,11 +3969,16 @@ class Amos:
             "payload": payload,
         }
 
-    def _edge_activation(self, atom_id: str) -> float:
-        count = 0
-        for edge in self.store.list_edges():
-            if edge["source_ref"] == atom_id or edge["target_ref"] == atom_id:
-                count += 1
+    def _edge_activation(
+        self, atom_id: str, *, edge_degrees: Mapping[str, int] | None = None
+    ) -> float:
+        if edge_degrees is not None:
+            count = int(edge_degrees.get(atom_id, 0))
+        else:
+            count = 0
+            for edge in self.store.list_edges():
+                if edge["source_ref"] == atom_id or edge["target_ref"] == atom_id:
+                    count += 1
         return min(1.0, count / 5.0)
 
     def _agentic_score_components(self, atom: Mapping[str, Any]) -> dict[str, float]:
@@ -3988,7 +4156,9 @@ class Amos:
                 "reason": reason,
             }
         )
-        archived = normalize_atom(archived, require_id=True)
+        archived = normalize_atom(
+            self._attach_search_index(archived), require_id=True
+        )
         self.store.replace_atom(conn, archived)
         deleted_edges = self.store.mark_edges_deleted_for_ref(conn, archived["id"])
         return archived, deleted_edges

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.request
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from amos import (
     AccessDenied,
     AgenticRecallAuditor,
     Amos,
+    BackgroundMemoryPolicyWorker,
     CASConflict,
     CapacityGovernor,
     DistillerMaintenanceWorker,
@@ -375,6 +377,66 @@ def test_propose_batch_commit_deletion_request_and_shared_refresh(amos):
     )
     assert deleted["status"] == "deleted"
     assert deleted["residual_retention"]["packet_cache"] == "purged"
+
+
+def test_batch_commit_uses_single_transaction_and_rejects_duplicate_batch(amos):
+    committed = amos.commit_memory_atoms(
+        [
+            {
+                "id": "batch_one",
+                "type": "belief",
+                "payload": {"claim": "batch one"},
+            },
+            {
+                "id": "batch_two",
+                "type": "belief",
+                "payload": {"claim": "batch two"},
+            },
+        ]
+    )
+
+    assert [item["atom"]["id"] for item in committed["committed"]] == [
+        "batch_one",
+        "batch_two",
+    ]
+    assert amos.store.graph_version() == 2
+    with pytest.raises(ValidationError):
+        amos.commit_memory_atoms(
+            [
+                {
+                    "id": "batch_duplicate",
+                    "type": "belief",
+                    "payload": {"claim": "duplicate"},
+                },
+                {
+                    "id": "batch_duplicate",
+                    "type": "belief",
+                    "payload": {"claim": "duplicate again"},
+                },
+            ]
+        )
+    assert amos.store.get_atom("batch_duplicate") is None
+
+
+def test_retrieve_packet_uses_graph_version_packet_cache(amos, monkeypatch):
+    amos.commit_atom(
+        {
+            "id": "cache_hit_atom",
+            "type": "belief",
+            "payload": {"claim": "cache hit retrieval works"},
+        }
+    )
+    first = amos.retrieve_packet(cues=["cache hit retrieval"], run_policy=False)
+    assert "cache_hit_atom" in item_refs(first)
+
+    def fail_list_atoms_filtered(**_kwargs):
+        raise AssertionError("cache hit should not scan atoms")
+
+    monkeypatch.setattr(amos.store, "list_atoms_filtered", fail_list_atoms_filtered)
+    second = amos.retrieve_packet(cues=["cache hit retrieval"], run_policy=False)
+
+    assert second["packet_id"] == first["packet_id"]
+    assert "cache_hit_atom" in item_refs(second)
 
 
 def test_procedural_memory_is_advisory_and_autonomous_execution_denied(amos):
@@ -1811,6 +1873,76 @@ def test_automatic_memory_policy_distills_and_maintains_on_retrieval(amos):
     assert replacement["payload"]["source_refs"] == distilled["payload"]["source_refs"]
     assert not replacement["payload"]["summary"].lstrip().startswith("{")
     assert "Replacement renderer output" in replacement["payload"]["summary"]
+
+
+def test_health_memory_can_skip_foreground_policy_tick(amos):
+    amos.configure_memory_policy(
+        schedule={"every_graph_versions": 1, "every_seconds": 0},
+        distillation={"min_source_atoms": 3, "max_source_atoms": 3},
+    )
+    for index in range(3):
+        amos.commit_atom(
+            {
+                "id": f"health_policy_source_{index}",
+                "type": "belief",
+                "payload": {"claim": f"health policy source memory {index}"},
+                "scope": {"tenant": "health-policy"},
+            }
+        )
+
+    health = amos.health_memory(run_policy=False)
+
+    assert health["last_policy_tick"]["status"] == "skipped"
+    assert health["last_policy_tick"]["reason"] == "policy_not_run_for_health"
+    assert not [
+        atom
+        for atom in amos.store.list_atoms()
+        if atom["type"] == "semantic"
+        and atom["payload"].get("distillation_type") == "automatic_policy"
+    ]
+
+
+def test_background_memory_policy_worker_runs_queued_tick(amos):
+    amos.configure_memory_policy(
+        schedule={"every_graph_versions": 1, "every_seconds": 0},
+        distillation={"min_source_atoms": 3, "max_source_atoms": 3},
+    )
+    for index in range(3):
+        amos.commit_atom(
+            {
+                "id": f"background_policy_source_{index}",
+                "type": "belief",
+                "payload": {"claim": f"background policy source memory {index}"},
+                "scope": {"tenant": "background-policy"},
+            }
+        )
+    worker = BackgroundMemoryPolicyWorker(amos, interval_seconds=30)
+    try:
+        worker.start()
+        queued = worker.request_tick(
+            trigger="retrieve_packet",
+            scope={"tenant": "background-policy"},
+        )
+        assert queued["status"] == "queued"
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            status = worker.status()
+            if status["last_result"] and status["last_result"]["status"] == "completed":
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail(f"background policy worker did not complete: {worker.status()}")
+    finally:
+        worker.stop()
+
+    semantic_atoms = [
+        atom
+        for atom in amos.store.list_atoms()
+        if atom["type"] == "semantic"
+        and atom["payload"].get("distillation_type") == "automatic_policy"
+    ]
+    assert semantic_atoms
+    assert amos.memory_policy_status()["state"]["last_trigger"] == "retrieve_packet"
 
 
 def test_automatic_memory_policy_prioritizes_outcome_evidence_over_directives(amos):

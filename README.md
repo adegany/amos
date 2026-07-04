@@ -31,7 +31,7 @@ flowchart LR
     M --> P[Packet renderer]
     E --> P
     G --> P
-    S --> W[Memory policy worker]
+    S --> W[Background memory policy worker]
     W --> D[Deterministic distillation]
     W --> SMP[Semantic Maintenance Processor]
     W --> C[Capacity and cleanup]
@@ -96,9 +96,9 @@ in-process SQLite store and serializes access through the service boundary:
   limitations, runtime state, self-assessments, traces, outcomes, corrections,
   and blocked actions.
 - Provenance-linked deterministic memory distillation.
-- Automatic memory policy scheduling for deterministic distillation, SMP,
-  stewardship, processor-pack distillation, derived-index refresh, and
-  packet-cache invalidation.
+- Automatic memory policy scheduling with a background HTTP-service worker for
+  deterministic distillation, SMP, stewardship, processor-pack distillation,
+  derived-index refresh, and packet-cache invalidation.
 - Deterministic non-generative Semantic Maintenance Processor (SMP) outputs
   using the required audit envelope.
 - Generic maintenance proposal records, a processor registry, and a policy gate
@@ -110,11 +110,13 @@ in-process SQLite store and serializes access through the service boundary:
   high-risk mutation requests gated behind explicit approval.
 - Capacity pressure reporting and degraded packet disclosure.
 - Journal chain and replay verification.
-- Worker artifacts for projection checks, index maintenance, packet-cache
-  invalidation, capacity governance, stewardship, self-model calibration,
-  agentic-recall auditing, and SMP analysis.
+- Worker artifacts for background memory policy ticks, projection checks, index
+  maintenance, packet-cache invalidation, capacity governance, stewardship,
+  self-model calibration, agentic-recall auditing, and SMP analysis.
 - Dependency-free HTTP adapter for the V1 JSON API surface; connected agents
-  call the service instead of embedding their own stores.
+  call the service instead of embedding their own stores. In HTTP service mode,
+  memory health is observational and packet retrieval queues policy work on the
+  background worker instead of running maintenance inline.
 - CLI and tests.
 
 Start here:
@@ -171,6 +173,12 @@ Serve the V1 HTTP API:
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 serve --host 127.0.0.1 --port 8765
 ```
 
+The HTTP service starts a background memory-policy worker. `GET
+/v1/health/memory` reports health and worker status without running maintenance
+inline, while `POST /v1/packets:retrieve` queues a policy tick and returns the
+packet immediately. Explicit `POST /v1/memory-policy:run` and the CLI
+`memory-policy --run` command remain synchronous operator paths.
+
 Verify journal replay:
 
 ```bash
@@ -208,8 +216,8 @@ python benchmarks/benchmark_amos.py --markdown --run-policy
 
 The benchmark commits typed atoms through the in-process service API, retrieves
 planner packets, verifies replay, and optionally runs the automatic memory
-policy once. It measures the current v1-local SQLite baseline, not HTTP or
-network overhead.
+policy once. It measures the current v1-local SQLite baseline, not HTTP,
+network, or background-worker scheduling overhead.
 
 Reference result from a local workstation run on 2026-07-04:
 
@@ -217,14 +225,14 @@ Reference result from a local workstation run on 2026-07-04:
 | --- | ---: |
 | Atoms committed | 100 |
 | Retrievals | 20 |
-| Commit throughput | 478.07 atoms/s |
-| Commit latency p50 / p95 | 2.071 ms / 2.582 ms |
-| Retrieval latency p50 / p95 | 73.79 ms / 83.206 ms |
+| Commit throughput | 1039.42 atoms/s |
+| Commit latency p50 / p95 | 0.947 ms / 1.241 ms |
+| Retrieval latency p50 / p95 | 0.256 ms / 14.754 ms |
 | Average packet items | 9 |
-| Replay verification | 11.206 ms (ok) |
-| Forced memory policy run | 1460.163 ms (completed) |
+| Replay verification | 21.761 ms (ok) |
+| Forced memory policy run | 175.669 ms (completed) |
 | Final atoms / edges | 101 / 60 |
-| SQLite DB size | 2424832 bytes |
+| SQLite DB size | 876544 bytes |
 | Environment | Python 3.12.2; 24 CPUs; Linux-6.17.0-35-generic-x86_64-with-glibc2.39 |
 
 ## Integration boundary
@@ -253,7 +261,7 @@ ambiguous or high-risk work for review.
 
 - Stabilize the V1 HTTP API envelopes and schema contracts.
 - Keep SQLite as the first supported shared-service deployment profile.
-- Expand replay verification and maintenance-worker acceptance tests.
+- Expand replay verification and background-maintenance acceptance tests.
 - Improve packet-ranking diagnostics, omissions reporting, and retrieval-outcome telemetry.
 - Harden the Mirror Agent demo as the reference self-awareness integration.
 

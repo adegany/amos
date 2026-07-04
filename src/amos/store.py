@@ -54,6 +54,10 @@ class SQLiteStore:
         )
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
+        self.conn.execute("PRAGMA busy_timeout = 5000")
+        if self.path != Path(":memory:"):
+            self.conn.execute("PRAGMA journal_mode = WAL")
+            self.conn.execute("PRAGMA synchronous = NORMAL")
         self.init_schema()
 
     def close(self) -> None:
@@ -120,6 +124,10 @@ class SQLiteStore:
             CREATE INDEX IF NOT EXISTS idx_atoms_type ON amos_atoms(type);
             CREATE INDEX IF NOT EXISTS idx_atoms_lifecycle ON amos_atoms(lifecycle_state);
             CREATE INDEX IF NOT EXISTS idx_atoms_health ON amos_atoms(health_status);
+            CREATE INDEX IF NOT EXISTS idx_atoms_deleted_updated
+                ON amos_atoms(deleted, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_atoms_lifecycle_health_type
+                ON amos_atoms(lifecycle_state, health_status, type);
 
             CREATE TABLE IF NOT EXISTS amos_edges (
                 edge_id TEXT PRIMARY KEY,
@@ -194,6 +202,8 @@ class SQLiteStore:
                 response_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_packet_cache_request_graph
+                ON amos_packet_cache(request_digest, graph_version);
 
             CREATE TABLE IF NOT EXISTS amos_retrieval_outcomes (
                 outcome_id TEXT PRIMARY KEY,
@@ -486,6 +496,66 @@ class SQLiteStore:
         rows = self.conn.execute("SELECT * FROM amos_atoms ORDER BY updated_at DESC").fetchall()
         return [self._row_dict(row) for row in rows]
 
+    def list_atoms_filtered(
+        self,
+        *,
+        include_deleted: bool = False,
+        types: list[str] | None = None,
+        lifecycle_states: list[str] | None = None,
+        excluded_health: list[str] | None = None,
+        included_health: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if not include_deleted:
+            clauses.append("deleted = 0")
+        if types:
+            clauses.append(f"type IN ({','.join('?' for _ in types)})")
+            params.extend(types)
+        if lifecycle_states:
+            clauses.append(
+                f"lifecycle_state IN ({','.join('?' for _ in lifecycle_states)})"
+            )
+            params.extend(lifecycle_states)
+        if excluded_health:
+            clauses.append(
+                f"health_status NOT IN ({','.join('?' for _ in excluded_health)})"
+            )
+            params.extend(excluded_health)
+        if included_health:
+            clauses.append(
+                f"health_status IN ({','.join('?' for _ in included_health)})"
+            )
+            params.extend(included_health)
+        query = "SELECT * FROM amos_atoms"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY updated_at DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [self._row_dict(row) for row in rows]
+
+    def atom_count(self, *, include_deleted: bool = False) -> int:
+        query = "SELECT COUNT(*) AS count FROM amos_atoms"
+        params: tuple[Any, ...] = ()
+        if not include_deleted:
+            query += " WHERE deleted = 0"
+        row = self.conn.execute(query, params).fetchone()
+        return int(row["count"])
+
+    def atom_counts_by(self, column: str, *, include_deleted: bool = False) -> dict[str, int]:
+        if column not in {"type", "health_status", "lifecycle_state"}:
+            raise ValueError(f"unsupported atom count column: {column}")
+        query = f"SELECT {column} AS key, COUNT(*) AS count FROM amos_atoms"
+        if not include_deleted:
+            query += " WHERE deleted = 0"
+        query += f" GROUP BY {column}"
+        rows = self.conn.execute(query).fetchall()
+        return {str(row["key"]): int(row["count"]) for row in rows}
+
     def insert_edge(self, conn: sqlite3.Connection, edge: Mapping[str, Any]) -> None:
         conn.execute(
             """
@@ -517,6 +587,40 @@ class SQLiteStore:
 
     def list_edges(self) -> list[dict[str, Any]]:
         rows = self.conn.execute("SELECT * FROM amos_edges WHERE deleted = 0").fetchall()
+        return [self._row_dict(row) for row in rows]
+
+    def edge_count(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS count FROM amos_edges WHERE deleted = 0"
+        ).fetchone()
+        return int(row["count"])
+
+    def edge_degree_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        rows = self.conn.execute(
+            """
+            SELECT source_ref, target_ref
+            FROM amos_edges
+            WHERE deleted = 0
+            """
+        ).fetchall()
+        for row in rows:
+            counts[str(row["source_ref"])] = counts.get(str(row["source_ref"]), 0) + 1
+            counts[str(row["target_ref"])] = counts.get(str(row["target_ref"]), 0) + 1
+        return counts
+
+    def list_edges_for_refs(self, refs: list[str]) -> list[dict[str, Any]]:
+        if not refs:
+            return []
+        placeholders = ",".join("?" for _ in refs)
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM amos_edges
+            WHERE deleted = 0
+              AND (source_ref IN ({placeholders}) OR target_ref IN ({placeholders}))
+            """,
+            tuple(refs + refs),
+        ).fetchall()
         return [self._row_dict(row) for row in rows]
 
     def mark_edges_deleted_for_ref(
@@ -644,6 +748,21 @@ class SQLiteStore:
             ),
         )
 
+    def get_cached_packet(
+        self, *, request: Mapping[str, Any], graph_version: int
+    ) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT response_json
+            FROM amos_packet_cache
+            WHERE request_digest = ? AND graph_version = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (digest(request), int(graph_version)),
+        ).fetchone()
+        return None if row is None else self._json(row["response_json"])
+
     def clear_packet_cache(self, conn: sqlite3.Connection) -> None:
         conn.execute("DELETE FROM amos_packet_cache")
 
@@ -747,16 +866,36 @@ class SQLiteStore:
         ).fetchone()
         return int(row["count"])
 
-    def list_retrieval_outcomes(self) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
-            "SELECT * FROM amos_retrieval_outcomes ORDER BY created_at DESC"
-        ).fetchall()
+    def list_retrieval_outcomes(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM amos_retrieval_outcomes ORDER BY created_at DESC"
+        params: tuple[Any, ...] = ()
+        if limit is not None:
+            query += " LIMIT ?"
+            params = (max(0, int(limit)),)
+        rows = self.conn.execute(query, params).fetchall()
         return [self._row_dict(row) for row in rows]
 
-    def list_events(self) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
-            "SELECT * FROM amos_event_journal ORDER BY graph_version ASC"
-        ).fetchall()
+    def event_count(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS count FROM amos_event_journal"
+        ).fetchone()
+        return int(row["count"])
+
+    def list_events(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        if limit is None:
+            rows = self.conn.execute(
+                "SELECT * FROM amos_event_journal ORDER BY graph_version ASC"
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """
+                SELECT * FROM amos_event_journal
+                ORDER BY graph_version DESC
+                LIMIT ?
+                """,
+                (max(0, int(limit)),),
+            ).fetchall()
+            rows = list(reversed(rows))
         return [self._row_dict(row) for row in rows]
 
     def _row_dict(self, row: sqlite3.Row) -> dict[str, Any]:

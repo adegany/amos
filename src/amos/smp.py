@@ -61,7 +61,22 @@ class SemanticMaintenanceProcessor:
         self.processor_version = PROCESSOR_VERSION
 
     def encode(self, atom_or_text_span: Mapping[str, Any] | str) -> list[float]:
-        text = atom_or_text_span if isinstance(atom_or_text_span, str) else atom_text(atom_or_text_span)
+        if isinstance(atom_or_text_span, Mapping):
+            index_refs = atom_or_text_span.get("index_refs")
+            if isinstance(index_refs, Mapping):
+                search_index = index_refs.get("amos.v1.search")
+                if isinstance(search_index, Mapping):
+                    vector = search_index.get("vector")
+                    if isinstance(vector, list):
+                        try:
+                            return [float(value) for value in vector]
+                        except (TypeError, ValueError):
+                            pass
+        text = (
+            atom_or_text_span
+            if isinstance(atom_or_text_span, str)
+            else atom_text(atom_or_text_span)
+        )
         vector = [0.0] * self.dimensions
         for token, count in Counter(tokens(text)).items():
             slot = int(digest(token), 16) % self.dimensions

@@ -23,6 +23,7 @@ from .smp import SemanticMaintenanceProcessor
 from .store import SQLiteStore
 from .workers import (
     AgenticRecallAuditor,
+    BackgroundMemoryPolicyWorker,
     CapacityGovernor,
     DistillerMaintenanceWorker,
     IndexMaintainer,
@@ -39,6 +40,7 @@ __all__ = [
     "AgenticRecallAuditor",
     "Amos",
     "AmosError",
+    "BackgroundMemoryPolicyWorker",
     "CASConflict",
     "CapacityGovernor",
     "DistillerMaintenanceWorker",

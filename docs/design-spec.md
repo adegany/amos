@@ -3,7 +3,7 @@
 **Project name:** Amos
 **Expansion:** Agent Memory Operating System
 **Status:** V1-local reference implementation plus active design spec
-**Implementation status:** Dependency-free Python service, SQLite store, HTTP adapter, CLI, schemas, migrations, examples, and tests are present in this repository.
+**Implementation status:** Dependency-free Python service, SQLite store, HTTP adapter with a background memory-policy worker, CLI, schemas, migrations, examples, and tests are present in this repository.
 
 ---
 
@@ -2809,7 +2809,8 @@ POST /v1/atoms:commit
   request payload: full atom record or atoms batch, optional idempotency_key,
   authorization_context
   response payload: committed atom refs, graph_version, projection_status
-  consistency: strong
+  consistency: strong; batch commits validate duplicate ids before mutation and
+  commit journal entries, atoms, and edges in one transaction
 
 POST /v1/atoms:archive
   request payload: atom_id, reason, optional expected_version, authorization_context
@@ -2823,8 +2824,10 @@ POST /v1/atoms:merge
 
 POST /v1/packets:retrieve
   request payload: MemoryPacketRequest
-  response payload: MemoryPacket
-  consistency: monotonic by default; strong if min_graph_version is provided and reachable
+  response payload: MemoryPacket; HTTP service mode includes a policy_schedule
+  acknowledgement when retrieval queues background policy work
+  consistency: monotonic by default; strong if min_graph_version is provided and reachable;
+  cacheable by request digest and graph_version when no policy mutation is required
 
 POST /v1/retrieval-outcomes
   request payload: packet_id, used_item_refs, outcome labels, correction refs
@@ -2842,7 +2845,7 @@ GET /v1/maintenance-processors
 
 GET /v1/memory-policy
   response payload: configured policy, persisted policy state, due reasons,
-  graph_version
+  graph_version, background worker status in HTTP service mode
   consistency: monotonic
 
 POST /v1/memory-policy:configure
@@ -2856,7 +2859,8 @@ POST /v1/memory-policy:run
   response payload: policy tick status,
   SMP/steward/distillation/maintenance_distiller/index/cache results, journal
   event ref when completed
-  consistency: strong when a tick runs
+  consistency: strong when a tick runs; this endpoint is the synchronous
+  operator/admin path
 
 POST /v1/maintenance-distiller:run
   request payload: scope, domain, optional processor_ids, window limits,
@@ -2927,7 +2931,8 @@ POST /v1/smp:analyze
   consistency: monotonic over the source graph version
 
 GET /v1/health/memory
-  response payload: memory health metrics by scope, lifecycle_state, health_status, and atom type
+  response payload: memory health metrics by scope, lifecycle_state, health_status, atom type, and background worker status in HTTP service mode
+  side effects: observational in HTTP service mode; does not run policy inline
 
 GET /v1/health/capacity
   response payload: CapacityHealthReport
@@ -3157,6 +3162,14 @@ eventual derived mutation:
 ```
 
 If Amos is deployed as a cluster, the spec requires one linearizable writer per tenant/workspace shard for strong canonical mutations, or an equivalent consensus mechanism. The deployment may use weaker consistency only for derived artifacts and low-risk telemetry.
+
+V1-local packet caches are valid only for the exact request signature and
+`graph_version` that produced them. Retrieval should check the packet cache
+before ranking atoms, but cache misses must produce the same correctness
+semantics as an uncached retrieval. Cache entries and materialized search
+metadata are discarded or rebuilt after canonical graph mutations, deletion
+requests, merges, health transitions, and policy maintenance that changes
+retrieval eligibility.
 
 ### 25.6 Pub/sub and cache invalidation
 
@@ -4328,6 +4341,36 @@ packet cache:
 
 The first implementation must keep vector indexes, packet caches, generated summaries, and telemetry rollups rebuildable from canonical records and retained evidence.
 
+V1-local SQLite service profile:
+
+```text
+connection profile:
+  foreign key enforcement enabled
+  busy timeout configured for foreground/background contention
+  WAL journal mode for file-backed databases
+  synchronous=NORMAL for service-owned local durability/performance balance
+
+canonical write profile:
+  strong mutations use explicit transactions
+  batch atom commits preflight duplicate ids before writing
+  atom rows, edge rows, and journal entries commit atomically
+  packet cache invalidation is performed once per successful mutation batch
+
+read/query profile:
+  filtered atom queries support type, lifecycle, health, deletion, limit, and
+  ordering constraints
+  SQL count helpers back health and derived-index status without loading the
+  full graph
+  graph-edge degree maps and ref-scoped edge reads are preferred over repeated
+  full-edge scans
+```
+
+Derived search metadata is stored in each atom's `index_refs` under a processor
+specific key such as `amos.v1.search`. This metadata may include normalized
+search text, token lists, and deterministic lexical vectors. It is rebuildable
+from canonical atom payloads and must not become the canonical source of memory
+truth.
+
 Postgres is a future TODO for scale-out deployments that need multiple API
 instances, independent writer processes, database-managed role separation,
 replication, point-in-time recovery, JSONB/GIN indexing, or stronger operational
@@ -4708,10 +4751,10 @@ SMP authority:
   high-risk SMP recommendation requires review before mutation
 
 automatic memory policy:
-  scheduled retrieval or worker ticks run deterministic maintenance, create
-  provenance-linked distilled atoms, refresh derived indexes, invalidate packet
-  cache, persist policy state, and journal memory_policy_run events without an
-  LLM
+  background worker ticks and explicit operator runs perform deterministic
+  maintenance, create provenance-linked distilled atoms, refresh derived
+  indexes, invalidate packet cache, persist policy state, and journal
+  memory_policy_run events without an LLM
 ```
 
 ### 29.11 V1 automatic memory policy
@@ -4763,10 +4806,26 @@ maintenance_distiller:
     authority: draft_only
 ```
 
-The policy tick runs opportunistically inside the AMOS service on retrieval,
-memory-health observation, explicit worker ticks, and operator-forced runs. A
-v1 implementation may add a background timer, but the correctness contract is
-that connected agents do not own lifecycle maintenance themselves.
+The v1 HTTP service starts a background memory-policy worker. Foreground
+service calls do not need to complete maintenance before responding:
+
+```text
+GET /v1/health/memory
+  reports memory health and background worker status
+  does not run a policy tick inline
+
+POST /v1/packets:retrieve
+  returns a packet from the current graph view
+  queues a background policy tick when run_policy is true
+
+POST /v1/memory-policy:run
+  runs the policy synchronously as an explicit operator/admin action
+```
+
+The in-process service API still exposes `run_memory_policy()` and
+`retrieve_packet(run_policy=True)` for tests, CLI use, and embedded deployments
+that intentionally want a synchronous tick. The shared-service contract is that
+connected agents do not own lifecycle maintenance themselves.
 
 When due, the policy should:
 
@@ -4783,6 +4842,29 @@ refresh rebuildable derived-index metadata
 invalidate packet cache
 persist memory_policy_state
 append a memory_policy_run event
+```
+
+V1-local policy execution profile:
+
+```text
+SMP analysis:
+  analyzes active eligible atoms
+  bounds pairwise semantic link analysis to likely candidate pairs
+  ranks candidates by type compatibility, lexical overlap, recency, and policy
+  limits rather than comparing every atom to every other atom
+
+maintenance evidence window:
+  uses configured limits for atoms, events, and retrieval outcomes
+  reads visible active graph neighborhoods for selected atoms
+  keeps processor packs side-effect-free
+
+retrieval policy scheduling:
+  packet retrieval may enqueue policy work but should not block on SMP,
+  stewardship, distillation, index refresh, or cache invalidation in HTTP mode
+
+health reporting:
+  reports graph size, event count, edge count, pressure, stale indexes,
+  background worker status, and policy due state using bounded reads
 ```
 
 Automatic distillation is non-LLM. It creates a canonical semantic memory with
@@ -5164,6 +5246,7 @@ worker artifacts:
   packet cache invalidator
   capacity governor
   memory steward
+  background memory policy worker
   self-model calibrator
   agentic recall auditor
   SMP worker
@@ -5191,6 +5274,9 @@ replay gate:
 
 retrieval gate:
   every MemoryPacket includes graph_version, provenance, omissions, degradation, and item score components
+  retrieval uses graph-version-aware packet caching, materialized search
+  metadata, filtered atom reads, bounded edge activation, and ref-scoped conflict
+  checks without changing packet correctness
 
 self-awareness gate:
   self-awareness packets distinguish durable self-knowledge from volatile runtime state,
@@ -5220,10 +5306,17 @@ SMP gate:
   non-generative processors can recommend actions, but high-risk mutations require authorization and review
 
 memory policy gate:
-  scheduled retrieval, health checks, worker ticks, and forced operator runs can
-  perform deterministic maintenance, distillation, processor-pack proposal
-  evaluation, index refresh, packet-cache invalidation, and journaled
-  memory_policy_run events without an LLM
+  background worker ticks and forced operator runs can perform deterministic
+  maintenance, distillation, processor-pack proposal evaluation, index refresh,
+  packet-cache invalidation, and journaled memory_policy_run events without an
+  LLM; HTTP health remains observational and packet retrieval schedules worker
+  work instead of blocking on maintenance
+
+performance gate:
+  service-owned SQLite uses WAL-compatible connection tuning, transactional
+  batch commits, SQL-backed health/count queries, bounded SMP candidate
+  selection, limited evidence windows, and cache/index invalidation semantics
+  that keep HTTP health and packet retrieval responsive as the graph grows
 
 processor-pack gate:
   built-in generic processors and imported external processors return

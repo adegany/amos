@@ -10,6 +10,7 @@ from typing import Any, cast
 
 from .errors import AmosError
 from .service import Amos
+from .workers import BackgroundMemoryPolicyWorker
 
 
 class AmosHTTPServer(ThreadingHTTPServer):
@@ -21,15 +22,26 @@ class AmosHTTPServer(ThreadingHTTPServer):
         maintenance_processor_paths: list[str] | None = None,
     ):
         self.db_path = db_path
+        self.maintenance_processor_paths = list(maintenance_processor_paths or [])
         self.amos = Amos(
             db_path,
-            maintenance_processor_paths=maintenance_processor_paths,
+            maintenance_processor_paths=self.maintenance_processor_paths,
         )
+        self.policy_worker_amos = Amos(
+            db_path,
+            maintenance_processor_paths=self.maintenance_processor_paths,
+        )
+        self.memory_policy_worker = BackgroundMemoryPolicyWorker(
+            self.policy_worker_amos
+        )
+        self.memory_policy_worker.start()
         self.service_lock = threading.RLock()
         super().__init__(server_address, make_handler())
 
     def server_close(self) -> None:
         try:
+            self.memory_policy_worker.stop()
+            self.policy_worker_amos.close()
             self.amos.close()
         finally:
             super().server_close()
@@ -53,7 +65,7 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 body = self._read_json() if method == "POST" else {}
                 server = cast(AmosHTTPServer, self.server)
                 with server.service_lock:
-                    self._dispatch(server.amos, method, body)
+                    self._dispatch(server, method, body)
             except AmosError as exc:
                 self._write_json(
                     {"status": "error", "error": str(exc)},
@@ -75,17 +87,28 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                     status=HTTPStatus.NOT_FOUND,
                 )
 
-        def _dispatch(self, amos: Amos, method: str, body: dict[str, Any]) -> None:
+        def _dispatch(
+            self, server: AmosHTTPServer, method: str, body: dict[str, Any]
+        ) -> None:
+            amos = server.amos
             path = self.path.split("?", 1)[0]
             if method == "GET":
                 if path == "/v1/health/memory":
-                    return self._write_json(amos.health_memory())
+                    payload = amos.health_memory(run_policy=False)
+                    payload["background_policy_worker"] = (
+                        server.memory_policy_worker.status()
+                    )
+                    return self._write_json(payload)
                 if path == "/v1/health/capacity":
                     return self._write_json(amos.health_capacity())
                 if path == "/v1/llm-reviewer/policy":
                     return self._write_json(amos.llm_reviewer_policy())
                 if path == "/v1/memory-policy":
-                    return self._write_json(amos.memory_policy_status())
+                    payload = amos.memory_policy_status()
+                    payload["background_policy_worker"] = (
+                        server.memory_policy_worker.status()
+                    )
+                    return self._write_json(payload)
                 if path == "/v1/maintenance-processors":
                     return self._write_json(amos.list_maintenance_processors())
                 if path == "/v1/verify":
@@ -134,7 +157,18 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
             if path == "/v1/atoms:merge":
                 return self._write_json(amos.merge_atoms(**body))
             if path == "/v1/packets:retrieve":
-                return self._write_json(amos.retrieve_packet(**body))
+                request = dict(body)
+                policy_schedule = None
+                if bool(request.get("run_policy", True)):
+                    policy_schedule = server.memory_policy_worker.request_tick(
+                        trigger="retrieve_packet",
+                        scope=request.get("scope") or {},
+                    )
+                    request["run_policy"] = False
+                packet = amos.retrieve_packet(**request)
+                if policy_schedule is not None:
+                    packet["policy_schedule"] = policy_schedule
+                return self._write_json(packet)
             if path == "/v1/retrieval-outcomes":
                 return self._write_json(amos.record_retrieval_outcome(**body))
             if path == "/v1/maintenance:request":
