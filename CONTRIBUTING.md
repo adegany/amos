@@ -1,8 +1,7 @@
 # Contributing to AMOS
 
 Thanks for helping improve AMOS. This project accepts contributions under the
-Apache License 2.0 and uses the Developer Certificate of Origin for contributor
-certification.
+Apache License 2.0.
 
 ## License
 
@@ -11,25 +10,6 @@ licensed under the Apache License 2.0 unless a file explicitly states
 otherwise.
 
 See [LICENSE](LICENSE) for the license terms.
-
-## Developer Certificate of Origin
-
-All commits must include a DCO sign-off. The sign-off certifies that you have
-the right to submit the contribution under this project's license.
-
-Use `git commit -s`:
-
-```bash
-git commit -s -m "Describe the change"
-```
-
-This appends a line like:
-
-```text
-Signed-off-by: Your Name <you@example.com>
-```
-
-See [DCO.md](DCO.md) for the full certificate text.
 
 ## Development Workflow
 
