@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -80,6 +81,22 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 self._write_json(
                     {"status": "error", "error": f"missing field: {exc}"},
                     status=HTTPStatus.BAD_REQUEST,
+                )
+            except sqlite3.OperationalError as exc:
+                message = str(exc)
+                if "database is locked" in message.lower() or "database is busy" in message.lower():
+                    self._write_json(
+                        {
+                            "status": "error",
+                            "error": message,
+                            "retryable": True,
+                        },
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                    return
+                self._write_json(
+                    {"status": "error", "error": message},
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
             except NotImplementedError:
                 self._write_json(

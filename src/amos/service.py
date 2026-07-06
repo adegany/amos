@@ -5043,6 +5043,9 @@ class Amos:
             seen.add(key)
             edges.append(self._edge(source, target, relation, scope))
 
+        for ref in _structured_ref_list(atom.get("supersedes")):
+            add(atom_id, ref, "rel:supersedes")
+
         for ref in _structured_ref_list(payload.get("source_refs")):
             add(atom_id, ref, "rel:derived_from")
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import threading
 import time
+import sqlite3
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -336,6 +338,33 @@ def test_idempotency_returns_same_response_and_conflicts_on_changed_payload(amos
             },
             idempotency_key="commit-fallback",
         )
+
+
+def test_commit_atom_projects_supersedes_edges(amos):
+    old = amos.commit_atom(
+        {
+            "id": "old_runtime_observation",
+            "type": "semantic",
+            "payload": {"summary": "Old runtime observation"},
+            "scope": {"tenant": "qandl"},
+        }
+    )
+    new = amos.commit_atom(
+        {
+            "id": "new_runtime_observation",
+            "type": "semantic",
+            "payload": {"summary": "New runtime observation"},
+            "scope": {"tenant": "qandl"},
+            "supersedes": [old["atom"]["id"]],
+        }
+    )
+
+    assert any(
+        edge["source_ref"] == new["atom"]["id"]
+        and edge["target_ref"] == old["atom"]["id"]
+        and edge["relation"] == "rel:supersedes"
+        for edge in new["edges"]
+    )
 
 
 def test_propose_batch_commit_deletion_request_and_shared_refresh(amos):
@@ -3086,6 +3115,43 @@ def test_http_v1_endpoints_smoke(tmp_path):
         verify = http_json(f"{base}/v1/verify")
         assert verify["journal"]["status"] == "ok"
         assert verify["replay"]["status"] == "ok"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_sqlite_lock_returns_retryable_json(tmp_path):
+    db_path = str(tmp_path / "http_locked.sqlite3")
+    try:
+        server = AmosHTTPServer(("127.0.0.1", 0), db_path)
+    except PermissionError as exc:
+        pytest.skip(f"loopback sockets unavailable in this sandbox: {exc}")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def locked_commit(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    server.amos.commit_atom = locked_commit
+    try:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            http_json(
+                f"{base}/v1/atoms:commit",
+                {
+                    "atom": {
+                        "id": "http_locked_atom",
+                        "type": "belief",
+                        "payload": {"claim": "lock handling works"},
+                    }
+                },
+            )
+        assert excinfo.value.code == 503
+        payload = json.loads(excinfo.value.read().decode("utf-8"))
+        assert payload["status"] == "error"
+        assert payload["retryable"] is True
+        assert "database is locked" in payload["error"]
     finally:
         server.shutdown()
         server.server_close()
