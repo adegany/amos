@@ -3432,6 +3432,7 @@ atom_merged
 memories_distilled
 steward_run
 maintenance_distillation_run
+storage_cleanup_run
 memory_policy_run
 ```
 
@@ -4854,8 +4855,9 @@ SMP authority:
 automatic memory policy:
   background worker ticks and explicit operator runs perform deterministic
   maintenance, create provenance-linked distilled atoms, refresh derived
-  indexes, invalidate packet cache, persist policy state, and journal
-  memory_policy_run events without an LLM
+  indexes, remove expired cold atoms, compact SQLite storage when idle,
+  invalidate packet cache, persist policy state, and journal memory_policy_run
+  events without an LLM
 ```
 
 ### 29.11 V1 automatic memory policy
@@ -4913,6 +4915,29 @@ decay:
   mark_stale_after_seconds: null
   archive_after_seconds: null
   low_utility_threshold: null
+
+storage_cleanup:
+  enabled: true
+  trigger: idle
+  idle_after_seconds: 300
+  min_interval_seconds: 900
+  max_deletions_per_tick: 256
+  remove_archived_from_hot_index: true
+  remove_stale_from_hot_index: true
+  delete_archived_after_seconds: 604800
+  delete_stale_after_seconds: 1209600
+  protected_types:
+    policy
+    self_model
+    commitment
+  compact_idempotency_after_seconds: 604800
+  max_idempotency_compactions_per_tick: 512
+  sqlite_compaction:
+    checkpoint_wal: true
+    checkpoint_mode: TRUNCATE
+    vacuum_enabled: true
+    vacuum_idle_after_seconds: 1800
+    vacuum_min_interval_seconds: 86400
 ```
 
 The v1 HTTP service starts a background memory-policy worker. Foreground
@@ -4949,6 +4974,13 @@ build a bounded evidence window and run registered maintenance processor packs
 commit only low-risk, policy-allowed proposals such as add_atom distillations
 defer medium/high-risk proposals, health changes, merges, archives, access
   policy changes, and ambiguous claims to explicit review
+prune archived/stale atoms from hot retrieval indexes during idle cleanup
+delete expired archived/stale atoms through normal tombstone and journal
+  projection paths while preserving protected types
+compact old idempotency responses so duplicate-response cache rows do not
+  dominate the hot SQLite file
+checkpoint the SQLite WAL and run VACUUM only after the configured idle window
+  and compaction interval
 refresh rebuildable derived-index metadata
 invalidate packet cache
 persist memory_policy_state
@@ -4963,6 +4995,15 @@ rules include `expires_at`, `retain_until`, `mark_stale_after_seconds`,
 Applied decay actions are journaled as `decay_policy_applied`, update atom
 version/health/lifecycle state, refresh derived token rows, and invalidate packet
 cache.
+
+Storage cleanup is deterministic and idle-triggered, not size-triggered by
+default. It removes archived/stale atoms from the hot token index immediately
+when the cleanup tick is due, then deletes archived/stale atoms only after their
+configured retention windows. Deletion uses the same deleted lifecycle,
+tombstones, edge deletion, packet-cache invalidation, and replay projection model
+as explicit `atom_deleted` operations. The event journal remains logically
+append-only; v1-local physical compaction trims derived/cache storage with
+idempotency-response slimming, `PRAGMA wal_checkpoint`, and SQLite `VACUUM`.
 
 V1-local policy execution profile:
 

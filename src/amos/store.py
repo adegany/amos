@@ -388,6 +388,61 @@ class SQLiteStore:
             (actor, key, payload_digest, event_id, canonical_json(response), utc_now()),
         )
 
+    def compact_idempotency_responses(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        older_than: str,
+        max_rows: int,
+    ) -> dict[str, Any]:
+        max_rows = max(0, int(max_rows))
+        if max_rows <= 0:
+            return {"status": "skipped", "reason": "max_rows_zero", "rows": 0}
+        rows = conn.execute(
+            """
+            SELECT actor, idempotency_key, payload_digest, event_id, response_json
+            FROM amos_idempotency
+            WHERE created_at < ?
+              AND response_json NOT LIKE '%"storage_compacted":true%'
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (older_than, max_rows),
+        ).fetchall()
+        compacted = 0
+        original_bytes = 0
+        compacted_bytes = 0
+        compacted_at = utc_now()
+        for row in rows:
+            response_json = row["response_json"] or ""
+            original_bytes += len(response_json.encode("utf-8"))
+            compact_response = {
+                "status": "compacted",
+                "storage_compacted": True,
+                "event_id": row["event_id"],
+                "payload_digest": row["payload_digest"],
+                "original_response_bytes": len(response_json.encode("utf-8")),
+                "compacted_at": compacted_at,
+            }
+            encoded = canonical_json(compact_response)
+            compacted_bytes += len(encoded.encode("utf-8"))
+            conn.execute(
+                """
+                UPDATE amos_idempotency
+                SET response_json = ?
+                WHERE actor = ? AND idempotency_key = ?
+                """,
+                (encoded, row["actor"], row["idempotency_key"]),
+            )
+            compacted += 1
+        return {
+            "status": "completed",
+            "rows": compacted,
+            "original_response_bytes": original_bytes,
+            "compacted_response_bytes": compacted_bytes,
+            "saved_bytes": max(0, original_bytes - compacted_bytes),
+        }
+
     def insert_evidence(
         self, conn: sqlite3.Connection, evidence: Mapping[str, Any], event_id: str
     ) -> None:
@@ -522,6 +577,53 @@ class SQLiteStore:
             """,
             [(atom_id, token) for token in tokens],
         )
+
+    def delete_atom_text_index(self, conn: sqlite3.Connection, atom_id: str) -> int:
+        cursor = conn.execute(
+            "DELETE FROM amos_atom_text_index WHERE atom_id = ?",
+            (str(atom_id),),
+        )
+        return int(cursor.rowcount or 0)
+
+    def prune_atom_text_index(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        lifecycle_states: list[str] | None = None,
+        health_statuses: list[str] | None = None,
+    ) -> dict[str, Any]:
+        predicates = []
+        params: list[Any] = []
+        lifecycle_states = [str(item) for item in lifecycle_states or []]
+        health_statuses = [str(item) for item in health_statuses or []]
+        if lifecycle_states:
+            placeholders = ",".join("?" for _ in lifecycle_states)
+            predicates.append(f"a.lifecycle_state IN ({placeholders})")
+            params.extend(lifecycle_states)
+        if health_statuses:
+            placeholders = ",".join("?" for _ in health_statuses)
+            predicates.append(f"a.health_status IN ({placeholders})")
+            params.extend(health_statuses)
+        if not predicates:
+            return {"status": "skipped", "reason": "no_prune_criteria", "rows": 0}
+        cursor = conn.execute(
+            f"""
+            DELETE FROM amos_atom_text_index
+            WHERE atom_id IN (
+                SELECT i.atom_id
+                FROM amos_atom_text_index i
+                JOIN amos_atoms a ON a.id = i.atom_id
+                WHERE {' OR '.join(predicates)}
+            )
+            """,
+            tuple(params),
+        )
+        return {
+            "status": "completed",
+            "rows": int(cursor.rowcount or 0),
+            "lifecycle_states": lifecycle_states,
+            "health_statuses": health_statuses,
+        }
 
     def _atom_text_index_tokens(self, atom: Mapping[str, Any]) -> set[str]:
         tokens: set[str] = set()
@@ -987,6 +1089,36 @@ class SQLiteStore:
             params = (max(0, int(limit)),)
         rows = self.conn.execute(query, params).fetchall()
         return [self._row_dict(row) for row in rows]
+
+    def checkpoint_wal(self, *, mode: str = "TRUNCATE") -> dict[str, Any]:
+        safe_mode = str(mode or "TRUNCATE").upper()
+        if safe_mode not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
+            safe_mode = "TRUNCATE"
+        row = self.conn.execute(f"PRAGMA wal_checkpoint({safe_mode})").fetchone()
+        values = list(row) if row is not None else []
+        return {
+            "status": "completed",
+            "mode": safe_mode,
+            "busy": int(values[0]) if len(values) > 0 and values[0] is not None else None,
+            "log_pages": int(values[1]) if len(values) > 1 and values[1] is not None else None,
+            "checkpointed_pages": int(values[2])
+            if len(values) > 2 and values[2] is not None
+            else None,
+        }
+
+    def vacuum(self) -> dict[str, Any]:
+        before_page_count = self.conn.execute("PRAGMA page_count").fetchone()[0]
+        before_freelist = self.conn.execute("PRAGMA freelist_count").fetchone()[0]
+        self.conn.execute("VACUUM")
+        after_page_count = self.conn.execute("PRAGMA page_count").fetchone()[0]
+        after_freelist = self.conn.execute("PRAGMA freelist_count").fetchone()[0]
+        return {
+            "status": "completed",
+            "page_count_before": int(before_page_count),
+            "page_count_after": int(after_page_count),
+            "freelist_count_before": int(before_freelist),
+            "freelist_count_after": int(after_freelist),
+        }
 
     def event_count(self) -> int:
         row = self.conn.execute(

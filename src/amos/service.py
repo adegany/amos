@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import re
 import json
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -104,6 +104,27 @@ DEFAULT_MEMORY_POLICY = {
         "mark_stale_after_seconds": None,
         "archive_after_seconds": None,
         "low_utility_threshold": None,
+    },
+    "storage_cleanup": {
+        "enabled": True,
+        "trigger": "idle",
+        "idle_after_seconds": 300,
+        "min_interval_seconds": 900,
+        "max_deletions_per_tick": 256,
+        "remove_archived_from_hot_index": True,
+        "remove_stale_from_hot_index": True,
+        "delete_archived_after_seconds": 604800,
+        "delete_stale_after_seconds": 1209600,
+        "protected_types": ["policy", "self_model", "commitment"],
+        "compact_idempotency_after_seconds": 604800,
+        "max_idempotency_compactions_per_tick": 512,
+        "sqlite_compaction": {
+            "checkpoint_wal": True,
+            "checkpoint_mode": "TRUNCATE",
+            "vacuum_enabled": True,
+            "vacuum_idle_after_seconds": 1800,
+            "vacuum_min_interval_seconds": 86400,
+        },
     },
 }
 SEARCH_INDEX_REF = "amos.v1.search"
@@ -257,6 +278,7 @@ class Amos:
         distillation: Mapping[str, Any] | None = None,
         maintenance_distiller: Mapping[str, Any] | None = None,
         decay: Mapping[str, Any] | None = None,
+        storage_cleanup: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         policy = self.memory_policy()
         if enabled is not None:
@@ -277,6 +299,21 @@ class Amos:
             }
         if decay is not None:
             policy["decay"] = {**policy["decay"], **dict(decay)}
+        if storage_cleanup is not None:
+            cleanup = dict(policy["storage_cleanup"])
+            for key, value in dict(storage_cleanup).items():
+                if (
+                    key == "sqlite_compaction"
+                    and isinstance(value, Mapping)
+                    and isinstance(cleanup.get("sqlite_compaction"), Mapping)
+                ):
+                    cleanup["sqlite_compaction"] = {
+                        **dict(cleanup["sqlite_compaction"]),
+                        **dict(value),
+                    }
+                else:
+                    cleanup[key] = value
+            policy["storage_cleanup"] = cleanup
         policy = self._normalize_memory_policy(policy)
         self.store.set_meta("memory_policy", canonical_json(policy))
         return {
@@ -307,6 +344,14 @@ class Amos:
             "due": due,
             "graph_version": self.store.graph_version(),
         }
+
+    def _mark_foreground_activity(self, actor: str | None = None) -> None:
+        if actor and str(actor).startswith("svc:"):
+            return
+        try:
+            self.store.set_meta("last_foreground_activity_at", utc_now())
+        except Exception:
+            pass
 
     def _search_text_for_atom(self, atom: Mapping[str, Any]) -> str:
         return (
@@ -503,6 +548,18 @@ class Amos:
                         target_refs.append(atom["id"])
                     target_refs.extend(committed.get("source_refs", []))
 
+            storage_cleanup = policy["storage_cleanup"]
+            if storage_cleanup["enabled"] and due.get("storage_cleanup", {}).get("due"):
+                results["storage_cleanup"] = self._run_storage_cleanup(
+                    cleanup=storage_cleanup,
+                    due=due["storage_cleanup"],
+                    scope=scope,
+                    actor=actor,
+                    state=state,
+                    force=force,
+                )
+                target_refs.extend(results["storage_cleanup"].get("deleted_atom_refs", []))
+
             policy_event_graph_version = self.store.graph_version() + 1
             if maintenance["enabled"] and maintenance["rebuild_indexes"]:
                 results["index"] = self._rebuild_derived_indexes(
@@ -557,6 +614,13 @@ class Amos:
                                 ).get("committed", [])
                                 if committed.get("atom")
                             ],
+                            "last_storage_cleanup_at": self.store.get_meta(
+                                "last_storage_cleanup_at"
+                            ),
+                            "last_vacuum_at": self.store.get_meta("last_vacuum_at"),
+                            "last_foreground_activity_at": self.store.get_meta(
+                                "last_foreground_activity_at"
+                            ),
                         }
                     ),
                 )
@@ -585,6 +649,7 @@ class Amos:
         access_policy: Mapping[str, Any] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        self._mark_foreground_activity(actor)
         request_payload = {
             "operation": "capture_event",
             "source_type": source_type,
@@ -630,6 +695,7 @@ class Amos:
         idempotency_key: str | None = None,
         authorization_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self._mark_foreground_activity(actor)
         request_payload = {"operation": "commit_atom", "atom": dict(atom)}
         normalized = self._prepare_committed_atom(atom)
         with self.store.transaction() as conn:
@@ -684,6 +750,7 @@ class Amos:
         actor: str = "system",
         scope: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self._mark_foreground_activity(actor)
         proposals = []
         for candidate in candidates:
             atom = dict(candidate)
@@ -704,6 +771,7 @@ class Amos:
         *,
         actor: str = "system",
     ) -> dict[str, Any]:
+        self._mark_foreground_activity(actor)
         prepared = [self._prepare_committed_atom(atom) for atom in atoms]
         seen_ids: set[str] = set()
         for atom in prepared:
@@ -767,6 +835,7 @@ class Amos:
         authorization_context: Mapping[str, Any] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        self._mark_foreground_activity(actor)
         op_payload = {
             "operation": "update_atom",
             "atom_id": atom_id,
@@ -881,6 +950,7 @@ class Amos:
         authorization_context: Mapping[str, Any] | None = None,
         recreation_policy: str = "block_recreate",
     ) -> dict[str, Any]:
+        self._mark_foreground_activity(actor)
         op_payload = {
             "operation": "delete_atom",
             "atom_id": atom_id,
@@ -964,6 +1034,7 @@ class Amos:
         authorization_context: Mapping[str, Any] | None = None,
         recreation_policy: str = "block_recreate",
     ) -> dict[str, Any]:
+        self._mark_foreground_activity(requested_by)
         result = self.delete_atom(
             target_ref,
             reason=reason,
@@ -1104,6 +1175,7 @@ class Amos:
         attention_context: Mapping[str, Any] | None = None,
         run_policy: bool = True,
     ) -> dict[str, Any]:
+        self._mark_foreground_activity(requester)
         if run_policy:
             self.run_memory_policy(trigger="retrieve_packet", scope=scope or {})
         profile = DEFAULT_PACKET_PROFILES.get(
@@ -1316,6 +1388,7 @@ class Amos:
         request: Mapping[str, Any],
         outcome: Mapping[str, Any],
     ) -> dict[str, Any]:
+        self._mark_foreground_activity(str(request.get("requester") or "system"))
         with self.store.transaction() as conn:
             record = self.store.insert_retrieval_outcome(
                 conn, packet_id=packet_id, request=request, outcome=outcome
@@ -2984,6 +3057,7 @@ class Amos:
                 "steward_run",
                 "retrieval_outcome_recorded",
                 "decay_policy_applied",
+                "storage_cleanup_run",
             }:
                 for atom in payload.get("projected_atoms", []):
                     if atom.get("deleted"):
@@ -2995,6 +3069,8 @@ class Amos:
                         edges.pop(edge["edge_id"], None)
                     else:
                         edges[edge["edge_id"]] = edge
+                for tombstone in payload.get("tombstones", []):
+                    tombstones[tombstone["target_ref"]] = tombstone
         return {
             "graph_version": self.store.graph_version(),
             "atoms": atoms,
@@ -3446,8 +3522,25 @@ class Amos:
                 "distillation",
                 "maintenance_distiller",
                 "decay",
+                "storage_cleanup",
             } and isinstance(value, Mapping):
-                normalized[key].update(dict(value))
+                if key == "storage_cleanup":
+                    cleanup = dict(normalized[key])
+                    for cleanup_key, cleanup_value in dict(value).items():
+                        if (
+                            cleanup_key == "sqlite_compaction"
+                            and isinstance(cleanup_value, Mapping)
+                            and isinstance(cleanup.get("sqlite_compaction"), Mapping)
+                        ):
+                            cleanup["sqlite_compaction"] = {
+                                **dict(cleanup["sqlite_compaction"]),
+                                **dict(cleanup_value),
+                            }
+                        else:
+                            cleanup[cleanup_key] = cleanup_value
+                    normalized[key] = cleanup
+                else:
+                    normalized[key].update(dict(value))
             else:
                 normalized[key] = value
         normalized["enabled"] = bool(normalized.get("enabled", True))
@@ -3526,6 +3619,50 @@ class Amos:
                 decay[key] = max(0.0, min(1.0, float(value)))
             else:
                 decay[key] = max(0, int(value))
+        cleanup = normalized["storage_cleanup"]
+        cleanup["enabled"] = bool(cleanup.get("enabled", True))
+        cleanup["trigger"] = str(cleanup.get("trigger") or "idle")
+        if cleanup["trigger"] != "idle":
+            cleanup["trigger"] = "idle"
+        for key, default in (
+            ("idle_after_seconds", 300),
+            ("min_interval_seconds", 900),
+            ("max_deletions_per_tick", 256),
+            ("max_idempotency_compactions_per_tick", 512),
+        ):
+            cleanup[key] = max(0, int(cleanup.get(key, default) or 0))
+        for key, default in (
+            ("delete_archived_after_seconds", 604800),
+            ("delete_stale_after_seconds", 1209600),
+            ("compact_idempotency_after_seconds", 604800),
+        ):
+            value = cleanup.get(key, default)
+            cleanup[key] = None if value in (None, "") else max(0, int(value))
+        cleanup["remove_archived_from_hot_index"] = bool(
+            cleanup.get("remove_archived_from_hot_index", True)
+        )
+        cleanup["remove_stale_from_hot_index"] = bool(
+            cleanup.get("remove_stale_from_hot_index", True)
+        )
+        cleanup["protected_types"] = sorted(
+            {str(item) for item in cleanup.get("protected_types", [])}
+        )
+        sqlite_compaction = dict(cleanup.get("sqlite_compaction") or {})
+        checkpoint_mode = str(sqlite_compaction.get("checkpoint_mode") or "TRUNCATE").upper()
+        if checkpoint_mode not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
+            checkpoint_mode = "TRUNCATE"
+        cleanup["sqlite_compaction"] = {
+            "checkpoint_wal": bool(sqlite_compaction.get("checkpoint_wal", True)),
+            "checkpoint_mode": checkpoint_mode,
+            "vacuum_enabled": bool(sqlite_compaction.get("vacuum_enabled", True)),
+            "vacuum_idle_after_seconds": max(
+                0, int(sqlite_compaction.get("vacuum_idle_after_seconds", 1800) or 0)
+            ),
+            "vacuum_min_interval_seconds": max(
+                0,
+                int(sqlite_compaction.get("vacuum_min_interval_seconds", 86400) or 0),
+            ),
+        }
         return normalized
 
     def _memory_policy_state(self) -> dict[str, Any]:
@@ -3539,6 +3676,13 @@ class Amos:
                 "last_due_reasons": [],
                 "last_distilled_refs": [],
                 "last_maintenance_distiller_refs": [],
+                "last_storage_cleanup_at": self.store.get_meta(
+                    "last_storage_cleanup_at"
+                ),
+                "last_vacuum_at": self.store.get_meta("last_vacuum_at"),
+                "last_foreground_activity_at": self.store.get_meta(
+                    "last_foreground_activity_at"
+                ),
             }
         try:
             data = json.loads(raw)
@@ -3549,12 +3693,20 @@ class Amos:
             "last_graph_version": int(data.get("last_graph_version", 0) or 0),
             "last_trigger": data.get("last_trigger"),
             "last_event_id": data.get("last_event_id"),
-                "last_due_reasons": list(data.get("last_due_reasons", [])),
-                "last_distilled_refs": list(data.get("last_distilled_refs", [])),
-                "last_maintenance_distiller_refs": list(
-                    data.get("last_maintenance_distiller_refs", [])
-                ),
-            }
+            "last_due_reasons": list(data.get("last_due_reasons", [])),
+            "last_distilled_refs": list(data.get("last_distilled_refs", [])),
+            "last_maintenance_distiller_refs": list(
+                data.get("last_maintenance_distiller_refs", [])
+            ),
+            "last_storage_cleanup_at": self.store.get_meta("last_storage_cleanup_at")
+            or data.get("last_storage_cleanup_at"),
+            "last_vacuum_at": self.store.get_meta("last_vacuum_at")
+            or data.get("last_vacuum_at"),
+            "last_foreground_activity_at": self.store.get_meta(
+                "last_foreground_activity_at"
+            )
+            or data.get("last_foreground_activity_at"),
+        }
 
     def _memory_policy_journal_results(
         self, results: Mapping[str, Any]
@@ -3569,6 +3721,8 @@ class Amos:
                 journal[key] = self._summarize_policy_distillation_result(value)
             elif key == "maintenance_distiller" and isinstance(value, Mapping):
                 journal[key] = self._summarize_maintenance_distiller_result(value)
+            elif key == "storage_cleanup" and isinstance(value, Mapping):
+                journal[key] = self._summarize_storage_cleanup_result(value)
             elif key in {"index", "packet_cache"} and isinstance(value, Mapping):
                 journal[key] = dict(value)
             else:
@@ -3698,6 +3852,29 @@ class Amos:
             "event_id": event_ref,
         }
 
+    def _summarize_storage_cleanup_result(
+        self, result: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        event = result.get("event")
+        event_ref = event.get("event_id") if isinstance(event, Mapping) else None
+        index_prune = dict(result.get("index_prune") or {})
+        idempotency = dict(result.get("idempotency") or {})
+        checkpoint = dict(result.get("checkpoint") or {})
+        vacuum = dict(result.get("vacuum") or {})
+        return {
+            "status": result.get("status"),
+            "deleted_atom_count": int(result.get("deleted_atom_count", 0) or 0),
+            "deleted_atom_refs": self._bounded_refs(result.get("deleted_atom_refs", [])),
+            "index_pruned_rows": int(index_prune.get("rows", 0) or 0),
+            "idempotency_compacted_rows": int(idempotency.get("rows", 0) or 0),
+            "idempotency_saved_bytes": int(idempotency.get("saved_bytes", 0) or 0),
+            "checkpoint_status": checkpoint.get("status"),
+            "checkpoint_mode": checkpoint.get("mode"),
+            "vacuum_status": vacuum.get("status"),
+            "vacuum_reason": vacuum.get("reason"),
+            "event_id": event_ref,
+        }
+
     def _count_mapping_values(
         self, rows: Sequence[Mapping[str, Any]], key: str
     ) -> dict[str, int]:
@@ -3760,6 +3937,11 @@ class Amos:
             and graph_delta > 0
         ):
             reasons.append(f"capacity_pressure:{pressure_mode}")
+        storage_cleanup = self._storage_cleanup_due(
+            policy.get("storage_cleanup", {}), state, force=force
+        )
+        if storage_cleanup["due"] and "force" not in reasons:
+            reasons.append("storage_cleanup_idle")
         return {
             "due": bool(reasons),
             "reasons": reasons,
@@ -3768,6 +3950,7 @@ class Amos:
             "graph_delta": graph_delta,
             "elapsed_seconds": elapsed_seconds,
             "pressure_mode": pressure_mode,
+            "storage_cleanup": storage_cleanup,
         }
 
     def _seconds_since(self, timestamp: Any) -> int | None:
@@ -3779,6 +3962,59 @@ class Amos:
             return None
         return max(0, int((datetime.now(timezone.utc) - parsed).total_seconds()))
 
+    def _iso_before_seconds(self, seconds: int) -> str:
+        return (
+            datetime.now(timezone.utc) - timedelta(seconds=max(0, int(seconds)))
+        ).isoformat().replace("+00:00", "Z")
+
+    def _storage_cleanup_due(
+        self,
+        cleanup: Mapping[str, Any],
+        state: Mapping[str, Any],
+        *,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        if not cleanup.get("enabled", True) and not force:
+            return {"due": False, "reason": "storage_cleanup_disabled"}
+        last_foreground = (
+            self.store.get_meta("last_foreground_activity_at")
+            or state.get("last_foreground_activity_at")
+        )
+        idle_elapsed = self._seconds_since(last_foreground)
+        idle_after = int(cleanup.get("idle_after_seconds", 300) or 0)
+        if idle_elapsed is not None and idle_elapsed < idle_after and not force:
+            return {
+                "due": False,
+                "reason": "foreground_activity_recent",
+                "idle_elapsed_seconds": idle_elapsed,
+                "idle_after_seconds": idle_after,
+                "last_foreground_activity_at": last_foreground,
+            }
+        last_cleanup = (
+            self.store.get_meta("last_storage_cleanup_at")
+            or state.get("last_storage_cleanup_at")
+        )
+        cleanup_elapsed = self._seconds_since(last_cleanup)
+        min_interval = int(cleanup.get("min_interval_seconds", 900) or 0)
+        if cleanup_elapsed is not None and cleanup_elapsed < min_interval and not force:
+            return {
+                "due": False,
+                "reason": "cleanup_interval_not_elapsed",
+                "elapsed_since_cleanup_seconds": cleanup_elapsed,
+                "min_interval_seconds": min_interval,
+                "last_storage_cleanup_at": last_cleanup,
+            }
+        return {
+            "due": True,
+            "reason": "force" if force else "idle_interval_elapsed",
+            "idle_elapsed_seconds": idle_elapsed,
+            "idle_after_seconds": idle_after,
+            "last_foreground_activity_at": last_foreground,
+            "elapsed_since_cleanup_seconds": cleanup_elapsed,
+            "min_interval_seconds": min_interval,
+            "last_storage_cleanup_at": last_cleanup,
+        }
+
     def _timestamp_elapsed(self, timestamp: Any) -> bool:
         if not timestamp:
             return False
@@ -3787,6 +4023,234 @@ class Amos:
         except ValueError:
             return False
         return datetime.now(timezone.utc) >= parsed
+
+    def _run_storage_cleanup(
+        self,
+        *,
+        cleanup: Mapping[str, Any],
+        due: Mapping[str, Any],
+        scope: Mapping[str, Any],
+        actor: str,
+        state: Mapping[str, Any],
+        force: bool = False,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        protected_types = {str(item) for item in cleanup.get("protected_types", [])}
+        max_deletions = max(0, int(cleanup.get("max_deletions_per_tick", 256) or 0))
+        projected_atoms: list[dict[str, Any]] = []
+        projected_edges: list[dict[str, Any]] = []
+        tombstones: list[dict[str, Any]] = []
+        actions: list[dict[str, Any]] = []
+        deleted_refs: list[str] = []
+        index_lifecycle_states = (
+            ["archived"] if cleanup.get("remove_archived_from_hot_index", True) else []
+        )
+        index_health_statuses = (
+            ["stale"] if cleanup.get("remove_stale_from_hot_index", True) else []
+        )
+        compact_after = cleanup.get("compact_idempotency_after_seconds")
+        with self.store.transaction() as conn:
+            index_prune = self.store.prune_atom_text_index(
+                conn,
+                lifecycle_states=index_lifecycle_states,
+                health_statuses=index_health_statuses,
+            )
+            atoms = self.store.list_atoms_filtered(
+                include_deleted=False,
+                lifecycle_states=["active", "archived", "proposed"],
+            )
+            for atom in atoms:
+                if len(actions) >= max_deletions:
+                    break
+                if not scope_visible(atom["scope"], scope):
+                    continue
+                if atom["type"] in protected_types:
+                    continue
+                reason = self._storage_deletion_reason(atom, cleanup)
+                if reason is None:
+                    continue
+                updated = dict(atom)
+                updated["lifecycle_state"] = "deleted"
+                updated["health_status"] = "deleted"
+                updated["deleted"] = 1
+                updated["version"] = int(atom["version"]) + 1
+                updated["updated_at"] = now
+                updated["revision_history"] = list(updated["revision_history"])
+                updated["revision_history"].append(
+                    {
+                        "version": atom["version"],
+                        "digest": digest(self._atom_projection(atom)),
+                        "changed_at": now,
+                        "actor": actor,
+                        "reason": reason,
+                    }
+                )
+                updated = normalize_atom(
+                    self._attach_search_index(updated), require_id=True
+                )
+                updated["deleted"] = 1
+                tombstone = self.store.insert_tombstone(
+                    conn,
+                    target_ref=atom["id"],
+                    content_digest=self._memory_identity_digest(atom),
+                    recreation_policy="block_recreate",
+                    reason=reason,
+                )
+                deleted_edges = self.store.mark_edges_deleted_for_ref(conn, atom["id"])
+                self.store.replace_atom(conn, updated)
+                projected_atoms.append(updated)
+                projected_edges.extend(deleted_edges)
+                tombstones.append(tombstone)
+                deleted_refs.append(atom["id"])
+                actions.append(
+                    {
+                        "atom_ref": atom["id"],
+                        "action": "delete",
+                        "reason": reason,
+                        "lifecycle_state_before": atom["lifecycle_state"],
+                        "health_status_before": atom["health_status"],
+                    }
+                )
+            if compact_after is None:
+                idempotency = {
+                    "status": "skipped",
+                    "reason": "idempotency_compaction_disabled",
+                    "rows": 0,
+                }
+            else:
+                idempotency = self.store.compact_idempotency_responses(
+                    conn,
+                    older_than=self._iso_before_seconds(int(compact_after)),
+                    max_rows=int(
+                        cleanup.get("max_idempotency_compactions_per_tick", 512) or 0
+                    ),
+                )
+            if actions or index_prune.get("rows") or idempotency.get("rows"):
+                event = self.store.append_event(
+                    conn,
+                    event_type="storage_cleanup_run",
+                    actor=actor,
+                    payload={
+                        "operation": "run_storage_cleanup",
+                        "policy": dict(cleanup),
+                        "due": dict(due),
+                        "actions": actions,
+                        "index_prune": index_prune,
+                        "idempotency": idempotency,
+                        "projected_atoms": projected_atoms,
+                        "projected_edges": projected_edges,
+                        "tombstones": tombstones,
+                    },
+                    target_refs=deleted_refs,
+                )
+                self.store.clear_packet_cache(conn)
+            else:
+                event = None
+            self.store._set_meta(conn, "last_storage_cleanup_at", now)
+        sqlite_compaction = dict(cleanup.get("sqlite_compaction") or {})
+        checkpoint = {"status": "skipped", "reason": "checkpoint_disabled"}
+        if sqlite_compaction.get("checkpoint_wal", True):
+            try:
+                checkpoint = self.store.checkpoint_wal(
+                    mode=str(sqlite_compaction.get("checkpoint_mode") or "TRUNCATE")
+                )
+            except Exception as exc:
+                checkpoint = {"status": "error", "error": str(exc)}
+        vacuum = self._maybe_vacuum_sqlite(
+            sqlite_compaction=sqlite_compaction,
+            state=state,
+            force=force,
+        )
+        checkpoint_after_vacuum = {"status": "skipped", "reason": "vacuum_not_completed"}
+        if (
+            sqlite_compaction.get("checkpoint_wal", True)
+            and vacuum.get("status") == "completed"
+        ):
+            try:
+                checkpoint_after_vacuum = self.store.checkpoint_wal(
+                    mode=str(sqlite_compaction.get("checkpoint_mode") or "TRUNCATE")
+                )
+            except Exception as exc:
+                checkpoint_after_vacuum = {"status": "error", "error": str(exc)}
+        return {
+            "status": "completed",
+            "due": dict(due),
+            "index_prune": index_prune,
+            "deleted_atom_count": len(actions),
+            "deleted_atom_refs": deleted_refs,
+            "idempotency": idempotency,
+            "checkpoint": checkpoint,
+            "vacuum": vacuum,
+            "checkpoint_after_vacuum": checkpoint_after_vacuum,
+            "event": event,
+        }
+
+    def _storage_deletion_reason(
+        self, atom: Mapping[str, Any], cleanup: Mapping[str, Any]
+    ) -> str | None:
+        if atom.get("deleted"):
+            return None
+        updated_age = self._seconds_since(
+            atom.get("last_accessed") or atom.get("updated_at") or atom.get("observed_at")
+        )
+        archived_after = cleanup.get("delete_archived_after_seconds")
+        if (
+            archived_after is not None
+            and atom.get("lifecycle_state") == "archived"
+            and updated_age is not None
+            and updated_age >= int(archived_after)
+        ):
+            return "storage_cleanup_archived_retention_elapsed"
+        stale_after = cleanup.get("delete_stale_after_seconds")
+        if (
+            stale_after is not None
+            and atom.get("health_status") == "stale"
+            and updated_age is not None
+            and updated_age >= int(stale_after)
+        ):
+            return "storage_cleanup_stale_retention_elapsed"
+        return None
+
+    def _maybe_vacuum_sqlite(
+        self,
+        *,
+        sqlite_compaction: Mapping[str, Any],
+        state: Mapping[str, Any],
+        force: bool,
+    ) -> dict[str, Any]:
+        if not sqlite_compaction.get("vacuum_enabled", True):
+            return {"status": "skipped", "reason": "vacuum_disabled"}
+        idle_after = int(sqlite_compaction.get("vacuum_idle_after_seconds", 1800) or 0)
+        last_foreground = (
+            self.store.get_meta("last_foreground_activity_at")
+            or state.get("last_foreground_activity_at")
+        )
+        idle_elapsed = self._seconds_since(last_foreground)
+        if idle_elapsed is not None and idle_elapsed < idle_after and not force:
+            return {
+                "status": "skipped",
+                "reason": "foreground_activity_recent",
+                "idle_elapsed_seconds": idle_elapsed,
+                "idle_after_seconds": idle_after,
+            }
+        min_interval = int(sqlite_compaction.get("vacuum_min_interval_seconds", 86400) or 0)
+        last_vacuum = self.store.get_meta("last_vacuum_at") or state.get("last_vacuum_at")
+        vacuum_elapsed = self._seconds_since(last_vacuum)
+        if vacuum_elapsed is not None and vacuum_elapsed < min_interval and not force:
+            return {
+                "status": "skipped",
+                "reason": "vacuum_interval_not_elapsed",
+                "elapsed_since_vacuum_seconds": vacuum_elapsed,
+                "min_interval_seconds": min_interval,
+                "last_vacuum_at": last_vacuum,
+            }
+        try:
+            result = self.store.vacuum()
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+        completed_at = utc_now()
+        self.store.set_meta("last_vacuum_at", completed_at)
+        return {**result, "completed_at": completed_at}
 
     def _run_decay_policy(
         self,
@@ -4177,6 +4641,18 @@ class Amos:
         with self.store.transaction() as conn:
             for atom in self.store.list_atoms_filtered(include_deleted=True):
                 self.store.replace_atom_text_index(conn, atom)
+            cleanup = self.memory_policy().get("storage_cleanup", {})
+            pruned_index = {"status": "skipped", "reason": "storage_cleanup_disabled"}
+            if cleanup.get("enabled", True):
+                pruned_index = self.store.prune_atom_text_index(
+                    conn,
+                    lifecycle_states=["archived"]
+                    if cleanup.get("remove_archived_from_hot_index", True)
+                    else [],
+                    health_statuses=["stale"]
+                    if cleanup.get("remove_stale_from_hot_index", True)
+                    else [],
+                )
             lexical = self.store.upsert_derived_index_metadata(
                 conn,
                 index_name="semantic_lexical_vectors",
@@ -4188,6 +4664,7 @@ class Amos:
                     "processor_id": self.smp.processor_id,
                     "rebuildable_from_canonical": True,
                     "maintained_by": "memory_policy",
+                    "hot_index_prune": pruned_index,
                 },
             )
             graph = self.store.upsert_derived_index_metadata(

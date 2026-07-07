@@ -133,6 +133,7 @@ def _parser() -> argparse.ArgumentParser:
     memory_policy.add_argument("--distillation", default="{}")
     memory_policy.add_argument("--maintenance-distiller", default="{}")
     memory_policy.add_argument("--decay", default="{}")
+    memory_policy.add_argument("--storage-cleanup", default="{}")
     memory_policy.add_argument("--run", action="store_true")
     memory_policy.add_argument("--force", action="store_true")
     memory_policy.add_argument("--trigger", default="cli")
@@ -307,6 +308,7 @@ def _memory_policy(amos: Amos, args: argparse.Namespace) -> dict[str, Any]:
             distillation=parse_json_arg(args.distillation),
             maintenance_distiller=parse_json_arg(args.maintenance_distiller),
             decay=parse_json_arg(args.decay),
+            storage_cleanup=parse_json_arg(args.storage_cleanup),
         )
     if args.run:
         return amos.run_memory_policy(

@@ -108,7 +108,8 @@ in-process SQLite store and serializes access through the service boundary:
 - Provenance-linked deterministic memory distillation.
 - Automatic memory policy scheduling with a background HTTP-service worker for
   deterministic distillation, SMP, stewardship, processor-pack distillation,
-  decay-policy execution, derived-index refresh, and packet-cache invalidation.
+  decay-policy execution, storage cleanup, SQLite compaction, derived-index
+  refresh, and packet-cache invalidation.
 - Deterministic non-generative Semantic Maintenance Processor (SMP) outputs
   using the required audit envelope.
 - Generic maintenance proposal records, a processor registry, and a policy gate
@@ -119,6 +120,10 @@ in-process SQLite store and serializes access through the service boundary:
 - Advisory maintenance for deduplication and contradiction marking, with
   high-risk mutation requests gated behind explicit approval.
 - Capacity pressure reporting and degraded packet disclosure.
+- Idle-triggered storage cleanup that prunes archived/stale atoms from the hot
+  token index, deletes expired archived/stale atoms through journaled
+  tombstones, compacts old idempotency responses, checkpoints WAL, and runs
+  SQLite `VACUUM` on a bounded interval.
 - Journal chain and replay verification.
 - Worker artifacts for background memory policy ticks, projection checks, index
   maintenance, packet-cache invalidation, capacity governance, stewardship,
@@ -219,6 +224,7 @@ Inspect or tune the automatic memory policy:
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy --configure --schedule '{"every_graph_versions": 10, "every_seconds": 300}'
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy --configure --decay '{"require_atom_policy":true,"max_atoms":256}'
+PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy --configure --storage-cleanup '{"idle_after_seconds":300,"delete_archived_after_seconds":604800,"sqlite_compaction":{"vacuum_min_interval_seconds":86400}}'
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy --run --force --trigger operator_check
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 maintenance-processors
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 maintenance-distiller --domain generic --processor-id amos.maintenance.generic.v1
