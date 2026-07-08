@@ -281,6 +281,31 @@ bounded AMOS evidence windows and return side-effect-free proposals; the AMOS
 service applies policy gates, journals accepted low-risk mutations, and defers
 ambiguous or high-risk work for review.
 
+### Client integration lessons
+
+AMOS works best when clients treat it as a shared memory plane, not a prompt
+log. A coordinated agent system should run one logical AMOS instance, give each
+role a stable identity, and retrieve bounded packets for the current role, task,
+scope, and runtime state.
+
+Recommended integration pattern:
+
+- Store raw experiences as evidence-backed traces, outcomes, corrections, and
+  retrieval outcomes.
+- Use client-owned maintenance processor packs to promote repeated experiences
+  into compact capability, limitation, semantic, or procedure atoms.
+- Keep static role contracts, current runtime state, and learned experience
+  profile atoms separate in prompt rendering.
+- Treat retrieved memories as advisory context. Application control registries,
+  permissions, schemas, and safety guardrails remain hard authority.
+- Record whether retrieved memories were materially used. Retrieved-but-uncited
+  context should be neutral telemetry, not positive reinforcement.
+- Render concise operational digests for agents and retain full packets in
+  telemetry for audit.
+
+This keeps AMOS generic while allowing client systems to learn domain-specific
+behavior from their own traces.
+
 ## Design goals
 
 - Reduce long-term storage and token cost.

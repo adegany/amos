@@ -1414,6 +1414,49 @@ RuntimeStateSnapshot
 
 Runtime state should be treated as high-volatility evidence. It may generate durable atoms only when repeated, policy-relevant, or explicitly committed.
 
+#### 7.13.4.1 Experience-derived profile updates
+
+Repeated role experiences may update an agent's self-model, but they should not
+overwrite the static self-model contract. They should be represented as ordinary
+canonical atoms, usually `capability`, `limitation`, `procedure`, or `semantic`
+atoms with explicit provenance back to action outcomes and retrieval outcomes.
+
+Recommended payload fields for experience-derived capability and limitation
+atoms:
+
+```text
+profile_update_source:
+  identifies the client processor or experience source
+
+subject_agent / agent_id:
+  role identity whose profile is being updated
+
+experience_kind:
+  action, decision, review, tool use, recovery, planning, or other client term
+
+outcome_category:
+  capability | limitation | procedure | observation
+
+source_count:
+  number of related experiences supporting the update
+
+recent_source_refs:
+  bounded refs to recent source traces or outcomes
+
+supported_count / failed_count:
+  aggregate outcome counts when available
+
+reuse_guidance:
+  concise instruction for when the learned profile item should influence a
+  future decision
+```
+
+Experience-derived profile atoms must remain separate from bootstrap contract
+atoms. Bootstrap logic may archive old static profile versions, but it must not
+archive learned profile updates solely because they lack the current static
+profile version. Learned profile updates are maintained by their source
+processor, retrieval outcomes, health state, and stewardship policy.
+
 #### 7.13.5 SelfAssessmentRecord
 
 Represents an introspective evaluation of recent agent behavior.
@@ -2038,6 +2081,14 @@ low utility
 ```
 
 Retrieval telemetry is a maintenance signal.
+
+Retrieval telemetry must not imply that every retrieved atom helped. A packet
+item that was present in context but did not materially affect the decision
+should be recorded as neutral exposure, for example `label = observed` and
+`use_status = context_only`. Only memories that changed the answer, selected
+field, safety decision, or explanation should receive positive helpful refs.
+Memories that caused or contributed to a bad decision should receive correction
+or unhelpful refs.
 
 ---
 
@@ -2926,7 +2977,9 @@ POST /v1/packets:retrieve
   cacheable by request digest and graph_version when no policy mutation is required
 
 POST /v1/retrieval-outcomes
-  request payload: packet_id, used_item_refs, outcome labels, correction refs
+  request payload: packet_id, original retrieval request, outcome labels,
+  used_item_refs, helpful_atom_refs, correction_refs, unhelpful_atom_refs,
+  optional use_status such as used, context_only, ignored, or unused
   response payload: retrieval outcome record refs and created_at
   consistency: eventual
 
@@ -3058,6 +3111,64 @@ capacity_limited
 projection_failed
 derived_index_stale
 ```
+
+#### 25.1.1 Client integration contract
+
+AMOS owns canonical memory semantics, lifecycle, maintenance, retrieval
+diagnostics, and audit. Client systems own domain interpretation, runtime
+authority, prompt rendering, and domain-specific maintenance processors.
+
+A production client should treat AMOS as a memory service, not as a prompt log:
+
+```text
+client responsibilities:
+  capture evidence-backed traces, outcomes, corrections, and runtime state
+  retrieve bounded role/task/scope packets
+  render concise operational prompt digests from packets
+  enforce application schemas, permissions, control registries, and guardrails
+  record whether retrieved memories were materially used
+  keep full packets and rendered prompts in client telemetry for audit
+
+AMOS responsibilities:
+  validate and journal canonical records
+  retrieve scope- and access-filtered packets
+  disclose omissions, conflicts, degradation, and attention traces
+  update utility/salience from retrieval outcomes
+  run deterministic maintenance and registered processor packs
+  commit low-risk derived memories through policy gates
+```
+
+Client-specific cleanup and learning should live in client packages as
+registered maintenance processors. For example, a training harness, coding
+agent, or support bot may promote recurring role experiences into capability,
+limitation, procedure, or semantic atoms. AMOS should provide the generic
+proposal and policy machinery; it should not encode that client's domain rules
+in core.
+
+Prompt rendering should keep these sources distinct:
+
+```text
+static contract:
+  bootstrap role description, stable policy text, schema requirements
+
+self-awareness packet:
+  current self-model, capabilities, limitations, commitments, runtime state
+
+experience profile:
+  recurring demonstrated capabilities, recurring limitations, and reuse
+  guidance distilled from action outcomes
+
+retrieved memory packet:
+  task-specific prior memories, policies, counterevidence, and citation
+  candidates selected for the current decision
+```
+
+The generated prompt should be compact and operational. More memory is not
+better when it causes the model to ignore current task authority or turns AMOS
+into a logging sink. The model should cite atom refs only when a memory
+materially changes a decision, selected field, explanation, or safety check. If
+memory was retrieved but not used, the client should record neutral
+`context_only` telemetry instead of positive retrieval feedback.
 
 ### 25.2 Client identity and capabilities
 
@@ -5116,6 +5227,11 @@ agents: integrations write typed atoms and evidence into shared AMOS; client
 processors inspect those canonical records; low-risk derived memories are
 committed through the shared service policy; high-risk or ambiguous changes
 remain review items.
+
+Processor packs should promote repeated, evidence-backed experiences into
+compact reusable memories rather than copying every source event into a prompt
+surface. Source atoms and evidence remain auditable; the promoted atom carries
+the operational lesson.
 
 V1 local tooling exposes this boundary through the CLI and HTTP service
 constructor. Operators pass external processors as `module:attribute` import

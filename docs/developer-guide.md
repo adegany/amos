@@ -143,15 +143,38 @@ POST /v1/retrieval-outcomes
 ```json
 {
   "packet_id": "pkt_...",
-  "actor": "agent:pilot",
-  "outcome": "used",
-  "used_atom_ids": ["atom_..."],
-  "notes": "cited policy memory in next directive"
+  "request": {
+    "requester": "agent:pilot",
+    "scope": {"project": "qandl", "mission": "performance_search"}
+  },
+  "outcome": {
+    "label": "useful",
+    "used_item_refs": ["atom_..."],
+    "correction_refs": [],
+    "notes": "cited policy memory in next directive"
+  }
 }
 ```
 
 Outcome feedback updates atom access, utility, salience, and health signals. It
 also gives the maintenance worker better evidence for cleanup and ranking.
+
+Distinguish memory exposure from memory use. If an atom was retrieved into a
+prompt but did not materially shape the decision, record that as neutral
+context, not as helpful evidence. A practical convention is:
+
+```json
+{
+  "label": "observed",
+  "use_status": "context_only",
+  "cited_atom_ref": "atom_..."
+}
+```
+
+Use positive labels such as `useful` only for atoms that changed the decision,
+field selection, explanation, or safety check. Use correction or failed labels
+when the retrieved memory contributed to a bad answer, was stale, was
+mis-scoped, or was contradicted by later evidence.
 
 ## 8. Let Amos Maintain Memory
 
@@ -167,6 +190,12 @@ POST /v1/memory-policy:run
 The built-in policy covers deterministic distillation, SMP analysis, low-risk
 maintenance proposals, search-index refresh, decay checks, cache invalidation,
 and capacity governance. It does not require an LLM.
+
+Client-specific cleanup and learning belongs in client processor packs, not in
+AMOS core. A domain processor receives a bounded evidence window and returns
+side-effect-free maintenance proposals. AMOS applies policy gates, commits
+low-risk derived atoms, journals the mutation, and defers ambiguous or high-risk
+work for review.
 
 ## 9. Model Agent Identity As Memory
 
@@ -186,7 +215,52 @@ Retrieve those atoms through role-specific packets instead of hard-coding large
 static prompt blocks. Static context can remain a fallback for startup or Amos
 outage handling.
 
-## 10. Production Checklist
+Do not merge learned experience directly into a static role contract. Keep three
+surfaces separate:
+
+- Durable self-model: stable role, delegated authority, standing commitments.
+- Runtime state: current tool availability, denied capabilities, budgets,
+  active task, and recent errors.
+- Experience profile: recurring demonstrated capabilities, recurring
+  limitations, and reuse guidance distilled from action outcomes.
+
+The experience profile should be compact. Prefer a few promoted capability and
+limitation atoms with source counts, recent source refs, control or task family,
+and reuse guidance over many raw action logs. The agent prompt should see the
+lesson; telemetry should retain the raw packet and evidence for audit.
+
+## 10. Keep Prompt Context Operational
+
+AMOS packets are context inputs, not a license to fill a prompt with every
+available memory. A good integration renders:
+
+- The current role identity and authority.
+- Current runtime constraints and denied capabilities.
+- The active task or mission policy.
+- A small set of materially relevant memories, including counterevidence.
+- Learned experience-profile capabilities and limitations for the role.
+- Citation candidates and a rule for when to cite or explain non-use.
+
+The model should be instructed to cite AMOS atom refs only when a memory
+materially shapes the decision. Otherwise it should record why retrieved memory
+was not used. This avoids false reinforcement and gives maintenance useful
+signal.
+
+## 11. Integration Lessons
+
+- Run one logical Amos instance per coordinated agent system.
+- Give each role a stable `agent_id` and keep per-role self-models separate.
+- Use scopes for tenant, project, run, mission, and agent visibility.
+- Keep static contracts as bootstrap or fallback context; prefer AMOS packets
+  once current self-awareness and mission policy atoms are available.
+- Store raw experiences as evidence-backed traces or outcomes, then promote
+  recurring patterns through maintenance processors.
+- Keep generated prompt digests compact and role-specific.
+- Treat memory retrieval as advisory. Application schemas, permissions,
+  guardrails, and control registries remain hard authority.
+- Persist rendered prompt packets and retrieval outcomes for later audit.
+
+## 12. Production Checklist
 
 - Run one shared Amos service per coordinated agent system.
 - Keep direct database access out of agents.
@@ -195,6 +269,8 @@ outage handling.
 - Retrieve per role, task, and mission with explicit attention context.
 - Enforce application authority outside attention ranking.
 - Record retrieval outcomes.
+- Promote recurring experience into compact learned profile atoms; do not use
+  AMOS as an append-only logging sink.
 - Monitor memory health, capacity health, worker status, and journal verify.
 - Keep packet payloads in telemetry for audit and debugging.
 
