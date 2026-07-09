@@ -18,7 +18,7 @@ from .schemas import (
 )
 
 PROCESSOR_ID = "amos.smp.deterministic"
-PROCESSOR_VERSION = "amos.smp.deterministic.v1"
+PROCESSOR_VERSION = "amos.smp.deterministic.v2"
 
 SMP_REASON_CODES = {
     "capacity_pressure",
@@ -55,10 +55,76 @@ class SemanticMaintenanceProcessor:
     still route mutations through AMOS policy and journal gates.
     """
 
-    def __init__(self, *, dimensions: int = 64):
+    def __init__(
+        self,
+        *,
+        dimensions: int = 64,
+        char_ngram_weight: float = 0.35,
+        latent_weight: float = 0.65,
+    ):
         self.dimensions = dimensions
+        self.char_ngram_weight = max(0.0, float(char_ngram_weight))
+        self.latent_weight = max(0.0, float(latent_weight))
         self.processor_id = PROCESSOR_ID
         self.processor_version = PROCESSOR_VERSION
+        self._idf_by_token: dict[str, float] = {}
+        self._idf_document_count = 0
+        self._idf_graph_version: int | None = None
+        self._latent_by_token: dict[str, list[float]] = {}
+        self._latent_dimensions = 0
+        self._latent_graph_version: int | None = None
+
+    def configure_vector_model(
+        self,
+        *,
+        document_frequencies: Mapping[str, int] | None = None,
+        document_count: int = 0,
+        graph_version: int | None = None,
+        latent_vectors: Mapping[str, Sequence[float]] | None = None,
+        latent_dimensions: int = 0,
+    ) -> None:
+        """Install graph-versioned derived statistics used by encode().
+
+        The SMP stays deterministic: IDF values and latent vectors come from
+        AMOS' own derived token index, and callers decide when to refresh them.
+        """
+
+        document_count = max(0, int(document_count or 0))
+        self._idf_document_count = document_count
+        self._idf_graph_version = graph_version
+        self._idf_by_token = {}
+        if document_count and document_frequencies:
+            for token, frequency in document_frequencies.items():
+                df = max(0, int(frequency or 0))
+                if df <= 0:
+                    continue
+                self._idf_by_token[str(token)] = math.log(
+                    (1.0 + document_count) / (1.0 + df)
+                ) + 1.0
+
+        self._latent_dimensions = max(0, int(latent_dimensions or 0))
+        self._latent_graph_version = graph_version if latent_vectors else None
+        self._latent_by_token = {}
+        if latent_vectors and self._latent_dimensions:
+            for token, vector in latent_vectors.items():
+                values: list[float] = []
+                for value in list(vector)[: self._latent_dimensions]:
+                    try:
+                        values.append(float(value))
+                    except (TypeError, ValueError):
+                        values.append(0.0)
+                if values:
+                    self._latent_by_token[str(token)] = values
+
+    def vector_model_info(self) -> dict[str, Any]:
+        return {
+            "idf_graph_version": self._idf_graph_version,
+            "idf_document_count": self._idf_document_count,
+            "latent_graph_version": self._latent_graph_version,
+            "latent_dimensions": self._latent_dimensions,
+            "word_hashing": "tf_idf",
+            "char_ngrams": [3, 4],
+        }
 
     def encode(self, atom_or_text_span: Mapping[str, Any] | str) -> list[float]:
         if isinstance(atom_or_text_span, Mapping):
@@ -67,7 +133,9 @@ class SemanticMaintenanceProcessor:
                 search_index = index_refs.get("amos.v1.search")
                 if isinstance(search_index, Mapping):
                     vector = search_index.get("vector")
-                    if isinstance(vector, list):
+                    if isinstance(vector, list) and self._stored_vector_matches(
+                        search_index
+                    ):
                         try:
                             return [float(value) for value in vector]
                         except (TypeError, ValueError):
@@ -78,13 +146,36 @@ class SemanticMaintenanceProcessor:
             else atom_text(atom_or_text_span)
         )
         vector = [0.0] * self.dimensions
-        for token, count in Counter(tokens(text)).items():
+        token_counts = Counter(tokens(text))
+        for token, count in token_counts.items():
             slot = int(digest(token), 16) % self.dimensions
-            vector[slot] += 1.0 + math.log(count)
+            tf = 1.0 + math.log(count)
+            weight = tf * self._idf_by_token.get(token, 1.0)
+            vector[slot] += weight
+            latent = self._latent_by_token.get(token)
+            if latent:
+                for index, value in enumerate(latent[: self.dimensions]):
+                    vector[index] += self.latent_weight * weight * value
+        for ngram, count in Counter(character_ngrams(token_counts)).items():
+            slot = int(digest(f"char:{ngram}"), 16) % self.dimensions
+            vector[slot] += self.char_ngram_weight * (1.0 + math.log(count))
         norm = math.sqrt(sum(value * value for value in vector))
         if norm == 0:
             return vector
         return [round(value / norm, 8) for value in vector]
+
+    def _stored_vector_matches(self, search_index: Mapping[str, Any]) -> bool:
+        if self._idf_graph_version is None and self._latent_graph_version is None:
+            return True
+        vector_model = search_index.get("vector_model")
+        if not isinstance(vector_model, Mapping):
+            return False
+        return (
+            vector_model.get("idf_graph_version") == self._idf_graph_version
+            and vector_model.get("latent_graph_version") == self._latent_graph_version
+            and int(vector_model.get("latent_dimensions") or 0)
+            == self._latent_dimensions
+        )
 
     def classify(self, memory_candidate: Mapping[str, Any] | str) -> dict[str, Any]:
         text = memory_candidate if isinstance(memory_candidate, str) else atom_text(memory_candidate)
@@ -392,6 +483,24 @@ def atom_text(atom_or_text: Mapping[str, Any] | str) -> str:
 
 def tokens(text: str) -> list[str]:
     return re.findall(r"[a-z0-9_]+", text.lower())
+
+
+def character_ngrams(token_counts: Mapping[str, int]) -> list[str]:
+    ngrams: list[str] = []
+    for token, count in token_counts.items():
+        if len(token) < 3:
+            continue
+        padded = f"^{token}$"
+        repeat = max(1, int(count or 1))
+        for size in (3, 4):
+            if len(padded) < size:
+                continue
+            ngrams.extend(
+                padded[index : index + size]
+                for index in range(0, len(padded) - size + 1)
+                for _ in range(repeat)
+            )
+    return ngrams
 
 
 def cosine(vector_a: Sequence[float], vector_b: Sequence[float]) -> float:

@@ -92,11 +92,15 @@ in-process SQLite store and serializes access through the service boundary:
   and retrieval outcomes.
 - Rebuildable SQLite token candidate index used to prefilter cue/attention
   retrieval before deterministic in-Python ranking.
+- Graph-versioned SMP vector model with dependency-free TF-IDF lexical hashing,
+  hashed character 3/4-grams for morphology and typo tolerance, and a
+  maintenance-built LSA token projection stored as disposable derived state.
 - Schema validation for envelope/payload separation, typed payload contracts,
   and JSON-compatible atoms.
 - Idempotent capture/commit operations and compare-and-swap update checks.
 - Memory packets with scope isolation, access filtering, omissions, conflicts,
-  provenance, and degradation metadata.
+  provenance, and degradation metadata; normal retrieval omits superseded atoms
+  unless the caller explicitly requests superseded history.
 - Attention-aware packet ranking with explicit focus, type-boost,
   counterevidence, and suppression score components plus packet-level
   `attention_trace` diagnostics.
@@ -108,8 +112,8 @@ in-process SQLite store and serializes access through the service boundary:
 - Provenance-linked deterministic memory distillation.
 - Automatic memory policy scheduling with a background HTTP-service worker for
   deterministic distillation, SMP, stewardship, processor-pack distillation,
-  decay-policy execution, storage cleanup, SQLite compaction, derived-index
-  refresh, and packet-cache invalidation.
+  decay-policy execution, superseded-memory archiving, storage cleanup, SQLite
+  compaction, lexical/LSA derived-index refresh, and packet-cache invalidation.
 - Deterministic non-generative Semantic Maintenance Processor (SMP) outputs
   using the required audit envelope.
 - Generic maintenance proposal records, a processor registry, and a policy gate
@@ -211,6 +215,11 @@ The HTTP service starts a background memory-policy worker. `GET
 inline, while `POST /v1/packets:retrieve` queues a policy tick and returns the
 packet immediately. Explicit `POST /v1/memory-policy:run` and the CLI
 `memory-policy --run` command remain synchronous operator paths.
+
+The stdlib HTTP adapter is the first single-process deployment profile: it owns
+one SQLite store and serializes service calls for correctness. Reader/writer
+parallelism with SQLite WAL or a production database adapter is the scale path
+for heavier concurrent retrieval workloads.
 
 Verify journal replay:
 
@@ -329,8 +338,10 @@ behavior from their own traces.
 ### Storage and Scale
 
 - Add production Postgres support using the existing migration contract.
-- Add optional vector and full-text index integrations while keeping index data
-  rebuildable and non-canonical.
+- Split the v1-local serialized HTTP adapter into reader/writer-safe concurrency
+  when retrieval throughput requires parallel reads.
+- Add optional external vector and full-text index integrations for larger
+  deployments while keeping index data rebuildable and non-canonical.
 - Support larger multi-tenant deployments with clearer capacity budgets, pressure modes, and retention policy controls.
 - Add export/import tooling for moving v1-local SQLite stores into production deployments.
 

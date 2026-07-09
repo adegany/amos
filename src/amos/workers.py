@@ -24,36 +24,9 @@ class IndexMaintainer:
         self.amos = amos
 
     def rebuild(self) -> dict[str, Any]:
-        atoms = self.amos.store.list_atoms()
-        edges = self.amos.store.list_edges()
-        graph_version = self.amos.store.graph_version()
-        with self.amos.store.transaction() as conn:
-            lexical = self.amos.store.upsert_derived_index_metadata(
-                conn,
-                index_name="semantic_lexical_vectors",
-                graph_version=graph_version,
-                freshness="fresh",
-                details={
-                    "atom_count": len([atom for atom in atoms if not atom.get("deleted")]),
-                    "processor_id": self.amos.smp.processor_id,
-                    "rebuildable_from_canonical": True,
-                },
-            )
-            graph = self.amos.store.upsert_derived_index_metadata(
-                conn,
-                index_name="graph_adjacency",
-                graph_version=graph_version,
-                freshness="fresh",
-                details={
-                    "edge_count": len(edges),
-                    "rebuildable_from_canonical": True,
-                },
-            )
-        return {
-            "status": "rebuilt",
-            "graph_version": graph_version,
-            "indexes": [lexical, graph],
-        }
+        return self.amos._rebuild_derived_indexes(
+            graph_version=self.amos.store.graph_version()
+        )
 
 
 class PacketCacheInvalidator:
@@ -126,7 +99,7 @@ class BackgroundMemoryPolicyWorker:
         self,
         amos: Amos,
         *,
-        interval_seconds: float = 5.0,
+        interval_seconds: float = 60.0,
         actor: str = "svc:memory_policy",
     ):
         self.amos = amos

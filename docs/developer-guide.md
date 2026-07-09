@@ -101,6 +101,11 @@ degradation metadata, and an `attention_trace`. Treat attention as a soft
 ranking policy only. Scope, access policy, schemas, mission contracts, and
 application safety rules remain hard authority.
 
+Normal packet retrieval excludes active atoms that have been superseded by an
+active replacement. Use `include_superseded: true` only when the caller needs
+history or audit context; those atoms remain down-ranked so current memories
+stay preferred.
+
 ## 5. Use Attention Deliberately
 
 Good attention contexts are compact and operational:
@@ -178,8 +183,12 @@ mis-scoped, or was contradicted by later evidence.
 
 ## 8. Let Amos Maintain Memory
 
-In HTTP service mode, packet retrieval queues background memory policy work.
-Operators can also run policy explicitly:
+In HTTP service mode, packet retrieval queues background memory policy work and
+returns a packet without running policy inline. Direct in-process callers can
+still opt into foreground policy through `retrieve_packet(run_policy=True)`, but
+latency-sensitive read views such as agentic recall skip foreground policy work
+and rely on the background worker or explicit operator runs. Operators can run
+policy explicitly:
 
 ```text
 GET  /v1/memory-policy
@@ -188,8 +197,15 @@ POST /v1/memory-policy:run
 ```
 
 The built-in policy covers deterministic distillation, SMP analysis, low-risk
-maintenance proposals, search-index refresh, decay checks, cache invalidation,
-and capacity governance. It does not require an LLM.
+maintenance proposals, search-index refresh, dependency-free lexical/LSA vector
+index refresh, decay checks, superseded-memory archiving, cache invalidation,
+and capacity governance. It does not require an LLM or an external vector
+database.
+
+For request-time retrieval, an empty scope only sees global/unscoped memory. For
+service-owned decay and storage cleanup, an empty maintenance scope means
+whole-store maintenance; provide an explicit scope only when an operator wants to
+limit cleanup to one tenant, project, run, or agent slice.
 
 Client-specific cleanup and learning belongs in client processor packs, not in
 AMOS core. A domain processor receives a bounded evidence window and returns
@@ -275,5 +291,7 @@ signal.
 - Keep packet payloads in telemetry for audit and debugging.
 
 For small deployments, the HTTP service plus SQLite is the intended v1 starting
-point. Postgres and external vector integration are roadmap items for larger
-multi-writer or higher-scale deployments.
+point. The stdlib HTTP adapter serializes service calls through one in-process
+lock for correctness with a single SQLite store. WAL-backed read parallelism,
+reader/writer lock splitting, Postgres, and external vector integration are
+roadmap items for larger multi-agent or higher-scale deployments.

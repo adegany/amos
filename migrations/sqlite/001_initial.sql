@@ -146,3 +146,13 @@ CREATE TABLE IF NOT EXISTS amos_derived_index_metadata (
     rebuilt_at TEXT NOT NULL,
     details_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS amos_token_latent_vectors (
+    token TEXT PRIMARY KEY,
+    graph_version INTEGER NOT NULL,
+    dimensions INTEGER NOT NULL,
+    vector_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_token_latent_vectors_graph
+    ON amos_token_latent_vectors(graph_version);

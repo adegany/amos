@@ -971,6 +971,13 @@ review_required:
   excluded from autonomous promotion and high-impact use
 ```
 
+Supersession is a lifecycle signal as well as a graph relation. When an active
+atom is the target of an active `rel:supersedes` edge, normal packet retrieval
+omits it as superseded unless the caller explicitly asks for superseded items.
+If included, it remains down-ranked. The memory policy may archive such atoms
+without requiring an atom-local decay rule, because the canonical graph already
+contains the replacement evidence.
+
 Canonical score fields:
 
 ```text
@@ -1209,6 +1216,9 @@ MemoryPacketRequest
   token_or_byte_budget
   consistency_requirement
   include_conflicts
+  include_archived
+  include_low_health
+  include_superseded
   include_provenance
   rendering_target
 ```
@@ -2010,6 +2020,13 @@ the candidate set to graph neighbors so edge activation can still surface linked
 memories that do not repeat the query wording. Empty-cue retrieval with
 attention terms uses the same token prefilter; empty-cue retrieval without
 attention terms remains an unprefiltered browse over visible eligible memory.
+If token prefiltering finds no direct candidates, v1-local falls back to bounded
+semantic scoring over visible eligible memory so morphology, spelling variants,
+and latent token relationships can still admit relevant atoms.
+Once candidates are selected, edge degree, supersession, and activation reads
+must be scoped to the candidate refs through indexed `source_ref`/`target_ref`
+lookups. Retrieval must not scan the full edge table for every packet when a
+bounded candidate set is available.
 Canonical memory remains the event journal and atom/edge graph, not the derived
 token index; the memory policy can rebuild the index from atom `index_refs`.
 
@@ -2938,6 +2955,13 @@ directly rather than wrapping every response in `AmosResponse`. The envelope
 above remains the stable client contract target for generated clients and later
 production adapters.
 
+The same adapter is the first usable single-process deployment profile. It owns
+one SQLite store and serializes service calls behind one process-local lock. That
+is correctness-first and simple, but it provides no parallel read throughput for
+concurrent retrieval calls. Higher-load deployments should move to a
+reader/writer concurrency model, SQLite WAL read parallelism, or a production
+database adapter while preserving one linearizable writer per shard.
+
 V1 endpoint contracts:
 
 ```text
@@ -3377,6 +3401,13 @@ semantics as an uncached retrieval. Cache entries and materialized search
 metadata are discarded or rebuilt after canonical graph mutations, deletion
 requests, merges, health transitions, and policy maintenance that changes
 retrieval eligibility.
+
+Stored search vectors are derived caches. Request-time retrieval may use a
+stored vector whose IDF or latent-vector model lags the current graph version so
+packets stay bounded-latency; direct index refresh paths may recompute from
+canonical atom text when exact freshness is required. Periodic maintenance
+refreshes the graph-versioned IDF/LSA model and records the graph version of the
+derived index.
 
 ### 25.6 Pub/sub and cache invalidation
 
@@ -4372,6 +4403,28 @@ derived:
 
 Embeddings can propose near-duplicates, semantic clusters, related episodes, and candidate association edges. Amos still validates through structure, scope, evidence, and policy.
 
+V1-local uses a dependency-free deterministic encoder rather than an external
+embedding service. The encoder combines:
+
+```text
+word hashes:
+  token term frequency multiplied by graph-version document-frequency IDF
+
+character hashes:
+  token character trigrams and four-grams for morphology and typo tolerance
+
+latent token vectors:
+  optional maintenance-built LSA projection from the local token-atom matrix
+```
+
+The IDF map is derived from `amos_atom_text_index(token, atom_id)`. The LSA
+projection is stored in `amos_token_latent_vectors` and refreshed by derived
+index maintenance, not during request handling. Stored atom search vectors carry
+graph-version vector-model metadata; stale vectors are ignored and recomputed
+from current derived statistics. These vectors are ranking aids and maintenance
+signals only. They are not canonical memory and are rebuildable from atom
+payload search text plus derived token rows.
+
 ### 28.5 Graph activation without generation
 
 Associative retrieval can run without an LLM.
@@ -4541,7 +4594,8 @@ evidence archive:
   filesystem or object storage referenced by EvidenceRecord.source_ref
 
 derived vector index:
-  replaceable derived index; v1 does not require a bundled vector database
+  replaceable derived lexical and LSA indexes; v1 does not require a bundled
+  vector database
 
 packet cache:
   SQLite table keyed by graph_version and request signature
@@ -4575,9 +4629,12 @@ read/query profile:
 
 Derived search metadata is stored in each atom's `index_refs` under a processor
 specific key such as `amos.v1.search`. This metadata may include normalized
-search text, token lists, and deterministic lexical vectors. It is rebuildable
-from canonical atom payloads and must not become the canonical source of memory
-truth.
+search text, token lists, deterministic TF-IDF/character-hash vectors, and
+graph-version vector-model metadata. The disposable `amos_atom_text_index` table
+provides token document-frequency counts and candidate prefiltering. The
+disposable `amos_token_latent_vectors` table stores the latest maintenance-built
+token -> latent vector projection. All of this is rebuildable from canonical
+atom payloads and must not become the canonical source of memory truth.
 
 Postgres is a future TODO for scale-out deployments that need multiple API
 instances, independent writer processes, database-managed role separation,
@@ -5023,6 +5080,8 @@ decay:
   enabled: true
   max_atoms: 256
   require_atom_policy: true
+  archive_superseded: true
+  archive_superseded_after_seconds: 0
   mark_stale_after_seconds: null
   archive_after_seconds: null
   low_utility_threshold: null
@@ -5057,6 +5116,8 @@ service calls do not need to complete maintenance before responding:
 ```text
 GET /v1/health/memory
   reports memory health and background worker status
+  includes quality diagnostics for active atom pressure, active superseded
+  atoms, isolated active atoms, and derived-index graph lag
   does not run a policy tick inline
 
 POST /v1/packets:retrieve
@@ -5072,6 +5133,12 @@ The in-process service API still exposes `run_memory_policy()` and
 that intentionally want a synchronous tick. The shared-service contract is that
 connected agents do not own lifecycle maintenance themselves.
 
+Policy scope is interpreted differently for retrieval and service-owned cleanup.
+An empty retrieval scope sees only global/unscoped memory. An empty service-owned
+decay or storage-cleanup scope means whole-store maintenance, so tenant- or
+run-scoped superseded atoms are still archived by the background worker. Passing
+an explicit scope narrows the maintenance pass to that scope.
+
 When due, the policy should:
 
 ```text
@@ -5079,6 +5146,8 @@ run SMP analysis
 run the memory steward for low-risk reversible cleanup
 execute deterministic decay rules from atom decay_policy and configured global
   bounds
+archive active atoms that are superseded by active replacement atoms when
+  archive_superseded is enabled
 create provenance-linked semantic distillations when enough eligible source
   atoms are available
 build a bounded evidence window and run registered maintenance processor packs
@@ -5093,16 +5162,19 @@ compact old idempotency responses so duplicate-response cache rows do not
 checkpoint the SQLite WAL and run VACUUM only after the configured idle window
   and compaction interval
 refresh rebuildable derived-index metadata
+refresh dependency-free lexical and LSA derived vector indexes
 invalidate packet cache
 persist memory_policy_state
 append a memory_policy_run event
 ```
 
 Decay execution is deterministic and non-generative. By default, v1-local only
-mutates atoms with explicit atom-level `decay_policy` rules. Supported v1-local
-rules include `expires_at`, `retain_until`, `mark_stale_after_seconds`,
-`archive_after_seconds`, and `low_utility_threshold`; operator policy can relax
-`require_atom_policy` to apply global stale/archive/low-utility thresholds.
+mutates atoms with explicit atom-level `decay_policy` rules, except for active
+atoms superseded by active replacements when `archive_superseded` is enabled.
+Supported v1-local rules include `expires_at`, `retain_until`,
+`mark_stale_after_seconds`, `archive_after_seconds`, and
+`low_utility_threshold`; operator policy can relax `require_atom_policy` to
+apply global stale/archive/low-utility thresholds.
 Applied decay actions are journaled as `decay_policy_applied`, update atom
 version/health/lifecycle state, refresh derived token rows, and invalidate packet
 cache.
@@ -5122,8 +5194,9 @@ V1-local policy execution profile:
 SMP analysis:
   analyzes active eligible atoms
   bounds pairwise semantic link analysis to likely candidate pairs
-  ranks candidates by type compatibility, lexical overlap, recency, and policy
-  limits rather than comparing every atom to every other atom
+  ranks candidates by type compatibility, lexical overlap, current semantic
+  vector similarity, recency, and policy limits rather than comparing every atom
+  to every other atom
 
 maintenance evidence window:
   uses configured limits for atoms, events, and retrieval outcomes

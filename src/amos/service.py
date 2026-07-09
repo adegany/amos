@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
 import re
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -67,6 +69,9 @@ DEFAULT_MEMORY_POLICY = {
         "max_smp_atoms": 128,
         "run_steward": True,
         "rebuild_indexes": True,
+        "rebuild_lsa": True,
+        "lsa_dimensions": 32,
+        "lsa_max_terms": 300,
         "invalidate_packet_cache": True,
     },
     "distillation": {
@@ -101,6 +106,8 @@ DEFAULT_MEMORY_POLICY = {
         "enabled": True,
         "max_atoms": 256,
         "require_atom_policy": True,
+        "archive_superseded": True,
+        "archive_superseded_after_seconds": 0,
         "mark_stale_after_seconds": None,
         "archive_after_seconds": None,
         "low_utility_threshold": None,
@@ -128,7 +135,7 @@ DEFAULT_MEMORY_POLICY = {
     },
 }
 SEARCH_INDEX_REF = "amos.v1.search"
-SEARCH_INDEX_SCHEMA = "amos.v1.search.payload_values"
+SEARCH_INDEX_SCHEMA = "amos.v1.search.payload_values.v2"
 ATTENTION_POLICY_ID = "amos.v1.attention.default"
 RETRIEVAL_RECENCY_HORIZON_SECONDS = 30 * 24 * 60 * 60
 RETRIEVAL_WEIGHTS = {
@@ -150,7 +157,9 @@ RETRIEVAL_WEIGHTS = {
     "contradiction_penalty": -0.30,
     "staleness_penalty": -0.18,
     "redundancy_penalty": -0.15,
+    "superseded_penalty": -0.20,
 }
+SEMANTIC_MATCH_THRESHOLD = 0.22
 
 
 def scope_visible(atom_scope: Mapping[str, Any], request_scope: Mapping[str, Any]) -> bool:
@@ -162,6 +171,14 @@ def scope_visible(atom_scope: Mapping[str, Any], request_scope: Mapping[str, Any
         if request_scope.get(key) != value:
             return False
     return True
+
+
+def maintenance_scope_visible(
+    atom_scope: Mapping[str, Any], maintenance_scope: Mapping[str, Any]
+) -> bool:
+    if not maintenance_scope:
+        return True
+    return scope_visible(atom_scope, maintenance_scope)
 
 
 def access_visible(
@@ -218,6 +235,7 @@ class Amos:
     ):
         self.store = store or SQLiteStore(db_path)
         self.smp = SemanticMaintenanceProcessor()
+        self._smp_vector_model_graph_version: int | None = None
         self.maintenance_processors = default_processor_registry(
             self.smp,
             processors=maintenance_processors,
@@ -380,6 +398,7 @@ class Amos:
         return str(value)
 
     def _search_index_for_atom(self, atom: Mapping[str, Any]) -> dict[str, Any]:
+        self._sync_smp_vector_model()
         text = self._search_text_for_atom(atom)
         raw_tokens = {token for token in re.findall(r"[a-z0-9_]+", text) if token}
         tokens = set(raw_tokens)
@@ -393,6 +412,7 @@ class Amos:
             "processor_id": self.smp.processor_id,
             "processor_version": self.smp.processor_version,
             "search_schema": SEARCH_INDEX_SCHEMA,
+            "vector_model": self.smp.vector_model_info(),
         }
 
     def _attach_search_index(self, atom: Mapping[str, Any]) -> dict[str, Any]:
@@ -402,7 +422,9 @@ class Amos:
         indexed["index_refs"] = index_refs
         return indexed
 
-    def _atom_search_index(self, atom: Mapping[str, Any]) -> dict[str, Any]:
+    def _atom_search_index(
+        self, atom: Mapping[str, Any], *, allow_stale: bool = False
+    ) -> dict[str, Any]:
         index_refs = atom.get("index_refs", {})
         if isinstance(index_refs, Mapping):
             stored = index_refs.get(SEARCH_INDEX_REF)
@@ -417,11 +439,18 @@ class Amos:
                     and isinstance(tokens, list)
                     and isinstance(vector, list)
                 ):
-                    return {
+                    index = {
                         "text": text,
                         "tokens": [str(token) for token in tokens],
                         "vector": [float(value) for value in vector],
+                        "vector_model": dict(stored.get("vector_model") or {}),
                     }
+                    stale = not self.smp._stored_vector_matches(stored)
+                    if stale and not allow_stale:
+                        return self._search_index_for_atom(atom)
+                    if stale:
+                        index["vector_stale"] = True
+                    return index
         return self._search_index_for_atom(atom)
 
     def _prepare_committed_atom(self, atom: Mapping[str, Any]) -> dict[str, Any]:
@@ -441,6 +470,31 @@ class Amos:
         normalized["updated_at"] = normalized["updated_at"] or now
         normalized["version"] = 1
         return normalize_atom(self._attach_search_index(normalized), require_id=True)
+
+    def _sync_smp_vector_model(
+        self, *, graph_version: int | None = None, force: bool = False
+    ) -> dict[str, Any]:
+        graph_version = (
+            self.store.graph_version() if graph_version is None else int(graph_version)
+        )
+        if not force and self._smp_vector_model_graph_version == graph_version:
+            return self.smp.vector_model_info()
+        document_count = self.store.atom_text_document_count()
+        document_frequencies = self.store.token_document_frequencies()
+        latent_vectors = self.store.list_token_latent_vectors(graph_version=graph_version)
+        latent_dimensions = max(
+            (len(vector) for vector in latent_vectors.values()),
+            default=0,
+        )
+        self.smp.configure_vector_model(
+            document_frequencies=document_frequencies,
+            document_count=document_count,
+            graph_version=graph_version,
+            latent_vectors=latent_vectors,
+            latent_dimensions=latent_dimensions,
+        )
+        self._smp_vector_model_graph_version = graph_version
+        return self.smp.vector_model_info()
 
     def run_memory_policy(
         self,
@@ -1171,6 +1225,7 @@ class Amos:
         include_conflicts: bool | None = None,
         include_archived: bool = False,
         include_low_health: bool = False,
+        include_superseded: bool = False,
         type_filter: Sequence[str] | None = None,
         attention_context: Mapping[str, Any] | None = None,
         run_policy: bool = True,
@@ -1206,6 +1261,7 @@ class Amos:
             "include_conflicts": include_conflicts,
             "include_archived": include_archived,
             "include_low_health": include_low_health,
+            "include_superseded": include_superseded,
             "type_filter": list(type_filter or []),
             "attention_context": attention_policy["context"],
             "pressure_mode": pressure_mode,
@@ -1217,6 +1273,7 @@ class Amos:
         )
         if cached is not None:
             return cached
+        self._sync_smp_vector_model(graph_version=graph_version)
 
         candidates: list[tuple[float, dict[str, Any]]] = []
         omissions: list[dict[str, Any]] = []
@@ -1235,8 +1292,10 @@ class Amos:
             lifecycle_states=lifecycle_states,
             atom_ids=candidate_atom_ids,
         )
-        edge_degrees = self.store.edge_degree_counts()
+        atom_refs = [str(atom["id"]) for atom in atoms]
+        edge_degrees = self.store.edge_degree_counts(atom_refs)
         cue_vector = self.smp.encode(cue_text) if cue_text else []
+        superseded_refs = self._active_superseded_refs(atom_refs)
         edge_activation_scores = self._graph_activation_scores(
             atoms,
             cues=request["cues"],
@@ -1248,6 +1307,7 @@ class Amos:
             cue_text=cue_text,
             cue_tokens=cue_tokens,
             attention_policy=attention_policy,
+            superseded_refs=superseded_refs if not include_superseded else None,
         )
         for atom in atoms:
             atom_ref = atom["id"]
@@ -1268,6 +1328,15 @@ class Amos:
                     {"atom_ref": atom_ref, "reason": f"health:{atom['health_status']}"}
                 )
                 continue
+            if atom_ref in superseded_refs and not include_superseded:
+                omissions.append(
+                    {
+                        "atom_ref": atom_ref,
+                        "reason": "superseded",
+                        "superseded_by": superseded_refs[atom_ref][:5],
+                    }
+                )
+                continue
             score, matched, components = self._rank_atom(
                 atom,
                 request["cues"],
@@ -1279,6 +1348,7 @@ class Amos:
                 edge_degrees=edge_degrees,
                 edge_activation_scores=edge_activation_scores,
                 attention_policy=attention_policy,
+                superseded_refs=superseded_refs,
             )
             if request["cues"] and not matched:
                 omissions.append({"atom_ref": atom_ref, "reason": "low_relevance"})
@@ -2088,6 +2158,7 @@ class Amos:
                 "self_assessment",
                 "self_narrative",
             ],
+            run_policy=False,
         )
         recalls = []
         self_actions = []
@@ -2632,6 +2703,7 @@ class Amos:
         max_atoms: int | None = None,
     ) -> dict[str, Any]:
         scope = dict(scope or {})
+        self._sync_smp_vector_model()
         atoms = [
             atom
             for atom in self.store.list_atoms_filtered()
@@ -2952,6 +3024,10 @@ class Amos:
                 "offline_backup_residual_window_days": 30,
                 "hot_packet_cache_policy": "purged_on_canonical_mutation",
             },
+            "quality": self._memory_quality_diagnostics(
+                policy=self.memory_policy(),
+                indexes=indexes,
+            ),
             "memory_policy": self.memory_policy_status(),
             "last_policy_tick": policy_tick,
         }
@@ -3558,12 +3634,24 @@ class Amos:
             "run_smp",
             "run_steward",
             "rebuild_indexes",
+            "rebuild_lsa",
             "invalidate_packet_cache",
         ]:
             maintenance[key] = bool(maintenance.get(key, True))
         maintenance["max_smp_atoms"] = max(
             1,
             int(maintenance.get("max_smp_atoms", 128) or 128),
+        )
+        maintenance["lsa_dimensions"] = max(
+            0,
+            min(
+                self.smp.dimensions,
+                int(maintenance.get("lsa_dimensions", 32) or 0),
+            ),
+        )
+        maintenance["lsa_max_terms"] = max(
+            maintenance["lsa_dimensions"],
+            int(maintenance.get("lsa_max_terms", 300) or 300),
         )
         distillation = normalized["distillation"]
         distillation["enabled"] = bool(distillation.get("enabled", True))
@@ -3607,6 +3695,11 @@ class Amos:
         decay["enabled"] = bool(decay.get("enabled", True))
         decay["max_atoms"] = max(1, int(decay.get("max_atoms", 256) or 256))
         decay["require_atom_policy"] = bool(decay.get("require_atom_policy", True))
+        decay["archive_superseded"] = bool(decay.get("archive_superseded", True))
+        value = decay.get("archive_superseded_after_seconds", 0)
+        decay["archive_superseded_after_seconds"] = (
+            None if value in (None, "") else max(0, int(value))
+        )
         for key in (
             "mark_stale_after_seconds",
             "archive_after_seconds",
@@ -3967,6 +4060,98 @@ class Amos:
             datetime.now(timezone.utc) - timedelta(seconds=max(0, int(seconds)))
         ).isoformat().replace("+00:00", "Z")
 
+    def _active_superseded_refs(
+        self, refs: Sequence[str] | None = None
+    ) -> dict[str, list[str]]:
+        active_refs = self.store.active_atom_ids(lifecycle_states=["active", "proposed"])
+        scoped_refs = {str(ref) for ref in refs or [] if str(ref)}
+        edges = (
+            self.store.list_edges_for_refs(sorted(scoped_refs))
+            if refs is not None
+            else self.store.list_edges()
+        )
+        superseded: dict[str, list[str]] = {}
+        for edge in edges:
+            if edge.get("relation") != "rel:supersedes":
+                continue
+            source = str(edge.get("source_ref") or "")
+            target = str(edge.get("target_ref") or "")
+            if source in active_refs and target in active_refs:
+                superseded.setdefault(target, []).append(source)
+        return {ref: sorted(set(sources)) for ref, sources in superseded.items()}
+
+    def _memory_quality_diagnostics(
+        self,
+        *,
+        policy: Mapping[str, Any],
+        indexes: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        atoms = self.store.list_atoms_filtered(lifecycle_states=["active", "proposed"])
+        by_ref = {str(atom["id"]): atom for atom in atoms}
+        active_count = len(atoms)
+        max_atoms = int(dict(policy.get("decay") or {}).get("max_atoms", 256) or 256)
+        edge_degrees = self.store.edge_degree_counts()
+        isolated = [
+            atom for atom in atoms if int(edge_degrees.get(str(atom["id"]), 0)) == 0
+        ]
+        isolated_by_type: dict[str, int] = {}
+        for atom in isolated:
+            atom_type = str(atom.get("type") or "unknown")
+            isolated_by_type[atom_type] = isolated_by_type.get(atom_type, 0) + 1
+
+        superseded_refs = self._active_superseded_refs()
+        superseded_by_type: dict[str, int] = {}
+        for atom_ref in superseded_refs:
+            atom = by_ref.get(atom_ref)
+            atom_type = str((atom or {}).get("type") or "unknown")
+            superseded_by_type[atom_type] = superseded_by_type.get(atom_type, 0) + 1
+
+        graph_version = self.store.graph_version()
+        index_lag = {
+            str(index["index_name"]): max(
+                0, graph_version - int(index.get("graph_version", 0) or 0)
+            )
+            for index in indexes
+        }
+        max_index_lag = max(index_lag.values(), default=0)
+
+        warnings: list[str] = []
+        if active_count > max_atoms:
+            warnings.append("active_atom_count_exceeds_decay_max_atoms")
+        if superseded_refs:
+            warnings.append("active_superseded_atoms_present")
+        if isolated:
+            warnings.append("isolated_active_atoms_present")
+        maintenance_every = int(
+            dict(policy.get("schedule") or {}).get("every_graph_versions", 25) or 25
+        )
+        if max_index_lag >= maintenance_every:
+            warnings.append("derived_index_lag_exceeds_schedule")
+
+        return {
+            "status": "warning" if warnings else "ok",
+            "warnings": warnings,
+            "active_atom_count": active_count,
+            "active_atom_limit": max_atoms,
+            "active_atom_pressure": "over_limit"
+            if active_count > max_atoms
+            else "within_limit",
+            "active_superseded_atoms": {
+                "count": len(superseded_refs),
+                "by_type": superseded_by_type,
+                "sample_refs": sorted(superseded_refs)[:10],
+            },
+            "isolated_active_atoms": {
+                "count": len(isolated),
+                "by_type": isolated_by_type,
+                "sample_refs": sorted(str(atom["id"]) for atom in isolated)[:10],
+            },
+            "derived_index_lag": {
+                "max_graph_delta": max_index_lag,
+                "by_index": index_lag,
+            },
+        }
+
     def _storage_cleanup_due(
         self,
         cleanup: Mapping[str, Any],
@@ -4062,7 +4247,7 @@ class Amos:
             for atom in atoms:
                 if len(actions) >= max_deletions:
                     break
-                if not scope_visible(atom["scope"], scope):
+                if not maintenance_scope_visible(atom["scope"], scope):
                     continue
                 if atom["type"] in protected_types:
                     continue
@@ -4264,13 +4449,27 @@ class Amos:
         actions: list[dict[str, Any]] = []
         projected_atoms: list[dict[str, Any]] = []
         now = utc_now()
-        atoms = self.store.list_atoms_filtered(
-            lifecycle_states=["active", "proposed"],
-            limit=max_atoms,
+        superseded_refs = (
+            self._active_superseded_refs()
+            if decay.get("archive_superseded", True)
+            else {}
         )
+        atoms_by_ref = {
+            atom["id"]: atom
+            for atom in self.store.list_atoms_filtered(
+                lifecycle_states=["active", "proposed"],
+                limit=max_atoms,
+            )
+        }
+        for atom in self.store.list_atoms_filtered(
+            lifecycle_states=["active", "proposed"],
+            atom_ids=sorted(superseded_refs),
+        ):
+            atoms_by_ref[atom["id"]] = atom
+        atoms = list(atoms_by_ref.values())
         with self.store.transaction() as conn:
             for atom in atoms:
-                if not scope_visible(atom["scope"], scope):
+                if not maintenance_scope_visible(atom["scope"], scope):
                     continue
                 atom_policy = (
                     dict(atom.get("decay_policy") or {})
@@ -4284,19 +4483,27 @@ class Amos:
                         if key != "retrieval_telemetry" and value not in (None, "", [], {})
                     }
                 )
-                if require_atom_policy and not explicit_atom_policy:
-                    continue
                 if atom_policy.get("enabled") is False:
                     continue
-                if self._timestamp_elapsed(atom_policy.get("retain_until")):
-                    pass
-                elif atom_policy.get("retain_until"):
-                    continue
-                action = self._decay_action_for_atom(
+                superseded_action = self._decay_action_for_superseded_atom(
                     atom,
-                    atom_policy=atom_policy,
+                    superseded_by=superseded_refs.get(atom["id"], []),
                     policy=decay,
                 )
+                if superseded_action is not None:
+                    action = superseded_action
+                else:
+                    if require_atom_policy and not explicit_atom_policy:
+                        continue
+                    if self._timestamp_elapsed(atom_policy.get("retain_until")):
+                        pass
+                    elif atom_policy.get("retain_until"):
+                        continue
+                    action = self._decay_action_for_atom(
+                        atom,
+                        atom_policy=atom_policy,
+                        policy=decay,
+                    )
                 if action is None:
                     continue
                 changed = dict(atom)
@@ -4327,6 +4534,11 @@ class Amos:
                         "atom_ref": changed["id"],
                         "action": action["action"],
                         "reason": action["reason"],
+                        **(
+                            {"superseded_by": action["superseded_by"]}
+                            if action.get("superseded_by")
+                            else {}
+                        ),
                         "health_status": changed["health_status"],
                         "lifecycle_state": changed["lifecycle_state"],
                     }
@@ -4352,6 +4564,29 @@ class Amos:
             "action_count": len(actions),
             "actions": actions,
             "event": event,
+        }
+
+    def _decay_action_for_superseded_atom(
+        self,
+        atom: Mapping[str, Any],
+        *,
+        superseded_by: Sequence[str],
+        policy: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        if not superseded_by:
+            return None
+        after = policy.get("archive_superseded_after_seconds", 0)
+        if after not in (None, ""):
+            age = self._seconds_since(
+                atom.get("last_accessed") or atom.get("updated_at") or atom.get("observed_at")
+            )
+            if age is not None and age < int(after):
+                return None
+        return {
+            "action": "archive",
+            "reason": "superseded_by_active_atom",
+            "health_status": "stale",
+            "superseded_by": list(superseded_by),
         }
 
     def _decay_action_for_atom(
@@ -4638,10 +4873,12 @@ class Amos:
         graph_version = (
             graph_version if graph_version is not None else self.store.graph_version()
         )
+        policy = self.memory_policy()
+        maintenance = policy.get("maintenance", {})
         with self.store.transaction() as conn:
             for atom in self.store.list_atoms_filtered(include_deleted=True):
                 self.store.replace_atom_text_index(conn, atom)
-            cleanup = self.memory_policy().get("storage_cleanup", {})
+            cleanup = policy.get("storage_cleanup", {})
             pruned_index = {"status": "skipped", "reason": "storage_cleanup_disabled"}
             if cleanup.get("enabled", True):
                 pruned_index = self.store.prune_atom_text_index(
@@ -4653,6 +4890,21 @@ class Amos:
                     if cleanup.get("remove_stale_from_hot_index", True)
                     else [],
                 )
+            lsa = self._build_lsa_token_vectors(
+                graph_version=graph_version,
+                enabled=bool(maintenance.get("rebuild_lsa", True)),
+                dimensions=int(maintenance.get("lsa_dimensions", 32) or 0),
+                max_terms=int(maintenance.get("lsa_max_terms", 300) or 300),
+            )
+            latent_store = self.store.replace_token_latent_vectors(
+                conn,
+                graph_version=graph_version,
+                dimensions=int(lsa.get("dimensions", 0) or 0),
+                vectors=lsa.get("vectors", {})
+                if isinstance(lsa.get("vectors"), Mapping)
+                else {},
+            )
+            self._sync_smp_vector_model(graph_version=graph_version, force=True)
             lexical = self.store.upsert_derived_index_metadata(
                 conn,
                 index_name="semantic_lexical_vectors",
@@ -4662,9 +4914,27 @@ class Amos:
                     "atom_count": self.store.atom_count(),
                     "token_count": self.store.atom_text_index_count(),
                     "processor_id": self.smp.processor_id,
+                    "processor_version": self.smp.processor_version,
+                    "vector_model": self.smp.vector_model_info(),
                     "rebuildable_from_canonical": True,
                     "maintained_by": "memory_policy",
                     "hot_index_prune": pruned_index,
+                },
+            )
+            lsa_index = self.store.upsert_derived_index_metadata(
+                conn,
+                index_name="semantic_lsa_vectors",
+                graph_version=graph_version,
+                freshness=lsa.get("freshness", "fresh"),
+                details={
+                    key: value
+                    for key, value in lsa.items()
+                    if key != "vectors"
+                }
+                | {
+                    "stored_vectors": latent_store,
+                    "rebuildable_from_canonical": True,
+                    "maintained_by": "memory_policy",
                 },
             )
             graph = self.store.upsert_derived_index_metadata(
@@ -4681,7 +4951,108 @@ class Amos:
         return {
             "status": "rebuilt",
             "graph_version": graph_version,
-            "indexes": [lexical, graph],
+            "indexes": [lexical, lsa_index, graph],
+        }
+
+    def _build_lsa_token_vectors(
+        self,
+        *,
+        graph_version: int,
+        enabled: bool,
+        dimensions: int,
+        max_terms: int,
+    ) -> dict[str, Any]:
+        if not enabled or dimensions <= 0:
+            return {
+                "status": "skipped",
+                "freshness": "skipped",
+                "reason": "lsa_disabled",
+                "dimensions": 0,
+                "vectors": {},
+            }
+        rows = self.store.token_atom_index_rows(max_terms=max_terms)
+        if not rows:
+            return {
+                "status": "skipped",
+                "freshness": "empty",
+                "reason": "no_token_index_rows",
+                "dimensions": 0,
+                "vectors": {},
+            }
+        doc_terms: dict[str, set[str]] = defaultdict(set)
+        token_docs: dict[str, set[str]] = defaultdict(set)
+        for atom_id, token in rows:
+            doc_terms[atom_id].add(token)
+            token_docs[token].add(atom_id)
+        terms = sorted(token_docs, key=lambda token: (-len(token_docs[token]), token))
+        terms = terms[: max(0, int(max_terms))]
+        if len(terms) < 2 or len(doc_terms) < 2:
+            return {
+                "status": "skipped",
+                "freshness": "insufficient_data",
+                "reason": "insufficient_terms_or_documents",
+                "term_count": len(terms),
+                "document_count": len(doc_terms),
+                "dimensions": 0,
+                "vectors": {},
+            }
+        term_index = {token: index for index, token in enumerate(terms)}
+        n_terms = len(terms)
+        n_docs = len(doc_terms)
+        idf = {
+            token: math.log((1.0 + n_docs) / (1.0 + len(token_docs[token]))) + 1.0
+            for token in terms
+        }
+        matrix = [[0.0] * n_terms for _ in range(n_terms)]
+        for tokens_in_doc in doc_terms.values():
+            indexed = [
+                (term_index[token], idf[token])
+                for token in sorted(tokens_in_doc)
+                if token in term_index
+            ]
+            for left_pos, (left, left_weight) in enumerate(indexed):
+                matrix[left][left] += left_weight * left_weight
+                for right, right_weight in indexed[left_pos + 1 :]:
+                    value = left_weight * right_weight
+                    matrix[left][right] += value
+                    matrix[right][left] += value
+        components = _top_symmetric_components(
+            matrix,
+            count=min(max(0, int(dimensions)), n_terms),
+            labels=terms,
+        )
+        if not components:
+            return {
+                "status": "skipped",
+                "freshness": "insufficient_signal",
+                "reason": "no_positive_components",
+                "term_count": n_terms,
+                "document_count": n_docs,
+                "dimensions": 0,
+                "vectors": {},
+            }
+        vectors: dict[str, list[float]] = {}
+        for term_offset, token in enumerate(terms):
+            coords = [
+                component[1][term_offset] * math.sqrt(max(component[0], 0.0))
+                for component in components
+            ]
+            norm = math.sqrt(sum(value * value for value in coords))
+            if norm <= 0.0:
+                continue
+            vectors[token] = [round(value / norm, 8) for value in coords]
+        return {
+            "status": "rebuilt",
+            "freshness": "fresh",
+            "graph_version": graph_version,
+            "term_count": n_terms,
+            "document_count": n_docs,
+            "dimensions": len(components),
+            "max_terms": max_terms,
+            "vectors": vectors,
+            "component_eigenvalues": [
+                round(component[0], 8) for component in components
+            ],
         }
 
     def _indexed_retrieval_candidates(
@@ -4702,7 +5073,7 @@ class Amos:
             return None
         direct = self.store.candidate_atom_ids_for_tokens(normalized, limit=512)
         if not direct:
-            return []
+            return None
         candidates = set(direct)
         candidates.update(self.store.neighbor_atom_ids(direct))
         return sorted(candidates)
@@ -4849,6 +5220,7 @@ class Amos:
         text_tokens: set[str],
         edge_degree: int,
         attention_policy: Mapping[str, Any] | None,
+        superseded_refs: Mapping[str, Sequence[str]] | None = None,
     ) -> dict[str, float]:
         policy = attention_policy if isinstance(attention_policy, Mapping) else {}
         context = policy.get("context", {}) if isinstance(policy.get("context", {}), Mapping) else {}
@@ -4967,6 +5339,7 @@ class Amos:
         cue_text: str,
         cue_tokens: set[str],
         attention_policy: Mapping[str, Any] | None,
+        superseded_refs: Mapping[str, Sequence[str]] | None = None,
     ) -> dict[str, float]:
         eligible_refs: set[str] = set()
         seed_strengths: dict[str, float] = {}
@@ -4982,8 +5355,10 @@ class Amos:
                 continue
             if atom["health_status"] in LOW_HEALTH_STATES and not include_low_health:
                 continue
+            if superseded_refs and atom_ref in superseded_refs:
+                continue
             eligible_refs.add(atom_ref)
-            search_index = self._atom_search_index(atom)
+            search_index = self._atom_search_index(atom, allow_stale=True)
             text = str(search_index["text"])
             text_tokens = set(str(token) for token in search_index["tokens"])
             direct = any(cue.lower() in text for cue in cues if cue)
@@ -5003,7 +5378,7 @@ class Amos:
             return {}
 
         activation: dict[str, float] = {}
-        for edge in self.store.list_edges():
+        for edge in self.store.list_edges_for_refs(sorted(eligible_refs)):
             source = str(edge.get("source_ref") or "")
             target = str(edge.get("target_ref") or "")
             if source not in eligible_refs or target not in eligible_refs:
@@ -5052,8 +5427,9 @@ class Amos:
         edge_degrees: Mapping[str, int] | None = None,
         edge_activation_scores: Mapping[str, float] | None = None,
         attention_policy: Mapping[str, Any] | None = None,
+        superseded_refs: Mapping[str, Sequence[str]] | None = None,
     ) -> tuple[float, bool, dict[str, float]]:
-        search_index = self._atom_search_index(atom)
+        search_index = self._atom_search_index(atom, allow_stale=True)
         text = str(search_index["text"])
         cue_text = " ".join(cues).lower() if cue_text is None else cue_text
         cue_tokens = (
@@ -5066,9 +5442,10 @@ class Amos:
         overlap = len(cue_tokens.intersection(text_tokens))
         matched = direct or overlap > 0 or not cue_tokens
         semantic_similarity = 0.0
-        if matched and cue_text:
+        if cue_text:
             cue_vector = self.smp.encode(cue_text) if cue_vector is None else cue_vector
             semantic_similarity = cosine(cue_vector, search_index["vector"])
+            matched = matched or semantic_similarity >= SEMANTIC_MATCH_THRESHOLD
         direct_score = 1.0 if direct else min(1.0, overlap / max(1, len(cue_tokens)))
         edge_degree = int((edge_degrees or {}).get(atom["id"], 0))
         edge_activation = min(
@@ -5112,6 +5489,7 @@ class Amos:
             else 0.0
         )
         redundancy_penalty = 1.0 if atom["health_status"] == "merged" else 0.0
+        superseded_penalty = 1.0 if atom["id"] in (superseded_refs or {}) else 0.0
         components = {
             "direct_cue_match": direct_score,
             "semantic_similarity": semantic_similarity,
@@ -5126,6 +5504,7 @@ class Amos:
             "contradiction_penalty": contradiction_penalty,
             "staleness_penalty": staleness_penalty,
             "redundancy_penalty": redundancy_penalty,
+            "superseded_penalty": superseded_penalty,
         }
         if retrieval_mode == "agentic_recall":
             components.update(self._agentic_score_components(atom))
@@ -5631,3 +6010,70 @@ class Amos:
             value = str(row.get(key))
             counts[value] = counts.get(value, 0) + 1
         return counts
+
+
+def _top_symmetric_components(
+    matrix: list[list[float]],
+    *,
+    count: int,
+    labels: Sequence[str],
+    iterations: int = 80,
+    tolerance: float = 1e-10,
+) -> list[tuple[float, list[float]]]:
+    """Return deterministic leading eigen-components for a small dense matrix."""
+
+    size = len(matrix)
+    if size == 0 or count <= 0:
+        return []
+    working = [row[:] for row in matrix]
+    components: list[tuple[float, list[float]]] = []
+    for component_index in range(min(count, size)):
+        vector = _deterministic_unit_vector(labels, component_index)
+        if not vector:
+            break
+        for _ in range(iterations):
+            candidate = _matrix_vector_product(working, vector)
+            norm = math.sqrt(sum(value * value for value in candidate))
+            if norm <= tolerance:
+                break
+            candidate = [value / norm for value in candidate]
+            delta = sum(abs(left - right) for left, right in zip(candidate, vector))
+            vector = candidate
+            if delta <= tolerance:
+                break
+        projected = _matrix_vector_product(working, vector)
+        eigenvalue = sum(left * right for left, right in zip(vector, projected))
+        if eigenvalue <= tolerance:
+            break
+        pivot = max(range(size), key=lambda index: abs(vector[index]))
+        if vector[pivot] < 0:
+            vector = [-value for value in vector]
+        components.append((eigenvalue, vector))
+        for row_index in range(size):
+            row_value = vector[row_index]
+            for column_index in range(size):
+                working[row_index][column_index] -= (
+                    eigenvalue * row_value * vector[column_index]
+                )
+    return components
+
+
+def _matrix_vector_product(
+    matrix: Sequence[Sequence[float]], vector: Sequence[float]
+) -> list[float]:
+    return [
+        sum(row[index] * vector[index] for index in range(len(vector)))
+        for row in matrix
+    ]
+
+
+def _deterministic_unit_vector(labels: Sequence[str], salt: int) -> list[float]:
+    values: list[float] = []
+    for label in labels:
+        raw = int(digest({"label": label, "salt": salt})[:12], 16)
+        values.append((raw % 2000000) / 1000000.0 - 1.0)
+    norm = math.sqrt(sum(value * value for value in values))
+    if norm <= 0.0 and values:
+        values[0] = 1.0
+        norm = 1.0
+    return [value / norm for value in values] if norm > 0 else []

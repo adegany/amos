@@ -7,7 +7,7 @@ import uuid
 import json
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, Sequence
 
 from .schemas import SCHEMA_VERSION, canonical_json, digest, utc_now
 
@@ -30,6 +30,7 @@ JSON_COLUMNS = {
     "scope",
     "supersedes",
     "target_refs",
+    "vector_json",
     "details_json",
 }
 
@@ -228,6 +229,16 @@ class SQLiteStore:
                 rebuilt_at TEXT NOT NULL,
                 details_json TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS amos_token_latent_vectors (
+                token TEXT PRIMARY KEY,
+                graph_version INTEGER NOT NULL,
+                dimensions INTEGER NOT NULL,
+                vector_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_token_latent_vectors_graph
+                ON amos_token_latent_vectors(graph_version);
             """
         )
         with self.transaction() as conn:
@@ -715,6 +726,55 @@ class SQLiteStore:
         ).fetchone()
         return int(row["count"])
 
+    def atom_text_document_count(self) -> int:
+        row = self.conn.execute(
+            """
+            SELECT COUNT(DISTINCT atom_id) AS count
+            FROM amos_atom_text_index
+            """
+        ).fetchone()
+        return int(row["count"])
+
+    def token_document_frequencies(self) -> dict[str, int]:
+        rows = self.conn.execute(
+            """
+            SELECT token, COUNT(DISTINCT atom_id) AS document_frequency
+            FROM amos_atom_text_index
+            GROUP BY token
+            """
+        ).fetchall()
+        return {
+            str(row["token"]): int(row["document_frequency"])
+            for row in rows
+        }
+
+    def token_atom_index_rows(
+        self, *, max_terms: int | None = None
+    ) -> list[tuple[str, str]]:
+        params: tuple[Any, ...] = ()
+        term_filter = ""
+        if max_terms is not None:
+            term_filter = """
+                WHERE token IN (
+                    SELECT token
+                    FROM amos_atom_text_index
+                    GROUP BY token
+                    ORDER BY COUNT(DISTINCT atom_id) DESC, token ASC
+                    LIMIT ?
+                )
+            """
+            params = (max(0, int(max_terms)),)
+        rows = self.conn.execute(
+            f"""
+            SELECT atom_id, token
+            FROM amos_atom_text_index
+            {term_filter}
+            ORDER BY atom_id ASC, token ASC
+            """,
+            params,
+        ).fetchall()
+        return [(str(row["atom_id"]), str(row["token"])) for row in rows]
+
     def candidate_atom_ids_for_tokens(
         self, tokens: list[str], *, limit: int | None = None
     ) -> list[str]:
@@ -760,6 +820,22 @@ class SQLiteStore:
             query += " WHERE deleted = 0"
         row = self.conn.execute(query, params).fetchone()
         return int(row["count"])
+
+    def active_atom_ids(
+        self, *, lifecycle_states: list[str] | None = None
+    ) -> set[str]:
+        lifecycle_states = lifecycle_states or ["active", "proposed"]
+        placeholders = ",".join("?" for _ in lifecycle_states)
+        rows = self.conn.execute(
+            f"""
+            SELECT id
+            FROM amos_atoms
+            WHERE deleted = 0
+              AND lifecycle_state IN ({placeholders})
+            """,
+            tuple(lifecycle_states),
+        ).fetchall()
+        return {str(row["id"]) for row in rows}
 
     def atom_counts_by(self, column: str, *, include_deleted: bool = False) -> dict[str, int]:
         if column not in {"type", "health_status", "lifecycle_state"}:
@@ -810,21 +886,32 @@ class SQLiteStore:
         ).fetchone()
         return int(row["count"])
 
-    def edge_degree_counts(self) -> dict[str, int]:
+    def edge_degree_counts(self, refs: list[str] | None = None) -> dict[str, int]:
         counts: dict[str, int] = {}
-        rows = self.conn.execute(
-            """
-            SELECT source_ref, target_ref
-            FROM amos_edges
-            WHERE deleted = 0
-            """
-        ).fetchall()
-        for row in rows:
-            counts[str(row["source_ref"])] = counts.get(str(row["source_ref"]), 0) + 1
-            counts[str(row["target_ref"])] = counts.get(str(row["target_ref"]), 0) + 1
+        if refs is not None:
+            ref_set = {str(ref) for ref in refs if str(ref)}
+            for edge in self.list_edges_for_refs(sorted(ref_set)):
+                source = str(edge["source_ref"])
+                target = str(edge["target_ref"])
+                if source in ref_set:
+                    counts[source] = counts.get(source, 0) + 1
+                if target in ref_set:
+                    counts[target] = counts.get(target, 0) + 1
+        else:
+            rows = self.conn.execute(
+                """
+                SELECT source_ref, target_ref
+                FROM amos_edges
+                WHERE deleted = 0
+                """
+            ).fetchall()
+            for row in rows:
+                counts[str(row["source_ref"])] = counts.get(str(row["source_ref"]), 0) + 1
+                counts[str(row["target_ref"])] = counts.get(str(row["target_ref"]), 0) + 1
         return counts
 
     def list_edges_for_refs(self, refs: list[str]) -> list[dict[str, Any]]:
+        refs = sorted({str(ref) for ref in refs if str(ref)})
         if not refs:
             return []
         placeholders = ",".join("?" for _ in refs)
@@ -1068,6 +1155,58 @@ class SQLiteStore:
             ),
         )
         return record
+
+    def replace_token_latent_vectors(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        graph_version: int,
+        dimensions: int,
+        vectors: Mapping[str, Sequence[float]],
+    ) -> dict[str, Any]:
+        conn.execute("DELETE FROM amos_token_latent_vectors")
+        updated_at = utc_now()
+        rows = [
+            (
+                str(token),
+                int(graph_version),
+                int(dimensions),
+                canonical_json([round(float(value), 8) for value in vector]),
+                updated_at,
+            )
+            for token, vector in sorted(vectors.items())
+        ]
+        if rows:
+            conn.executemany(
+                """
+                INSERT INTO amos_token_latent_vectors(
+                    token, graph_version, dimensions, vector_json, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+        return {
+            "status": "replaced",
+            "graph_version": int(graph_version),
+            "dimensions": int(dimensions),
+            "token_count": len(rows),
+            "updated_at": updated_at,
+        }
+
+    def list_token_latent_vectors(
+        self, *, graph_version: int | None = None
+    ) -> dict[str, list[float]]:
+        params: tuple[Any, ...] = ()
+        query = "SELECT token, vector_json FROM amos_token_latent_vectors"
+        if graph_version is not None:
+            query += " WHERE graph_version = ?"
+            params = (int(graph_version),)
+        rows = self.conn.execute(query, params).fetchall()
+        return {
+            str(row["token"]): [float(value) for value in self._json(row["vector_json"])]
+            for row in rows
+        }
 
     def list_derived_index_metadata(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(

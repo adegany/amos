@@ -37,15 +37,19 @@ class AmosHTTPServer(ThreadingHTTPServer):
         )
         self.memory_policy_worker.start()
         self.service_lock = threading.RLock()
+        self.closing = False
         super().__init__(server_address, make_handler())
 
     def server_close(self) -> None:
+        self.memory_policy_worker.stop(timeout=30.0)
+        with self.service_lock:
+            self.closing = True
         try:
-            self.memory_policy_worker.stop()
-            self.policy_worker_amos.close()
-            self.amos.close()
-        finally:
             super().server_close()
+        finally:
+            with self.service_lock:
+                self.policy_worker_amos.close()
+                self.amos.close()
 
 
 def make_handler() -> type[BaseHTTPRequestHandler]:
@@ -66,6 +70,16 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 body = self._read_json() if method == "POST" else {}
                 server = cast(AmosHTTPServer, self.server)
                 with server.service_lock:
+                    if server.closing:
+                        self._write_json(
+                            {
+                                "status": "error",
+                                "error": "server is shutting down",
+                                "retryable": True,
+                            },
+                            status=HTTPStatus.SERVICE_UNAVAILABLE,
+                        )
+                        return
                     self._dispatch(server, method, body)
             except AmosError as exc:
                 self._write_json(

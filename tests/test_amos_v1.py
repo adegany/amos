@@ -36,6 +36,7 @@ from amos import (
 )
 from amos.cli import main as cli_main
 from amos.http_api import AmosHTTPServer
+from amos.smp import cosine
 
 
 @pytest.fixture()
@@ -763,6 +764,68 @@ def test_retrieve_packet_uses_sqlite_token_candidate_index(amos, monkeypatch):
     assert [item["atom_ref"] for item in packet["items"]] == ["indexed_candidate_match"]
 
 
+def test_retrieve_packet_scopes_edge_reads_to_candidate_refs(amos, monkeypatch):
+    for index in range(3):
+        old = amos.commit_atom(
+            {
+                "id": f"unrelated_edge_old_{index}",
+                "type": "semantic",
+                "payload": {"summary": f"Unrelated edge old memory {index}"},
+            }
+        )["atom"]
+        amos.commit_atom(
+            {
+                "id": f"unrelated_edge_new_{index}",
+                "type": "semantic",
+                "payload": {"summary": f"Unrelated edge new memory {index}"},
+                "supersedes": [old["id"]],
+            }
+        )
+    target = amos.commit_atom(
+        {
+            "id": "scoped_edge_candidate",
+            "type": "semantic",
+            "payload": {"summary": "Scoped edge retrieval target phrase"},
+        }
+    )["atom"]
+    linked = amos.commit_atom(
+        {
+            "id": "scoped_edge_neighbor",
+            "type": "semantic",
+            "payload": {
+                "summary": "Neighbor reached through candidate-scoped edge activation",
+                "source_refs": [target["id"]],
+            },
+        }
+    )["atom"]
+
+    original_scoped_edges = amos.store.list_edges_for_refs
+    scoped_calls = []
+
+    def capture_list_edges_for_refs(refs):
+        scoped_calls.append(list(refs))
+        return original_scoped_edges(refs)
+
+    def fail_list_edges():
+        raise AssertionError("retrieve_packet should not scan all edges")
+
+    monkeypatch.setattr(amos.store, "list_edges_for_refs", capture_list_edges_for_refs)
+    monkeypatch.setattr(amos.store, "list_edges", fail_list_edges)
+
+    packet = amos.retrieve_packet(
+        cues=["target phrase"],
+        max_items=4,
+        include_conflicts=True,
+        run_policy=False,
+    )
+
+    assert target["id"] in item_refs(packet)
+    assert linked["id"] in item_refs(packet)
+    assert scoped_calls
+    allowed_refs = {target["id"], linked["id"]}
+    assert all(set(call) <= allowed_refs for call in scoped_calls)
+
+
 def test_attention_context_is_part_of_packet_cache_key(amos):
     amos.commit_atom(
         {
@@ -959,6 +1022,49 @@ def test_smp_interface_outputs_required_envelope_and_review_gate(amos):
     analysis = amos.run_smp_analysis(scope={"tenant": "qandl"})
     assert analysis["review_required"]
     assert any(output["risk_level"] == "high" for output in analysis["review_required"])
+
+
+def test_smp_encoder_uses_idf_weighting_and_character_ngrams():
+    smp = SemanticMaintenanceProcessor(dimensions=256)
+    smp.configure_vector_model(
+        document_count=10,
+        document_frequencies={"common": 10, "distinctive": 1},
+        graph_version=7,
+    )
+
+    mixed = smp.encode("common distinctive")
+    assert cosine(mixed, smp.encode("distinctive")) > cosine(
+        mixed, smp.encode("common")
+    )
+
+    assert cosine(smp.encode("retrieval"), smp.encode("retrieving")) > 0.1
+
+
+def test_retrieval_falls_back_to_semantic_similarity_for_morphology(amos):
+    amos.commit_atom(
+        {
+            "id": "morphology_retrieval_atom",
+            "type": "semantic",
+            "payload": {"summary": "Packet retrieval troubleshooting procedure"},
+        }
+    )
+    amos.commit_atom(
+        {
+            "id": "morphology_unrelated_atom",
+            "type": "semantic",
+            "payload": {"summary": "Cooking inventory background note"},
+        }
+    )
+
+    packet = amos.retrieve_packet(
+        cues=["retrieving"],
+        max_items=2,
+        run_policy=False,
+    )
+
+    assert packet["items"]
+    assert packet["items"][0]["atom_ref"] == "morphology_retrieval_atom"
+    assert packet["items"][0]["score_components"]["semantic_similarity"] > 0
 
 
 def test_retrieval_packets_include_score_components_and_evidence_omissions(amos):
@@ -1916,6 +2022,35 @@ def test_agentic_recall_accepts_spec_native_subject_agent_alias(amos):
     assert item["score_components"]["agency_match"] == 1.0
 
 
+def test_agentic_recall_skips_foreground_memory_policy(amos):
+    amos.configure_memory_policy(
+        schedule={"every_graph_versions": 1, "every_seconds": 0},
+        distillation={"min_source_atoms": 3, "max_source_atoms": 3},
+    )
+    for index in range(3):
+        amos.record_agentic_trace(
+            agent_id="trainer",
+            task=f"latency sensitive recall {index}",
+            action="read agent memory",
+            outcome="success",
+            scope={"tenant": "qandl"},
+        )
+
+    recall = amos.retrieve_agentic_recall(
+        agent_id="trainer",
+        cues=["latency sensitive recall"],
+        scope={"tenant": "qandl"},
+    )
+
+    assert recall["self_actions"]
+    assert amos.memory_policy_status()["due"]["due"] is True
+    assert not [
+        event
+        for event in amos.store.list_events()
+        if event["event_type"] == "memory_policy_run"
+    ]
+
+
 def test_self_narrative_expires_after_later_counterevidence(amos):
     amos.record_agentic_trace(
         agent_id="trainer",
@@ -2164,11 +2299,13 @@ def test_worker_artifacts_update_indexes_and_observability(amos):
     index = IndexMaintainer(amos).rebuild()
     assert {item["index_name"] for item in index["indexes"]} == {
         "graph_adjacency",
+        "semantic_lsa_vectors",
         "semantic_lexical_vectors",
     }
     health = amos.health_memory()
     assert health["projection_lag"] == 0
     assert "semantic_lexical_vectors" in health["index_freshness"]
+    assert "semantic_lsa_vectors" in health["index_freshness"]
 
     packet = amos.retrieve_packet(cues=["worker"])
     assert amos.store.list_packet_cache()
@@ -2186,6 +2323,42 @@ def test_worker_artifacts_update_indexes_and_observability(amos):
     )["balance"]["success_count"] == 1
     assert SMPWorker(amos).run(scope={"tenant": "qandl"})["status"] == "completed"
     assert packet["packet_id"]
+
+
+def test_index_rebuild_persists_lsa_vectors_and_refreshes_atom_vectors(amos):
+    for atom_id, summary in [
+        ("lsa_retrieval_packet", "retrieval packet memory recall"),
+        ("lsa_retrieve_context", "retrieve packet context recall"),
+        ("lsa_optimizer_budget", "optimizer budget schedule"),
+        ("lsa_training_schedule", "training optimizer schedule"),
+    ]:
+        amos.commit_atom(
+            {
+                "id": atom_id,
+                "type": "semantic",
+                "payload": {"summary": summary},
+            }
+        )
+    amos.configure_memory_policy(
+        maintenance={"lsa_dimensions": 4, "lsa_max_terms": 32},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": False},
+        storage_cleanup={"enabled": False},
+    )
+
+    result = IndexMaintainer(amos).rebuild()
+    by_name = {item["index_name"]: item for item in result["indexes"]}
+
+    assert by_name["semantic_lsa_vectors"]["details_json"]["status"] == "rebuilt"
+    assert by_name["semantic_lsa_vectors"]["details_json"]["dimensions"] > 0
+    assert amos.store.list_token_latent_vectors(graph_version=result["graph_version"])
+
+    atom = amos.store.get_atom("lsa_retrieval_packet")
+    model = amos._atom_search_index(atom)["vector_model"]
+    assert model["idf_graph_version"] == result["graph_version"]
+    assert model["latent_graph_version"] == result["graph_version"]
+    assert model["latent_dimensions"] > 0
 
 
 def test_automatic_memory_policy_distills_and_maintains_on_retrieval(amos):
@@ -2312,6 +2485,157 @@ def test_memory_policy_executes_atom_decay_policy(amos):
         event["event_type"] == "decay_policy_applied"
         for event in amos.store.list_events()
     )
+
+
+def test_memory_policy_archives_superseded_atoms_and_retrieval_omits_them(amos):
+    old = amos.commit_atom(
+        {
+            "id": "superseded_runtime_observation",
+            "type": "semantic",
+            "payload": {"summary": "terrain candidate alpha old snapshot"},
+        }
+    )["atom"]
+    new = amos.commit_atom(
+        {
+            "id": "current_runtime_observation",
+            "type": "semantic",
+            "payload": {"summary": "terrain candidate alpha current snapshot"},
+            "supersedes": [old["id"]],
+        }
+    )["atom"]
+
+    before = amos.retrieve_packet(
+        cues=["terrain candidate alpha old"],
+        include_low_health=True,
+        run_policy=False,
+    )
+    assert old["id"] not in [item["atom_id"] for item in before["items"]]
+    assert any(
+        omission["atom_ref"] == old["id"] and omission["reason"] == "superseded"
+        for omission in before["omissions"]
+    )
+
+    included = amos.retrieve_packet(
+        cues=["terrain candidate alpha old"],
+        include_low_health=True,
+        include_superseded=True,
+        run_policy=False,
+    )
+    assert old["id"] in [item["atom_id"] for item in included["items"]]
+    old_item = next(item for item in included["items"] if item["atom_id"] == old["id"])
+    assert old_item["score_components"]["superseded_penalty"] == 1.0
+
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={
+            "enabled": True,
+            "require_atom_policy": True,
+            "archive_superseded": True,
+            "archive_superseded_after_seconds": 0,
+        },
+        storage_cleanup={"enabled": False},
+    )
+    result = amos.run_memory_policy(force=True, trigger="superseded_decay_test")
+
+    assert result["results"]["decay"]["action_count"] == 1
+    assert result["results"]["decay"]["actions"][0]["reason"] == "superseded_by_active_atom"
+    assert result["results"]["decay"]["actions"][0]["superseded_by"] == [new["id"]]
+    archived = amos.store.get_atom(old["id"])
+    assert archived["lifecycle_state"] == "archived"
+    assert archived["health_status"] == "stale"
+    assert amos.store.get_atom(new["id"])["lifecycle_state"] == "active"
+
+
+def test_service_owned_decay_archives_scoped_superseded_atoms_with_empty_scope(amos):
+    scope = {"tenant": "qandl", "component": "training", "run_id": "run-1"}
+    old = amos.commit_atom(
+        {
+            "id": "scoped_superseded_runtime_observation",
+            "type": "runtime_state",
+            "payload": {"agent_id": "qandl.training.pilot", "summary": "old scoped runtime state"},
+            "scope": scope,
+        }
+    )["atom"]
+    new = amos.commit_atom(
+        {
+            "id": "scoped_current_runtime_observation",
+            "type": "runtime_state",
+            "payload": {
+                "agent_id": "qandl.training.pilot",
+                "summary": "current scoped runtime state",
+            },
+            "scope": scope,
+            "supersedes": [old["id"]],
+        }
+    )["atom"]
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={
+            "enabled": True,
+            "require_atom_policy": True,
+            "archive_superseded": True,
+            "archive_superseded_after_seconds": 0,
+        },
+        storage_cleanup={"enabled": False},
+    )
+
+    result = amos.run_memory_policy(
+        force=True,
+        trigger="background_interval",
+        scope={},
+    )
+
+    assert result["results"]["decay"]["action_count"] == 1
+    assert result["results"]["decay"]["actions"][0]["atom_ref"] == old["id"]
+    assert amos.store.get_atom(old["id"])["lifecycle_state"] == "archived"
+    assert amos.store.get_atom(new["id"])["lifecycle_state"] == "active"
+
+
+def test_health_memory_reports_quality_diagnostics(amos):
+    amos.configure_memory_policy(
+        decay={"max_atoms": 1},
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        storage_cleanup={"enabled": False},
+    )
+    old = amos.commit_atom(
+        {
+            "id": "quality_superseded",
+            "type": "semantic",
+            "payload": {"summary": "quality superseded"},
+        }
+    )["atom"]
+    amos.commit_atom(
+        {
+            "id": "quality_current",
+            "type": "semantic",
+            "payload": {"summary": "quality current"},
+            "supersedes": [old["id"]],
+        }
+    )
+    isolated = amos.commit_atom(
+        {
+            "id": "quality_isolated",
+            "type": "semantic",
+            "payload": {"summary": "quality isolated"},
+        }
+    )["atom"]
+
+    health = amos.health_memory(run_policy=False)
+
+    assert health["quality"]["status"] == "warning"
+    assert "active_atom_count_exceeds_decay_max_atoms" in health["quality"]["warnings"]
+    assert "active_superseded_atoms_present" in health["quality"]["warnings"]
+    assert "isolated_active_atoms_present" in health["quality"]["warnings"]
+    assert health["quality"]["active_superseded_atoms"]["count"] == 1
+    assert health["quality"]["active_superseded_atoms"]["sample_refs"] == [old["id"]]
+    assert health["quality"]["isolated_active_atoms"]["count"] >= 1
+    assert isolated["id"] in health["quality"]["isolated_active_atoms"]["sample_refs"]
 
 
 def test_memory_policy_storage_cleanup_deletes_expired_archived_and_stale_atoms(amos):
