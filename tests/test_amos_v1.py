@@ -826,6 +826,65 @@ def test_retrieve_packet_scopes_edge_reads_to_candidate_refs(amos, monkeypatch):
     assert all(set(call) <= allowed_refs for call in scoped_calls)
 
 
+def test_retrieve_packet_filters_archived_hot_activation_except_provenance(amos):
+    seed = amos.commit_atom(
+        {
+            "id": "hot_activation_seed",
+            "type": "semantic",
+            "payload": {"summary": "zzseedalpha active retrieval seed"},
+        }
+    )["atom"]
+    archived_uses = amos.commit_atom(
+        {
+            "id": "archived_uses_neighbor",
+            "type": "semantic",
+            "payload": {"summary": "qqarchivedomega ordinary archived neighbor"},
+            "lifecycle_state": "archived",
+            "health_status": "stale",
+        }
+    )["atom"]
+    archived_source = amos.commit_atom(
+        {
+            "id": "archived_provenance_neighbor",
+            "type": "semantic",
+            "payload": {"summary": "rrprovenanceomega archived source neighbor"},
+            "lifecycle_state": "archived",
+            "health_status": "stale",
+        }
+    )["atom"]
+    with amos.store.transaction() as conn:
+        amos.store.insert_edge(
+            conn,
+            amos._edge(seed["id"], archived_uses["id"], "rel:uses", {}),
+        )
+        amos.store.insert_edge(
+            conn,
+            amos._edge(seed["id"], archived_source["id"], "rel:derived_from", {}),
+        )
+
+    packet = amos.retrieve_packet(
+        cues=["zzseedalpha"],
+        max_items=5,
+        include_archived=True,
+        include_low_health=True,
+        run_policy=False,
+    )
+
+    refs = item_refs(packet)
+    assert seed["id"] in refs
+    assert archived_source["id"] in refs
+    assert archived_uses["id"] not in refs
+    provenance = next(
+        item for item in packet["items"] if item["atom_ref"] == archived_source["id"]
+    )
+    assert provenance["score_components"]["edge_activation"] > 0
+    assert any(
+        omission["atom_ref"] == archived_uses["id"]
+        and omission["reason"] == "low_relevance"
+        for omission in packet["omissions"]
+    )
+
+
 def test_attention_context_is_part_of_packet_cache_key(amos):
     amos.commit_atom(
         {

@@ -1293,7 +1293,7 @@ class Amos:
             atom_ids=candidate_atom_ids,
         )
         atom_refs = [str(atom["id"]) for atom in atoms]
-        edge_degrees = self.store.edge_degree_counts(atom_refs)
+        edge_degrees = self._hot_graph_edge_degree_counts(atoms)
         cue_vector = self.smp.encode(cue_text) if cue_text else []
         superseded_refs = self._active_superseded_refs(atom_refs)
         edge_activation_scores = self._graph_activation_scores(
@@ -5377,11 +5377,14 @@ class Amos:
         if not seed_strengths:
             return {}
 
+        atoms_by_ref = {str(atom.get("id") or ""): atom for atom in atoms}
         activation: dict[str, float] = {}
         for edge in self.store.list_edges_for_refs(sorted(eligible_refs)):
             source = str(edge.get("source_ref") or "")
             target = str(edge.get("target_ref") or "")
             if source not in eligible_refs or target not in eligible_refs:
+                continue
+            if not self._hot_graph_edge_visible(edge, atoms_by_ref):
                 continue
             relation_weight = self._edge_relation_activation_weight(
                 str(edge.get("relation") or "")
@@ -5397,6 +5400,46 @@ class Amos:
                     min(1.0, seed_strengths[target] * relation_weight * 0.8),
                 )
         return activation
+
+    def _hot_graph_edge_degree_counts(
+        self, atoms: Sequence[Mapping[str, Any]]
+    ) -> dict[str, int]:
+        atoms_by_ref = {
+            str(atom.get("id") or ""): atom
+            for atom in atoms
+            if str(atom.get("id") or "")
+        }
+        refs = sorted(atoms_by_ref)
+        if not refs:
+            return {}
+        counts: dict[str, int] = {}
+        for edge in self.store.list_edges_for_refs(refs):
+            if not self._hot_graph_edge_visible(edge, atoms_by_ref):
+                continue
+            source = str(edge.get("source_ref") or "")
+            target = str(edge.get("target_ref") or "")
+            if source in atoms_by_ref:
+                counts[source] = counts.get(source, 0) + 1
+            if target in atoms_by_ref:
+                counts[target] = counts.get(target, 0) + 1
+        return counts
+
+    def _hot_graph_edge_visible(
+        self,
+        edge: Mapping[str, Any],
+        atoms_by_ref: Mapping[str, Mapping[str, Any]],
+    ) -> bool:
+        relation = str(edge.get("relation") or "")
+        source = atoms_by_ref.get(str(edge.get("source_ref") or ""))
+        target = atoms_by_ref.get(str(edge.get("target_ref") or ""))
+        if not source or not target:
+            return False
+        if relation in {"rel:derived_from", "rel:supersedes"}:
+            return True
+        return not (
+            source.get("lifecycle_state") == "archived"
+            or target.get("lifecycle_state") == "archived"
+        )
 
     def _edge_relation_activation_weight(self, relation: str) -> float:
         if relation in {
