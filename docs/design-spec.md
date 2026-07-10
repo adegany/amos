@@ -5080,6 +5080,12 @@ decay:
   enabled: true
   max_atoms: 256
   require_atom_policy: true
+  pressure_archive_policyless: true
+  pressure_max_archives_per_run: 256
+  pressure_protected_types:
+    - commitment
+    - policy
+    - self_model
   archive_superseded: true
   archive_superseded_after_seconds: 0
   mark_stale_after_seconds: null
@@ -5097,9 +5103,9 @@ storage_cleanup:
   delete_archived_after_seconds: 604800
   delete_stale_after_seconds: 1209600
   protected_types:
-    policy
-    self_model
-    commitment
+    - policy
+    - self_model
+    - commitment
   compact_idempotency_after_seconds: 604800
   max_idempotency_compactions_per_tick: 512
   sqlite_compaction:
@@ -5169,8 +5175,16 @@ append a memory_policy_run event
 ```
 
 Decay execution is deterministic and non-generative. By default, v1-local only
-mutates atoms with explicit atom-level `decay_policy` rules, except for active
-atoms superseded by active replacements when `archive_superseded` is enabled.
+applies time, utility, and expiry rules to atoms with explicit atom-level
+`decay_policy` rules, except for active atoms superseded by active replacements
+when `archive_superseded` is enabled. When the active/proposed count exceeds
+`max_atoms`, `pressure_archive_policyless` separately archives the minimum
+eligible excess. It preserves proposed atoms, `decay_policy.enabled = false`,
+future `retain_until` rules, recognized explicit atom decay rules, and configured
+`pressure_protected_types`. Candidates are ordered deterministically: isolated
+before connected, unhealthy before healthy, then lower utility, lower salience,
+older access/update time, and atom id. `pressure_max_archives_per_run` bounds each
+maintenance transaction; residual pressure remains visible for the next tick.
 Supported v1-local rules include `expires_at`, `retain_until`,
 `mark_stale_after_seconds`, `archive_after_seconds`, and
 `low_utility_threshold`; operator policy can relax `require_atom_policy` to

@@ -106,6 +106,9 @@ DEFAULT_MEMORY_POLICY = {
         "enabled": True,
         "max_atoms": 256,
         "require_atom_policy": True,
+        "pressure_archive_policyless": True,
+        "pressure_max_archives_per_run": 256,
+        "pressure_protected_types": ["commitment", "policy", "self_model"],
         "archive_superseded": True,
         "archive_superseded_after_seconds": 0,
         "mark_stale_after_seconds": None,
@@ -3695,6 +3698,23 @@ class Amos:
         decay["enabled"] = bool(decay.get("enabled", True))
         decay["max_atoms"] = max(1, int(decay.get("max_atoms", 256) or 256))
         decay["require_atom_policy"] = bool(decay.get("require_atom_policy", True))
+        decay["pressure_archive_policyless"] = bool(
+            decay.get("pressure_archive_policyless", True)
+        )
+        decay["pressure_max_archives_per_run"] = max(
+            1,
+            int(decay.get("pressure_max_archives_per_run", 256) or 256),
+        )
+        decay["pressure_protected_types"] = sorted(
+            {
+                str(item)
+                for item in decay.get(
+                    "pressure_protected_types",
+                    ["commitment", "policy", "self_model"],
+                )
+                if str(item)
+            }
+        )
         decay["archive_superseded"] = bool(decay.get("archive_superseded", True))
         value = decay.get("archive_superseded_after_seconds", 0)
         decay["archive_superseded_after_seconds"] = (
@@ -4089,7 +4109,8 @@ class Amos:
         atoms = self.store.list_atoms_filtered(lifecycle_states=["active", "proposed"])
         by_ref = {str(atom["id"]): atom for atom in atoms}
         active_count = len(atoms)
-        max_atoms = int(dict(policy.get("decay") or {}).get("max_atoms", 256) or 256)
+        decay = dict(policy.get("decay") or {})
+        max_atoms = int(decay.get("max_atoms", 256) or 256)
         edge_degrees = self.store.edge_degree_counts()
         isolated = [
             atom for atom in atoms if int(edge_degrees.get(str(atom["id"]), 0)) == 0
@@ -4114,10 +4135,24 @@ class Amos:
             for index in indexes
         }
         max_index_lag = max(index_lag.values(), default=0)
+        pressure_eligible = [
+            atom
+            for atom in atoms
+            if self._pressure_archive_eligible(atom, decay=decay, scope={})
+        ]
+        pressure_eligible_by_type: dict[str, int] = {}
+        for atom in pressure_eligible:
+            atom_type = str(atom.get("type") or "unknown")
+            pressure_eligible_by_type[atom_type] = (
+                pressure_eligible_by_type.get(atom_type, 0) + 1
+            )
+        archives_needed = max(0, active_count - max_atoms)
 
         warnings: list[str] = []
         if active_count > max_atoms:
             warnings.append("active_atom_count_exceeds_decay_max_atoms")
+            if len(pressure_eligible) < archives_needed:
+                warnings.append("active_atom_pressure_not_fully_enforceable")
         if superseded_refs:
             warnings.append("active_superseded_atoms_present")
         if isolated:
@@ -4136,6 +4171,18 @@ class Amos:
             "active_atom_pressure": "over_limit"
             if active_count > max_atoms
             else "within_limit",
+            "pressure_cleanup": {
+                "policyless_fallback_enabled": bool(
+                    decay.get("pressure_archive_policyless", True)
+                ),
+                "archives_needed": archives_needed,
+                "eligible_policyless_count": len(pressure_eligible),
+                "eligible_policyless_by_type": pressure_eligible_by_type,
+                "max_archives_per_run": int(
+                    decay.get("pressure_max_archives_per_run", 256) or 256
+                ),
+                "protected_types": list(decay.get("pressure_protected_types", [])),
+            },
             "active_superseded_atoms": {
                 "count": len(superseded_refs),
                 "by_type": superseded_by_type,
@@ -4457,8 +4504,7 @@ class Amos:
         atoms_by_ref = {
             atom["id"]: atom
             for atom in self.store.list_atoms_filtered(
-                lifecycle_states=["active", "proposed"],
-                limit=max_atoms,
+                lifecycle_states=["active", "proposed"]
             )
         }
         for atom in self.store.list_atoms_filtered(
@@ -4467,45 +4513,95 @@ class Amos:
         ):
             atoms_by_ref[atom["id"]] = atom
         atoms = list(atoms_by_ref.values())
-        with self.store.transaction() as conn:
-            for atom in atoms:
-                if not maintenance_scope_visible(atom["scope"], scope):
+        planned: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        planned_archives: set[str] = set()
+        for atom in atoms:
+            if not maintenance_scope_visible(atom["scope"], scope):
+                continue
+            atom_policy = (
+                dict(atom.get("decay_policy") or {})
+                if isinstance(atom.get("decay_policy"), Mapping)
+                else {}
+            )
+            explicit_atom_policy = self._has_explicit_atom_decay_policy(atom_policy)
+            if atom_policy.get("enabled") is False:
+                continue
+            superseded_action = self._decay_action_for_superseded_atom(
+                atom,
+                superseded_by=superseded_refs.get(atom["id"], []),
+                policy=decay,
+            )
+            if superseded_action is not None:
+                action = superseded_action
+            else:
+                if require_atom_policy and not explicit_atom_policy:
                     continue
+                if self._timestamp_elapsed(atom_policy.get("retain_until")):
+                    pass
+                elif atom_policy.get("retain_until"):
+                    continue
+                action = self._decay_action_for_atom(
+                    atom,
+                    atom_policy=atom_policy,
+                    policy=decay,
+                )
+            if action is None:
+                continue
+            planned.append((atom, action))
+            if action["action"] == "archive":
+                planned_archives.add(str(atom["id"]))
+
+        hot_count_before = sum(
+            1 for atom in atoms if atom.get("lifecycle_state") in {"active", "proposed"}
+        )
+        hot_count_after_rules = hot_count_before - len(planned_archives)
+        pressure_needed = max(0, hot_count_after_rules - max_atoms)
+        pressure_limit = int(decay.get("pressure_max_archives_per_run", 256) or 256)
+        pressure_candidates = [
+            atom
+            for atom in atoms
+            if str(atom["id"]) not in planned_archives
+            and self._pressure_archive_eligible(atom, decay=decay, scope=scope)
+        ]
+        edge_degrees = self.store.edge_degree_counts() if pressure_needed else {}
+        pressure_candidates.sort(
+            key=lambda atom: self._pressure_archive_sort_key(atom, edge_degrees)
+        )
+        pressure_archive_count = 0
+        if decay.get("pressure_archive_policyless", True) and pressure_needed:
+            for atom in pressure_candidates[: min(pressure_needed, pressure_limit)]:
+                action = {
+                    "action": "archive",
+                    "reason": "active_atom_pressure_policyless_fallback",
+                    "health_status": "stale",
+                }
+                planned.append((atom, action))
+                planned_archives.add(str(atom["id"]))
+                pressure_archive_count += 1
+
+        pressure = {
+            "enabled": bool(decay.get("pressure_archive_policyless", True)),
+            "triggered": pressure_needed > 0,
+            "max_atoms": max_atoms,
+            "hot_count_before": hot_count_before,
+            "hot_count_after_rules": hot_count_after_rules,
+            "eligible_policyless_count": len(pressure_candidates),
+            "archive_limit": pressure_limit,
+            "archive_count": pressure_archive_count,
+            "remaining_hot_count": hot_count_after_rules - pressure_archive_count,
+            "remaining_over_limit": max(
+                0,
+                hot_count_after_rules - pressure_archive_count - max_atoms,
+            ),
+        }
+
+        with self.store.transaction() as conn:
+            for atom, action in planned:
                 atom_policy = (
                     dict(atom.get("decay_policy") or {})
                     if isinstance(atom.get("decay_policy"), Mapping)
                     else {}
                 )
-                explicit_atom_policy = bool(
-                    {
-                        key: value
-                        for key, value in atom_policy.items()
-                        if key != "retrieval_telemetry" and value not in (None, "", [], {})
-                    }
-                )
-                if atom_policy.get("enabled") is False:
-                    continue
-                superseded_action = self._decay_action_for_superseded_atom(
-                    atom,
-                    superseded_by=superseded_refs.get(atom["id"], []),
-                    policy=decay,
-                )
-                if superseded_action is not None:
-                    action = superseded_action
-                else:
-                    if require_atom_policy and not explicit_atom_policy:
-                        continue
-                    if self._timestamp_elapsed(atom_policy.get("retain_until")):
-                        pass
-                    elif atom_policy.get("retain_until"):
-                        continue
-                    action = self._decay_action_for_atom(
-                        atom,
-                        atom_policy=atom_policy,
-                        policy=decay,
-                    )
-                if action is None:
-                    continue
                 changed = dict(atom)
                 changed["version"] = int(changed["version"]) + 1
                 changed["updated_at"] = now
@@ -4563,8 +4659,82 @@ class Amos:
             "status": "completed",
             "action_count": len(actions),
             "actions": actions,
+            "pressure": pressure,
             "event": event,
         }
+
+    def _has_explicit_atom_decay_policy(self, atom_policy: Mapping[str, Any]) -> bool:
+        return any(
+            atom_policy.get(key) not in (None, "", [], {})
+            for key in {
+                "archive_after_seconds",
+                "expires_at",
+                "low_utility_threshold",
+                "mark_stale_after_seconds",
+                "retain_until",
+            }
+        )
+
+    def _pressure_archive_eligible(
+        self,
+        atom: Mapping[str, Any],
+        *,
+        decay: Mapping[str, Any],
+        scope: Mapping[str, Any],
+    ) -> bool:
+        if not decay.get("pressure_archive_policyless", True):
+            return False
+        if atom.get("lifecycle_state") != "active":
+            return False
+        if not maintenance_scope_visible(atom.get("scope", {}), scope):
+            return False
+        if str(atom.get("type") or "") in set(
+            decay.get("pressure_protected_types", [])
+        ):
+            return False
+        atom_policy = (
+            dict(atom.get("decay_policy") or {})
+            if isinstance(atom.get("decay_policy"), Mapping)
+            else {}
+        )
+        if atom_policy.get("enabled") is False:
+            return False
+        if self._has_explicit_atom_decay_policy(atom_policy):
+            return False
+        retain_until = atom_policy.get("retain_until")
+        if retain_until and not self._timestamp_elapsed(retain_until):
+            return False
+        return True
+
+    def _pressure_archive_sort_key(
+        self,
+        atom: Mapping[str, Any],
+        edge_degrees: Mapping[str, int],
+    ) -> tuple[Any, ...]:
+        health_rank = {
+            "low_utility": 0,
+            "orphaned": 0,
+            "stale": 0,
+            "confounding": 1,
+            "contradicted": 1,
+            "healthy": 2,
+        }
+        atom_ref = str(atom.get("id") or "")
+        timestamp = str(
+            atom.get("last_accessed")
+            or atom.get("updated_at")
+            or atom.get("observed_at")
+            or atom.get("created_at")
+            or ""
+        )
+        return (
+            1 if int(edge_degrees.get(atom_ref, 0) or 0) > 0 else 0,
+            health_rank.get(str(atom.get("health_status") or ""), 1),
+            float(atom.get("utility", 0.0) or 0.0),
+            float(atom.get("salience", 0.0) or 0.0),
+            timestamp,
+            atom_ref,
+        )
 
     def _decay_action_for_superseded_atom(
         self,

@@ -2546,6 +2546,139 @@ def test_memory_policy_executes_atom_decay_policy(amos):
     )
 
 
+def test_memory_policy_pressure_archives_policyless_atoms_to_limit(amos):
+    old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    protected = amos.commit_atom(
+        {
+            "id": "pressure_protected_policy",
+            "type": "policy",
+            "payload": {"rule": "Preserve governance memory under pressure."},
+            "utility": 0.1,
+        }
+    )["atom"]
+    opted_out = amos.commit_atom(
+        {
+            "id": "pressure_opted_out_trace",
+            "type": "agentic_trace",
+            "payload": {"task": "pressure", "action": "keep", "outcome": "opted out"},
+            "utility": 0.0,
+            "decay_policy": {"enabled": False},
+        }
+    )["atom"]
+    low = amos.commit_atom(
+        {
+            "id": "pressure_low_trace",
+            "type": "agentic_trace",
+            "payload": {"task": "pressure", "action": "rank", "outcome": "low"},
+            "created_at": old,
+            "observed_at": old,
+            "updated_at": old,
+            "utility": 0.1,
+            "decay_policy": {
+                "retrieval_telemetry": {"used_count": 3, "correction_count": 1}
+            },
+        }
+    )["atom"]
+    middle = amos.commit_atom(
+        {
+            "id": "pressure_middle_trace",
+            "type": "agentic_trace",
+            "payload": {"task": "pressure", "action": "rank", "outcome": "middle"},
+            "utility": 0.2,
+        }
+    )["atom"]
+    high = amos.commit_atom(
+        {
+            "id": "pressure_high_trace",
+            "type": "agentic_trace",
+            "payload": {"task": "pressure", "action": "rank", "outcome": "high"},
+            "utility": 0.9,
+        }
+    )["atom"]
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={
+            "enabled": True,
+            "max_atoms": 3,
+            "require_atom_policy": True,
+            "pressure_archive_policyless": True,
+            "pressure_max_archives_per_run": 10,
+        },
+        storage_cleanup={"enabled": False},
+    )
+
+    result = amos.run_memory_policy(force=True, trigger="pressure_decay_test")
+    pressure = result["results"]["decay"]["pressure"]
+
+    assert pressure == {
+        "enabled": True,
+        "triggered": True,
+        "max_atoms": 3,
+        "hot_count_before": 5,
+        "hot_count_after_rules": 5,
+        "eligible_policyless_count": 3,
+        "archive_limit": 10,
+        "archive_count": 2,
+        "remaining_hot_count": 3,
+        "remaining_over_limit": 0,
+    }
+    pressure_actions = [
+        action
+        for action in result["results"]["decay"]["actions"]
+        if action["reason"] == "active_atom_pressure_policyless_fallback"
+    ]
+    assert [action["atom_ref"] for action in pressure_actions] == [
+        low["id"],
+        middle["id"],
+    ]
+    assert amos.store.get_atom(low["id"])["lifecycle_state"] == "archived"
+    assert amos.store.get_atom(middle["id"])["lifecycle_state"] == "archived"
+    assert amos.store.get_atom(high["id"])["lifecycle_state"] == "active"
+    assert amos.store.get_atom(opted_out["id"])["lifecycle_state"] == "active"
+    assert amos.store.get_atom(protected["id"])["lifecycle_state"] == "active"
+    health = amos.health_memory(run_policy=False)
+    assert health["quality"]["active_atom_count"] == 3
+    assert health["quality"]["active_atom_pressure"] == "within_limit"
+    assert health["quality"]["pressure_cleanup"]["eligible_policyless_count"] == 1
+
+
+def test_memory_policy_pressure_reports_residual_protected_atoms(amos):
+    for index in range(2):
+        amos.commit_atom(
+            {
+                "id": f"pressure_protected_policy_{index}",
+                "type": "policy",
+                "payload": {"rule": f"Protected policy {index}"},
+            }
+        )
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={
+            "enabled": True,
+            "max_atoms": 1,
+            "pressure_archive_policyless": True,
+        },
+        storage_cleanup={"enabled": False},
+    )
+
+    result = amos.run_memory_policy(force=True, trigger="protected_pressure_test")
+    pressure = result["results"]["decay"]["pressure"]
+
+    assert pressure["archive_count"] == 0
+    assert pressure["remaining_hot_count"] == 2
+    assert pressure["remaining_over_limit"] == 1
+    health = amos.health_memory(run_policy=False)
+    assert "active_atom_pressure_not_fully_enforceable" in health["quality"]["warnings"]
+    assert health["quality"]["pressure_cleanup"]["eligible_policyless_count"] == 0
+    assert health["quality"]["pressure_cleanup"]["archives_needed"] == 1
+
+
 def test_memory_policy_archives_superseded_atoms_and_retrieval_omits_them(amos):
     old = amos.commit_atom(
         {
