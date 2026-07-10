@@ -2679,6 +2679,54 @@ def test_memory_policy_pressure_reports_residual_protected_atoms(amos):
     assert health["quality"]["pressure_cleanup"]["archives_needed"] == 1
 
 
+def test_memory_health_recommends_capacity_target_with_headroom(amos):
+    for index in range(3):
+        amos.commit_atom(
+            {
+                "id": f"capacity_atom_{index}",
+                "type": "semantic",
+                "payload": {"summary": f"Capacity observation {index}"},
+            }
+        )
+    amos.configure_memory_policy(
+        decay={
+            "max_atoms": 3,
+            "capacity_assessment_targets": [3, 6, 9],
+            "capacity_headroom_ratio": 0.2,
+        }
+    )
+
+    health = amos.health_memory(run_policy=False)
+    capacity = health["quality"]["capacity_assessment"]
+
+    assert capacity["configured_target"] == 3
+    assert capacity["active_count"] == 3
+    assert capacity["utilization"] == 1.0
+    assert capacity["near_limit"] is True
+    assert capacity["recommended_target"] == 6
+    assert capacity["candidate_targets"] == [
+        {
+            "target": 3,
+            "headroom_atoms": 0,
+            "utilization": 1.0,
+            "meets_headroom_target": False,
+        },
+        {
+            "target": 6,
+            "headroom_atoms": 3,
+            "utilization": 0.5,
+            "meets_headroom_target": True,
+        },
+        {
+            "target": 9,
+            "headroom_atoms": 6,
+            "utilization": 0.3333,
+            "meets_headroom_target": True,
+        },
+    ]
+    assert "active_atom_capacity_headroom_low" in health["quality"]["warnings"]
+
+
 def test_memory_policy_archives_superseded_atoms_and_retrieval_omits_them(amos):
     old = amos.commit_atom(
         {
@@ -3567,6 +3615,41 @@ def test_maintenance_distiller_skips_empty_windows_without_journal_event(amos):
     assert result["reason"] == "no_proposals"
     assert result["event"] is None
     assert len(amos.store.list_events()) == event_count
+
+
+def test_maintenance_evidence_window_prioritizes_hot_atoms_over_recent_archives(amos):
+    scope = {"tenant": "window-priority"}
+    active = amos.commit_atom(
+        {
+            "id": "window_active_anchor",
+            "type": "self_model",
+            "payload": {"agent_id": "window-agent", "name": "active anchor"},
+            "scope": scope,
+        }
+    )["atom"]
+    for index in range(3):
+        atom_id = f"window_recent_archive_{index}"
+        amos.commit_atom(
+            {
+                "id": atom_id,
+                "type": "semantic",
+                "payload": {"summary": f"recent archive {index}"},
+                "scope": scope,
+            }
+        )
+        amos.archive_atom(atom_id, reason="window priority regression")
+
+    window = amos._maintenance_evidence_window(
+        scope=scope,
+        domain="generic",
+        max_atoms=2,
+        max_events=0,
+        max_retrieval_outcomes=0,
+    )
+
+    assert window.atoms[0]["id"] == active["id"]
+    assert window.atoms[0]["lifecycle_state"] == "active"
+    assert len(window.atoms) == 2
 
 
 def test_maintenance_distiller_skips_unchanged_deferred_proposals(amos):

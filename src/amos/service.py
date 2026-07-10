@@ -109,6 +109,8 @@ DEFAULT_MEMORY_POLICY = {
         "pressure_archive_policyless": True,
         "pressure_max_archives_per_run": 256,
         "pressure_protected_types": ["commitment", "policy", "self_model"],
+        "capacity_assessment_targets": [256, 512, 768],
+        "capacity_headroom_ratio": 0.2,
         "archive_superseded": True,
         "archive_superseded_after_seconds": 0,
         "mark_stale_after_seconds": None,
@@ -3218,7 +3220,10 @@ class Amos:
     ) -> EvidenceWindow:
         atoms = [
             atom
-            for atom in self.store.list_atoms_filtered(limit=max(1, int(max_atoms or 1)))
+            for atom in self.store.list_atoms_filtered(
+                limit=max(1, int(max_atoms or 1)),
+                prioritize_hot=True,
+            )
             if not atom.get("deleted") and scope_visible(atom["scope"], scope)
         ]
         atom_refs = {atom["id"] for atom in atoms}
@@ -3715,6 +3720,18 @@ class Amos:
                 if str(item)
             }
         )
+        decay["capacity_assessment_targets"] = sorted(
+            {
+                max(1, int(item))
+                for item in decay.get("capacity_assessment_targets", [256, 512, 768])
+                if item not in (None, "")
+            }
+            | {decay["max_atoms"]}
+        )
+        decay["capacity_headroom_ratio"] = max(
+            0.0,
+            min(0.9, float(decay.get("capacity_headroom_ratio", 0.2) or 0.0)),
+        )
         decay["archive_superseded"] = bool(decay.get("archive_superseded", True))
         value = decay.get("archive_superseded_after_seconds", 0)
         decay["archive_superseded_after_seconds"] = (
@@ -4147,12 +4164,34 @@ class Amos:
                 pressure_eligible_by_type.get(atom_type, 0) + 1
             )
         archives_needed = max(0, active_count - max_atoms)
+        capacity_headroom_ratio = float(
+            decay.get("capacity_headroom_ratio", 0.2) or 0.0
+        )
+        capacity_targets = sorted(
+            {
+                max(1, int(item))
+                for item in decay.get("capacity_assessment_targets", [256, 512, 768])
+                if item not in (None, "")
+            }
+            | {max_atoms}
+        )
+        required_with_headroom = int(
+            math.ceil(active_count / max(0.1, 1.0 - capacity_headroom_ratio))
+        )
+        recommended_target = next(
+            (target for target in capacity_targets if target >= required_with_headroom),
+            capacity_targets[-1],
+        )
+        capacity_utilization = active_count / max(1, max_atoms)
+        capacity_near_limit = capacity_utilization >= 1.0 - capacity_headroom_ratio
 
         warnings: list[str] = []
         if active_count > max_atoms:
             warnings.append("active_atom_count_exceeds_decay_max_atoms")
             if len(pressure_eligible) < archives_needed:
                 warnings.append("active_atom_pressure_not_fully_enforceable")
+        if capacity_near_limit:
+            warnings.append("active_atom_capacity_headroom_low")
         if superseded_refs:
             warnings.append("active_superseded_atoms_present")
         if isolated:
@@ -4182,6 +4221,24 @@ class Amos:
                     decay.get("pressure_max_archives_per_run", 256) or 256
                 ),
                 "protected_types": list(decay.get("pressure_protected_types", [])),
+            },
+            "capacity_assessment": {
+                "configured_target": max_atoms,
+                "active_count": active_count,
+                "headroom_atoms": max(0, max_atoms - active_count),
+                "utilization": round(capacity_utilization, 4),
+                "headroom_ratio_target": capacity_headroom_ratio,
+                "near_limit": capacity_near_limit,
+                "recommended_target": recommended_target,
+                "candidate_targets": [
+                    {
+                        "target": target,
+                        "headroom_atoms": target - active_count,
+                        "utilization": round(active_count / max(1, target), 4),
+                        "meets_headroom_target": target >= required_with_headroom,
+                    }
+                    for target in capacity_targets
+                ],
             },
             "active_superseded_atoms": {
                 "count": len(superseded_refs),

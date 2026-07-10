@@ -5086,6 +5086,11 @@ decay:
     - commitment
     - policy
     - self_model
+  capacity_assessment_targets:
+    - 256
+    - 512
+    - 768
+  capacity_headroom_ratio: 0.2
   archive_superseded: true
   archive_superseded_after_seconds: 0
   mark_stale_after_seconds: null
@@ -5185,6 +5190,12 @@ future `retain_until` rules, recognized explicit atom decay rules, and configure
 before connected, unhealthy before healthy, then lower utility, lower salience,
 older access/update time, and atom id. `pressure_max_archives_per_run` bounds each
 maintenance transaction; residual pressure remains visible for the next tick.
+Memory health also reports a non-mutating `capacity_assessment` across the
+configured candidate targets. It recommends the smallest target that preserves
+`capacity_headroom_ratio` above the current active count and warns when the
+configured target no longer has that headroom. Deployments should use this
+signal with retrieval-quality and maintenance-latency measurements rather than
+raising `max_atoms` solely to suppress pressure warnings.
 Supported v1-local rules include `expires_at`, `retain_until`,
 `mark_stale_after_seconds`, `archive_after_seconds`, and
 `low_utility_threshold`; operator policy can relax `require_atom_policy` to
@@ -5214,6 +5225,8 @@ SMP analysis:
 
 maintenance evidence window:
   uses configured limits for atoms, events, and retrieval outcomes
+  prioritizes active and proposed atoms before filling remaining atom capacity
+  with archived provenance, so recent archival cannot displace hot self-models
   reads visible active graph neighborhoods for selected atoms
   keeps processor packs side-effect-free
 

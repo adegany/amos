@@ -682,6 +682,7 @@ class SQLiteStore:
         included_health: list[str] | None = None,
         atom_ids: list[str] | None = None,
         limit: int | None = None,
+        prioritize_hot: bool = False,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -713,7 +714,14 @@ class SQLiteStore:
         query = "SELECT * FROM amos_atoms"
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY updated_at DESC"
+        if prioritize_hot:
+            query += (
+                " ORDER BY CASE lifecycle_state "
+                "WHEN 'active' THEN 0 WHEN 'proposed' THEN 1 ELSE 2 END, "
+                "updated_at DESC"
+            )
+        else:
+            query += " ORDER BY updated_at DESC"
         if limit is not None:
             query += " LIMIT ?"
             params.append(max(0, int(limit)))
