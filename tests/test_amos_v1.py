@@ -3652,6 +3652,66 @@ def test_maintenance_evidence_window_prioritizes_hot_atoms_over_recent_archives(
     assert len(window.atoms) == 2
 
 
+def test_maintenance_evidence_window_includes_narrower_scopes_before_limit(amos):
+    for index in range(3):
+        amos.commit_atom(
+            {
+                "id": f"unrelated_hot_{index}",
+                "type": "semantic",
+                "payload": {"summary": f"unrelated {index}"},
+                "scope": {"tenant": "other", "component": "training"},
+            }
+        )
+    broad = amos.commit_atom(
+        {
+            "id": "hierarchical_broad",
+            "type": "semantic",
+            "payload": {"summary": "broad evidence"},
+            "scope": {"tenant": "hierarchical", "component": "training"},
+        }
+    )["atom"]
+    narrow = amos.commit_atom(
+        {
+            "id": "hierarchical_narrow",
+            "type": "semantic",
+            "payload": {"summary": "run evidence"},
+            "scope": {
+                "tenant": "hierarchical",
+                "component": "training",
+                "asset": "UPRO",
+                "run_id": "run-1",
+            },
+        }
+    )["atom"]
+
+    window = amos._maintenance_evidence_window(
+        scope={"tenant": "hierarchical", "component": "training"},
+        domain="generic",
+        max_atoms=2,
+        max_events=0,
+        max_retrieval_outcomes=0,
+    )
+
+    assert {atom["id"] for atom in window.atoms} == {broad["id"], narrow["id"]}
+
+    exact_window = amos._maintenance_evidence_window(
+        scope={
+            "tenant": "hierarchical",
+            "component": "training",
+            "asset": "UPRO",
+            "run_id": "run-1",
+        },
+        domain="generic",
+        max_atoms=2,
+        max_events=0,
+        max_retrieval_outcomes=0,
+    )
+    assert {atom["id"] for atom in exact_window.atoms} == {
+        broad["id"],
+        narrow["id"],
+    }
+
+
 def test_maintenance_distiller_skips_unchanged_deferred_proposals(amos):
     amos.register_maintenance_processor(ExampleTrainingFlightProcessor())
     scope = {"tenant": "example", "component": "training", "case": "deferred"}

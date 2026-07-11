@@ -183,7 +183,18 @@ def maintenance_scope_visible(
 ) -> bool:
     if not maintenance_scope:
         return True
-    return scope_visible(atom_scope, maintenance_scope)
+    # Maintenance scopes are compatible hierarchically in both directions: a
+    # broad pass includes narrower evidence, while a run-specific pass still
+    # includes tenant-level profiles. Only an explicit conflicting dimension
+    # (for example a different run_id or tenant) makes an atom invisible.
+    for key in set(atom_scope).intersection(maintenance_scope):
+        atom_value = atom_scope.get(key)
+        maintenance_value = maintenance_scope.get(key)
+        if atom_value == "global" or maintenance_value == "global":
+            continue
+        if atom_value != maintenance_value:
+            return False
+    return True
 
 
 def access_visible(
@@ -3218,14 +3229,17 @@ class Amos:
         max_events: int,
         max_retrieval_outcomes: int,
     ) -> EvidenceWindow:
-        atoms = [
+        # Maintenance scopes are hierarchical: a broad tenant/component pass
+        # must see atoms in narrower run, asset, and agent scopes. Filter before
+        # applying the window bound so unrelated hot atoms cannot crowd the
+        # requested scope out of the evidence window.
+        visible_atoms = [
             atom
-            for atom in self.store.list_atoms_filtered(
-                limit=max(1, int(max_atoms or 1)),
-                prioritize_hot=True,
-            )
-            if not atom.get("deleted") and scope_visible(atom["scope"], scope)
+            for atom in self.store.list_atoms_filtered(prioritize_hot=True)
+            if not atom.get("deleted")
+            and maintenance_scope_visible(atom["scope"], scope)
         ]
+        atoms = visible_atoms[: max(1, int(max_atoms or 1))]
         atom_refs = {atom["id"] for atom in atoms}
         edges = [
             edge
