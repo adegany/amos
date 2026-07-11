@@ -23,6 +23,35 @@ GET /v1/health/capacity
 GET /v1/verify
 ```
 
+### Handle transient service failures
+
+AMOS returns a structured transient-failure envelope when the service is
+shutting down or its SQLite store is temporarily locked or busy:
+
+```http
+HTTP/1.1 503 Service Unavailable
+```
+
+```json
+{
+  "status": "error",
+  "error": "database is locked",
+  "retryable": true
+}
+```
+
+Clients should retry only bounded transient failures, using exponential backoff
+with jitter. A typical client makes three or four attempts over a few seconds,
+then moves the operation into its own delayed retry queue instead of converting
+an infrastructure failure into a domain decision or operator approval.
+
+Writes are safe to retry only when the request carries a stable
+`idempotency_key`, or when the endpoint is otherwise documented as
+observational. Reuse the same actor, key, and payload on every attempt. Do not
+silently retry schema, authorization, expected-version, or idempotency
+conflicts; refresh, correct, merge, or request review according to the returned
+error.
+
 ## 2. Store Typed Memory, Not Prompt Text
 
 Commit canonical memory as typed atoms. Keep English summaries as generated

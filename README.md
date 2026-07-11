@@ -309,6 +309,9 @@ Recommended integration pattern:
   permissions, schemas, and safety guardrails remain hard authority.
 - Record whether retrieved memories were materially used. Retrieved-but-uncited
   context should be neutral telemetry, not positive reinforcement.
+- Treat HTTP `503` responses with `"retryable": true` as transient service
+  failures. Retry with bounded exponential backoff and jitter, and use a stable
+  idempotency key before retrying a write.
 - Render concise operational digests for agents and retain full packets in
   telemetry for audit.
 

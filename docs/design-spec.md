@@ -3136,6 +3136,25 @@ projection_failed
 derived_index_stale
 ```
 
+HTTP service implementations may also return a transport-level transient
+failure envelope:
+
+```json
+{
+  "status": "error",
+  "error": "database is locked",
+  "retryable": true
+}
+```
+
+In v1, service shutdown and SQLite locked/busy conditions return HTTP 503 with
+`retryable: true`. Clients own bounded retry timing and delayed requeue state;
+AMOS does not encode client-domain lifecycle decisions for these failures.
+Clients should use exponential backoff with jitter and must reuse a stable
+idempotency key, actor, and payload when retrying a mutation. Validation,
+authorization, version, and idempotency conflicts are not transient transport
+failures and must not be retried blindly.
+
 #### 25.1.1 Client integration contract
 
 AMOS owns canonical memory semantics, lifecycle, maintenance, retrieval
@@ -3148,6 +3167,7 @@ A production client should treat AMOS as a memory service, not as a prompt log:
 client responsibilities:
   capture evidence-backed traces, outcomes, corrections, and runtime state
   retrieve bounded role/task/scope packets
+  retry explicitly retryable service failures with bounded backoff and idempotent writes
   render concise operational prompt digests from packets
   enforce application schemas, permissions, control registries, and guardrails
   record whether retrieved memories were materially used
