@@ -2491,6 +2491,52 @@ def test_automatic_memory_policy_distills_and_maintains_on_retrieval(amos):
     assert "Replacement renderer output" in replacement["payload"]["summary"]
 
 
+def test_memory_policy_skips_when_another_tick_holds_execution_lock(amos):
+    assert amos._memory_policy_lock.acquire(blocking=False)
+    try:
+        result = amos.run_memory_policy(force=True, trigger="concurrent_tick")
+    finally:
+        amos._memory_policy_lock.release()
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "memory_policy_already_running"
+
+
+def test_maintenance_edge_conflict_does_not_append_phantom_projection(amos, monkeypatch):
+    source = amos.commit_atom(
+        {"id": "edge_race_source", "type": "semantic", "payload": {"summary": "source"}}
+    )["atom"]
+    target = amos.commit_atom(
+        {"id": "edge_race_target", "type": "semantic", "payload": {"summary": "target"}}
+    )["atom"]
+    stored_edge = amos._edge(source["id"], target["id"], "rel:derived_from", {})
+    with amos.store.transaction() as conn:
+        assert amos.store.insert_edge(conn, stored_edge) is True
+    proposal = MaintenanceProposal(
+        processor_id="test.edge.race",
+        processor_version="test.edge.race.v1",
+        action="add_edge",
+        risk_level="low",
+        confidence=0.8,
+        reason_code="test_edge_insert_race",
+        source_refs=(source["id"], target["id"]),
+        payload={
+            "edge": {
+                "source_ref": source["id"],
+                "target_ref": target["id"],
+                "relation": "rel:derived_from",
+            }
+        },
+    ).to_dict()
+    event_count = len(amos.store.list_events())
+    monkeypatch.setattr(amos.store, "list_edges", lambda: [])
+
+    result = amos._commit_maintenance_edge_proposal(proposal, actor="test")
+
+    assert result["status"] == "already_committed"
+    assert len(amos.store.list_events()) == event_count
+
+
 def test_memory_policy_executes_atom_decay_policy(amos):
     old = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat().replace(
         "+00:00", "Z"

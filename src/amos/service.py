@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -252,6 +253,8 @@ class Amos:
         self.store = store or SQLiteStore(db_path)
         self.smp = SemanticMaintenanceProcessor()
         self._smp_vector_model_graph_version: int | None = None
+        self._memory_policy_lock = threading.Lock()
+        self._memory_policy_running = False
         self.maintenance_processors = default_processor_registry(
             self.smp,
             processors=maintenance_processors,
@@ -520,13 +523,6 @@ class Amos:
         scope: Mapping[str, Any] | None = None,
         actor: str = "svc:memory_policy",
     ) -> dict[str, Any]:
-        if getattr(self, "_memory_policy_running", False):
-            return {
-                "status": "skipped",
-                "reason": "memory_policy_already_running",
-                "trigger": trigger,
-                "graph_version": self.store.graph_version(),
-            }
         policy = self.memory_policy()
         state = self._memory_policy_state()
         due = self._memory_policy_due(policy, state, force=force)
@@ -544,6 +540,14 @@ class Amos:
                 "reason": "policy_disabled",
                 "trigger": trigger,
                 "due": due,
+                "graph_version": self.store.graph_version(),
+            }
+
+        if not self._memory_policy_lock.acquire(blocking=False):
+            return {
+                "status": "skipped",
+                "reason": "memory_policy_already_running",
+                "trigger": trigger,
                 "graph_version": self.store.graph_version(),
             }
 
@@ -707,6 +711,7 @@ class Amos:
             }
         finally:
             self._memory_policy_running = False
+            self._memory_policy_lock.release()
 
     def capture_event(
         self,
@@ -3382,7 +3387,14 @@ class Amos:
                 "source_refs": list(proposal.get("source_refs", [])),
             }
         with self.store.transaction() as conn:
-            self.store.insert_edge(conn, edge)
+            inserted = self.store.insert_edge(conn, edge)
+            if not inserted:
+                return {
+                    "status": "already_committed",
+                    "proposal_id": proposal["proposal_id"],
+                    "edge": edge,
+                    "source_refs": list(proposal.get("source_refs", [])),
+                }
             event = self.store.append_event(
                 conn,
                 event_type="edge_committed",

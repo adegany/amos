@@ -855,8 +855,8 @@ class SQLiteStore:
         rows = self.conn.execute(query).fetchall()
         return {str(row["key"]): int(row["count"]) for row in rows}
 
-    def insert_edge(self, conn: sqlite3.Connection, edge: Mapping[str, Any]) -> None:
-        conn.execute(
+    def insert_edge(self, conn: sqlite3.Connection, edge: Mapping[str, Any]) -> bool:
+        cursor = conn.execute(
             """
             INSERT INTO amos_edges(
                 edge_id, source_ref, target_ref, relation, schema_version,
@@ -883,6 +883,7 @@ class SQLiteStore:
                 1 if edge.get("deleted") else 0,
             ),
         )
+        return cursor.rowcount > 0
 
     def list_edges(self) -> list[dict[str, Any]]:
         rows = self.conn.execute("SELECT * FROM amos_edges WHERE deleted = 0").fetchall()
