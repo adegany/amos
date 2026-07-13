@@ -1460,6 +1460,46 @@ def test_commit_atom_projects_self_model_profile_edges(amos):
     assert amos.verify_replay()["status"] == "ok"
 
 
+def test_steward_prunes_live_profile_edges_to_inactive_atoms(amos):
+    self_model = amos.commit_atom(
+        {
+            "id": "stale_edge_self_model",
+            "type": "self_model",
+            "payload": {"agent_id": "agent.edge", "role_key": "edge"},
+        }
+    )["atom"]
+    capability = amos.commit_atom(
+        {
+            "id": "stale_edge_capability",
+            "type": "capability",
+            "payload": {
+                "agent_id": "agent.edge",
+                "role_key": "edge",
+                "name": "old capability",
+            },
+            "evidence_refs": [self_model["id"]],
+        }
+    )["atom"]
+    assert amos.store.list_edges()
+
+    # Reproduce a legacy projection in which the atom lifecycle changed
+    # without cascading its live attachment edge.
+    with amos.store.transaction() as conn:
+        archived = dict(capability)
+        archived["lifecycle_state"] = "archived"
+        archived["health_status"] = "stale"
+        archived["version"] = int(archived["version"]) + 1
+        amos.store.replace_atom(conn, archived)
+
+    result = amos.run_steward(actor="test")
+
+    assert any(
+        action.get("action") == "prune_inactive_attachment_edges"
+        for action in result["actions"]
+    )
+    assert amos.store.list_edges() == []
+
+
 def test_retrieval_outcome_accepts_stable_outcome_id(amos):
     first = amos.record_retrieval_outcome(
         packet_id="pkt_demo",
@@ -2567,7 +2607,10 @@ def test_memory_policy_executes_atom_decay_policy(amos):
         {
             "id": "decay_ignored_atom",
             "type": "semantic",
-            "payload": {"summary": "Decay ignored target"},
+            "payload": {
+                "summary": "Decay ignored target",
+                "source_refs": [archive_atom["id"]],
+            },
             "updated_at": old,
             "observed_at": old,
             "created_at": old,
@@ -2586,6 +2629,8 @@ def test_memory_policy_executes_atom_decay_policy(amos):
     assert amos.store.get_atom(stale_atom["id"])["health_status"] == "stale"
     assert amos.store.get_atom(archive_atom["id"])["lifecycle_state"] == "archived"
     assert amos.store.get_atom(ignored_atom["id"])["health_status"] == "healthy"
+    assert result["results"]["decay"]["projected_edges"]
+    assert amos.store.list_edges() == []
     assert any(
         event["event_type"] == "decay_policy_applied"
         for event in amos.store.list_events()

@@ -969,6 +969,42 @@ class SQLiteStore:
             )
         return edges
 
+    def mark_edges_deleted(
+        self, conn: sqlite3.Connection, edge_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        edge_ids = sorted({str(edge_id) for edge_id in edge_ids if str(edge_id)})
+        if not edge_ids:
+            return []
+        placeholders = ",".join("?" for _ in edge_ids)
+        rows = conn.execute(
+            f"SELECT * FROM amos_edges WHERE deleted = 0 AND edge_id IN ({placeholders})",
+            tuple(edge_ids),
+        ).fetchall()
+        edges = [self._row_dict(row) for row in rows]
+        now = utc_now()
+        for edge in edges:
+            edge["deleted"] = 1
+            edge["lifecycle_state"] = "deleted"
+            edge["health_status"] = "deleted"
+            edge["updated_at"] = now
+            edge["version"] = int(edge["version"]) + 1
+            conn.execute(
+                """
+                UPDATE amos_edges SET
+                    lifecycle_state = ?, health_status = ?, updated_at = ?,
+                    version = ?, deleted = 1
+                WHERE edge_id = ?
+                """,
+                (
+                    edge["lifecycle_state"],
+                    edge["health_status"],
+                    edge["updated_at"],
+                    edge["version"],
+                    edge["edge_id"],
+                ),
+            )
+        return edges
+
     def insert_tombstone(
         self,
         conn: sqlite3.Connection,

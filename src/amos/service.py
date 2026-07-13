@@ -2822,6 +2822,44 @@ class Amos:
                 and atom.get("lifecycle_state") == "active"
                 and scope_visible(atom["scope"], scope)
             ]
+            live_attachment_relations = {
+                "rel:attributed_to",
+                "rel:has_capability",
+                "rel:has_limitation",
+                "rel:made_commitment",
+            }
+            invalid_attachment_edge_ids: list[str] = []
+            for edge in self.store.list_edges():
+                if edge.get("relation") not in live_attachment_relations:
+                    continue
+                endpoints = (
+                    self.store.get_atom(str(edge.get("source_ref") or "")),
+                    self.store.get_atom(str(edge.get("target_ref") or "")),
+                )
+                if any(
+                    atom is None
+                    or atom.get("deleted")
+                    or atom.get("lifecycle_state") != "active"
+                    for atom in endpoints
+                ):
+                    invalid_attachment_edge_ids.append(str(edge.get("edge_id") or ""))
+            invalid_attachment_edges = self.store.mark_edges_deleted(
+                conn, invalid_attachment_edge_ids
+            )
+            if invalid_attachment_edges:
+                projected_edges.extend(invalid_attachment_edges)
+                actions.append(
+                    {
+                        "action": "prune_inactive_attachment_edges",
+                        "edge_count": len(invalid_attachment_edges),
+                        "relations": sorted(
+                            {
+                                str(edge.get("relation") or "")
+                                for edge in invalid_attachment_edges
+                            }
+                        ),
+                    }
+                )
             smp_outputs = self.smp.cluster(atoms) + self.smp.detect_conflicts(atoms)
             existing_edge_ids = {
                 edge["edge_id"] for edge in self.store.list_edges()
@@ -4578,6 +4616,7 @@ class Amos:
         require_atom_policy = bool(decay.get("require_atom_policy", True))
         actions: list[dict[str, Any]] = []
         projected_atoms: list[dict[str, Any]] = []
+        projected_edges: list[dict[str, Any]] = []
         now = utc_now()
         superseded_refs = (
             self._active_superseded_refs()
@@ -4691,6 +4730,9 @@ class Amos:
                 if action["action"] == "archive":
                     changed["lifecycle_state"] = "archived"
                     changed["health_status"] = action.get("health_status", "stale")
+                    projected_edges.extend(
+                        self.store.mark_edges_deleted_for_ref(conn, str(atom["id"]))
+                    )
                 elif action["action"] == "mark_stale":
                     changed["health_status"] = "stale"
                 elif action["action"] == "mark_low_utility":
@@ -4732,6 +4774,7 @@ class Amos:
                         "policy": dict(decay),
                         "actions": actions,
                         "projected_atoms": projected_atoms,
+                        "projected_edges": projected_edges,
                     },
                     target_refs=[action["atom_ref"] for action in actions],
                 )
@@ -4742,6 +4785,7 @@ class Amos:
             "status": "completed",
             "action_count": len(actions),
             "actions": actions,
+            "projected_edges": projected_edges,
             "pressure": pressure,
             "event": event,
         }

@@ -1194,6 +1194,11 @@ AssociationEdge
 
 Edges are first-class. They are not incidental metadata.
 
+When an atom leaves the active lifecycle, live edges attached to it must leave
+the active graph in the same mutation. Stewardship also removes legacy live
+capability, limitation, commitment, and attribution edges whose endpoint is no
+longer active; provenance carried by canonical atom fields remains auditable.
+
 ### 7.12 MemoryPacket
 
 The retrieval output consumed by processors. A `MemoryPacket` is a rendered, bounded, non-authoritative view over canonical memory at a specific graph version.
