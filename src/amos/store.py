@@ -885,6 +885,55 @@ class SQLiteStore:
         )
         return cursor.rowcount > 0
 
+    def get_edge(self, edge_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM amos_edges WHERE edge_id = ?", (edge_id,)
+        ).fetchone()
+        return self._row_dict(row) if row else None
+
+    def upsert_edge(self, conn: sqlite3.Connection, edge: Mapping[str, Any]) -> None:
+        """Project an edge state, including lifecycle reactivation on promotion."""
+        conn.execute(
+            """
+            INSERT INTO amos_edges(
+                edge_id, source_ref, target_ref, relation, schema_version,
+                evidence_refs, scope, confidence, lifecycle_state, health_status,
+                created_at, updated_at, version, deleted
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(edge_id) DO UPDATE SET
+                source_ref = excluded.source_ref,
+                target_ref = excluded.target_ref,
+                relation = excluded.relation,
+                schema_version = excluded.schema_version,
+                evidence_refs = excluded.evidence_refs,
+                scope = excluded.scope,
+                confidence = excluded.confidence,
+                lifecycle_state = excluded.lifecycle_state,
+                health_status = excluded.health_status,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at,
+                version = excluded.version,
+                deleted = excluded.deleted
+            """,
+            (
+                edge["edge_id"],
+                edge["source_ref"],
+                edge["target_ref"],
+                edge["relation"],
+                edge["schema_version"],
+                canonical_json(edge["evidence_refs"]),
+                canonical_json(edge["scope"]),
+                canonical_json(edge["confidence"]),
+                edge["lifecycle_state"],
+                edge["health_status"],
+                edge["created_at"],
+                edge["updated_at"],
+                edge["version"],
+                1 if edge.get("deleted") else 0,
+            ),
+        )
+
     def list_edges(self) -> list[dict[str, Any]]:
         rows = self.conn.execute("SELECT * FROM amos_edges WHERE deleted = 0").fetchall()
         return [self._row_dict(row) for row in rows]

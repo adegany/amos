@@ -965,6 +965,21 @@ class Amos:
                 and updated.get("lifecycle_state") != "active"
             ):
                 projected_edges = self.store.mark_edges_deleted_for_ref(conn, atom_id)
+            elif (
+                current.get("lifecycle_state") != "active"
+                and updated.get("lifecycle_state") == "active"
+            ):
+                for edge in self._intrinsic_edges_for_atom(updated):
+                    existing_edge = self.store.get_edge(str(edge["edge_id"]))
+                    if existing_edge:
+                        edge = {
+                            **edge,
+                            "created_at": existing_edge["created_at"],
+                            "updated_at": utc_now(),
+                            "version": int(existing_edge["version"]) + 1,
+                        }
+                    self.store.upsert_edge(conn, edge)
+                    projected_edges.append(edge)
             event = self.store.append_event(
                 conn,
                 event_type="atom_updated",
@@ -2860,6 +2875,33 @@ class Amos:
                         ),
                     }
                 )
+            proposed_endpoint_edge_ids: list[str] = []
+            for edge in self.store.list_edges():
+                if edge.get("lifecycle_state") != "active":
+                    continue
+                endpoints = (
+                    self.store.get_atom(str(edge.get("source_ref") or "")),
+                    self.store.get_atom(str(edge.get("target_ref") or "")),
+                )
+                if any(
+                    atom is not None
+                    and not atom.get("deleted")
+                    and atom.get("lifecycle_state") == "proposed"
+                    for atom in endpoints
+                ):
+                    proposed_endpoint_edge_ids.append(str(edge.get("edge_id") or ""))
+            proposed_endpoint_edges = self.store.mark_edges_deleted(
+                conn, proposed_endpoint_edge_ids
+            )
+            if proposed_endpoint_edges:
+                projected_edges.extend(proposed_endpoint_edges)
+                actions.append(
+                    {
+                        "action": "isolate_proposed_endpoint_edges",
+                        "edge_count": len(proposed_endpoint_edges),
+                        "policy": "proposed_atoms_do_not_participate_in_active_graph",
+                    }
+                )
             smp_outputs = self.smp.cluster(atoms) + self.smp.detect_conflicts(atoms)
             existing_edge_ids = {
                 edge["edge_id"] for edge in self.store.list_edges()
@@ -4164,7 +4206,7 @@ class Amos:
     def _active_superseded_refs(
         self, refs: Sequence[str] | None = None
     ) -> dict[str, list[str]]:
-        active_refs = self.store.active_atom_ids(lifecycle_states=["active", "proposed"])
+        active_refs = self.store.active_atom_ids(lifecycle_states=["active"])
         scoped_refs = {str(ref) for ref in refs or [] if str(ref)}
         edges = (
             self.store.list_edges_for_refs(sorted(scoped_refs))
@@ -4173,6 +4215,8 @@ class Amos:
         )
         superseded: dict[str, list[str]] = {}
         for edge in edges:
+            if edge.get("lifecycle_state") != "active":
+                continue
             if edge.get("relation") != "rel:supersedes":
                 continue
             source = str(edge.get("source_ref") or "")
@@ -5726,10 +5770,17 @@ class Amos:
         edge: Mapping[str, Any],
         atoms_by_ref: Mapping[str, Mapping[str, Any]],
     ) -> bool:
+        if edge.get("lifecycle_state") != "active":
+            return False
         relation = str(edge.get("relation") or "")
         source = atoms_by_ref.get(str(edge.get("source_ref") or ""))
         target = atoms_by_ref.get(str(edge.get("target_ref") or ""))
         if not source or not target:
+            return False
+        if (
+            source.get("lifecycle_state") == "proposed"
+            or target.get("lifecycle_state") == "proposed"
+        ):
             return False
         if relation in {"rel:derived_from", "rel:supersedes"}:
             return True
@@ -6205,6 +6256,9 @@ class Amos:
 
     def _intrinsic_edges_for_atom(self, atom: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Project deterministic graph edges encoded by structured atom fields."""
+
+        if atom.get("deleted") or atom.get("lifecycle_state") != "active":
+            return []
 
         atom_id = str(atom["id"])
         scope = dict(atom.get("scope") or {})

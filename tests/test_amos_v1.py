@@ -410,6 +410,87 @@ def test_propose_batch_commit_deletion_request_and_shared_refresh(amos):
     assert deleted["residual_retention"]["packet_cache"] == "purged"
 
 
+def test_proposed_intrinsic_links_are_isolated_until_atom_promotion(amos):
+    source = amos.commit_atom(
+        {
+            "id": "active_source_for_proposal",
+            "type": "semantic",
+            "payload": {"summary": "Reviewed source"},
+            "scope": {"tenant": "qandl"},
+        }
+    )["atom"]
+    proposal = amos.propose_memory_atoms(
+        [
+            {
+                "id": "proposed_reflection_episode",
+                "type": "episode",
+                "payload": {
+                    "summary": "A reviewable reflection occurrence",
+                    "source_refs": [source["id"]],
+                },
+                "evidence_refs": [source["id"]],
+            }
+        ],
+        scope={"tenant": "qandl"},
+    )["proposals"][0]
+
+    assert proposal["atom"]["lifecycle_state"] == "proposed"
+    assert proposal["edges"] == []
+    assert amos.store.list_edges() == []
+
+    promoted = amos.update_atom(
+        proposal["atom"]["id"],
+        set_fields={"lifecycle_state": "active"},
+        expected_version=proposal["atom"]["version"],
+    )
+
+    assert promoted["atom"]["lifecycle_state"] == "active"
+    assert len(promoted["projected_edges"]) == 1
+    edge = promoted["projected_edges"][0]
+    assert edge["source_ref"] == proposal["atom"]["id"]
+    assert edge["target_ref"] == source["id"]
+    assert edge["relation"] == "rel:derived_from"
+    assert edge["lifecycle_state"] == "active"
+    assert amos.verify_replay()["status"] == "ok"
+
+
+def test_steward_removes_legacy_active_edges_touching_proposed_atoms(amos):
+    source = amos.commit_atom(
+        {
+            "id": "legacy_edge_active_source",
+            "type": "semantic",
+            "payload": {"summary": "Reviewed source"},
+            "scope": {"tenant": "qandl"},
+        }
+    )["atom"]
+    proposed = amos.propose_memory_atoms(
+        [
+            {
+                "id": "legacy_edge_proposed_atom",
+                "type": "semantic",
+                "payload": {"summary": "Still under review"},
+            }
+        ],
+        scope={"tenant": "qandl"},
+    )["proposals"][0]["atom"]
+    legacy_edge = amos._edge(
+        proposed["id"], source["id"], "rel:derived_from", {"tenant": "qandl"}
+    )
+    with amos.store.transaction() as conn:
+        amos.store.insert_edge(conn, legacy_edge)
+    assert amos.store.list_edges()
+
+    result = amos.run_steward(scope={"tenant": "qandl"})
+
+    action = next(
+        item for item in result["actions"]
+        if item["action"] == "isolate_proposed_endpoint_edges"
+    )
+    assert action["edge_count"] == 1
+    assert amos.store.list_edges() == []
+    assert amos.verify_replay()["status"] == "ok"
+
+
 def test_batch_commit_uses_single_transaction_and_rejects_duplicate_batch(amos):
     committed = amos.commit_memory_atoms(
         [
