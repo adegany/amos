@@ -290,12 +290,40 @@ bounded AMOS evidence windows and return side-effect-free proposals; the AMOS
 service applies policy gates, journals accepted low-risk mutations, and defers
 ambiguous or high-risk work for review.
 
+### Agent identity and cognitive-processor boundary
+
+AMOS preserves the identity and continuity of an agent, not the identity of the
+model used to process a request. Integrations must keep these concepts separate:
+
+- `agent_id` names the durable agent or digital being whose self-model,
+  autobiography, commitments, and memories are represented in AMOS.
+- `processor_id` and `target_processor` name functional processing roles for an
+  invocation. The LLM provider, model, checkpoint, weights, quantization, prompt,
+  and runtime are replaceable processing-substrate metadata, not agent identity.
+- A language-model invocation may receive bounded context and use ephemeral
+  caches, but it is stateless with respect to durable identity, memory authority,
+  commitments, and cross-session continuity. Those remain in AMOS and the
+  integrating runtime.
+- First-person language is a delegated rendering of the active agent's voice. It
+  must be grounded in that agent's current self-awareness packet and must not
+  present the model provider, training persona, or model traits as the agent's
+  self.
+- Prior model output is fallible generated expression, not canonical memory or
+  independent evidence. Model-derived memories and self-model changes must enter
+  AMOS as provenance-bearing, evidence-linked proposals and pass the normal
+  validation, authorization, and lifecycle gates.
+
+Replacing a model is a processor-substrate migration. It may change capability
+or runtime observations, but it must not silently change `agent_id`, rewrite the
+agent's lineage, or promote the incoming model's identity into the self-model.
+
 ### Client integration lessons
 
 AMOS works best when clients treat it as a shared memory plane, not a prompt
 log. A coordinated agent system should run one logical AMOS instance, give each
-role a stable identity, and retrieve bounded packets for the current role, task,
-scope, and runtime state.
+durable agent a stable identity, give reasoner, planner, executor, and other
+processing roles separate processor identifiers, and retrieve bounded packets
+for the current agent, task, scope, processor role, and runtime state.
 
 Recommended integration pattern:
 

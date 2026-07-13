@@ -1431,7 +1431,7 @@ Runtime state should be treated as high-volatility evidence. It may generate dur
 
 #### 7.13.4.1 Experience-derived profile updates
 
-Repeated role experiences may update an agent's self-model, but they should not
+Repeated agent experiences may update an agent's self-model, but they should not
 overwrite the static self-model contract. They should be represented as ordinary
 canonical atoms, usually `capability`, `limitation`, `procedure`, or `semantic`
 atoms with explicit provenance back to action outcomes and retrieval outcomes.
@@ -1444,7 +1444,7 @@ profile_update_source:
   identifies the client processor or experience source
 
 subject_agent / agent_id:
-  role identity whose profile is being updated
+  durable agent identity whose profile is being updated
 
 experience_kind:
   action, decision, review, tool use, recovery, planning, or other client term
@@ -2584,6 +2584,10 @@ possible user confirmation or human review
 ## 21. Processor-facing views
 
 Different processors should receive different views of the same canonical memory.
+Receiving a processor-facing view or being selected by `target_processor` does
+not confer durable agent identity. A processor is a replaceable cognitive
+function unless the application explicitly models it as a distinct durable
+agent with its own `agent_id`, evidence, and lifecycle.
 
 ### 21.1 Reasoner view
 
@@ -2663,7 +2667,7 @@ The self-awareness view must distinguish:
 
 ```text
 durable self-knowledge:
-  stable role, policy, durable capabilities, recurring limitations
+  stable agent role or purpose, policy, durable capabilities, recurring limitations
 
 current runtime state:
   tools currently available, sandbox state, active task, budgets, recent errors
@@ -2856,9 +2860,13 @@ Within that system:
   agents share canonical memory, shared task context, goals, commitments,
   evidence pointers, procedures, constraints, and shared memory views
 
-Each agent/service keeps:
-  its own ClientIdentity, SelfModelAtom, CapabilityAtoms, LimitationAtoms,
-  RuntimeStateSnapshots, permissions, and role-specific packet overlays
+Each durable agent keeps:
+  its own agent_id, SelfModelAtom, CapabilityAtoms, LimitationAtoms,
+  commitments, lineage, and agent-scoped packet overlays
+
+Each connected service or processor keeps:
+  its own ClientIdentity, processor_id, permissions, RuntimeStateSnapshots,
+  model/substrate metadata, and processor-specific packet overlays
 ```
 
 Physical deployment is separate from logical instance identity. One physical Amos cluster may host many logical Amos instances, but unrelated agent systems should be separated by tenant/workspace/project scope and access policy so their memories and self-models do not contaminate one another.
@@ -3218,6 +3226,54 @@ into a logging sink. The model should cite atom refs only when a memory
 materially changes a decision, selected field, explanation, or safety check. If
 memory was retrieved but not used, the client should record neutral
 `context_only` telemetry instead of positive retrieval feedback.
+
+#### 25.1.2 Durable agent identity and replaceable cognitive processors
+
+The processor used to interpret a packet is not the subject represented by the
+packet. AMOS integrations must maintain the following boundary:
+
+```text
+agent_id:
+  durable subject of self-model, memory, commitments, autobiography, and lineage
+
+processor_id / target_processor:
+  functional processing role selected for an invocation
+
+client_identity:
+  authenticated service or process actor and its authority
+
+model_profile:
+  provider, model, checkpoint, weights, quantization, prompt, runtime, and other
+  replaceable cognitive-substrate metadata
+```
+
+An LLM invocation may receive a bounded packet and use ephemeral inference
+state, but it must be stateless with respect to durable identity, memory
+authority, commitments, and cross-session continuity. Those properties live in
+the canonical AMOS state and the integrating agent runtime. Processor-local
+state must not silently become canonical memory.
+
+When an LLM writes in the first person, that voice is delegated by the active
+agent. The prompt and response-handling path must identify the agent as the
+speaker and the model as a cognitive processor. They must not import the model
+provider's persona, model name, training narrative, or self-description into the
+agent's role, purpose, personality, biography, capabilities, or limitations.
+Substrate-specific constraints may be recorded separately as model or runtime
+metadata; they become agent-level learnings only through independent evidence
+and the normal promotion policy.
+
+Generated output, including prior chat output, is a fallible expression rather
+than canonical truth or independent evidence about the agent. Any LLM-derived
+memory or self-model mutation must be a provenance-bearing, evidence-linked
+proposal subject to schema validation, authorization, contradiction handling,
+review policy, journaling, and lifecycle controls. The model must never promote
+its own identity claim merely because it generated the claim.
+
+Replacing or upgrading an LLM is a processor-substrate migration. The
+integration may update model metadata and observe new runtime capabilities or
+limitations, but it must preserve `agent_id`, lineage, commitments, and the
+existing self-model unless ordinary evidence-backed memory policy justifies a
+change.
 
 ### 25.2 Client identity and capabilities
 
@@ -4496,6 +4552,11 @@ natural-language explanations
 ```
 
 But LLM outputs should always be proposals, not authoritative mutations.
+
+The reviewer is a stateless, replaceable processor with respect to durable
+agent identity. Its model identity, provider persona, and generated
+self-description must not become the subject identity or evidence for a
+self-model claim.
 
 ```text
 LLM proposes

@@ -31,6 +31,7 @@ runtime backend for this repository state is SQLite behind the service boundary.
 | Decay policy execution | `src/amos/service.py::_run_decay_policy`, `tests/test_amos_v1.py::test_memory_policy_executes_atom_decay_policy`, `tests/test_amos_v1.py::test_memory_policy_pressure_archives_policyless_atoms_to_limit`, `tests/test_amos_v1.py::test_memory_policy_pressure_reports_residual_protected_atoms`, `tests/test_amos_v1.py::test_memory_policy_archives_superseded_atoms_and_retrieval_omits_them` |
 | Memory health diagnostics | `src/amos/service.py::health_memory`, `tests/test_amos_v1.py::test_health_memory_reports_quality_diagnostics` |
 | Generic maintenance distiller and external processor packs | `src/amos/maintenance.py`, `src/amos/service.py`, `src/amos/workers.py`, `tests/test_amos_v1.py::test_external_processor_distills_supported_control_lesson`, `tests/test_amos_v1.py::test_external_processor_defers_sanitized_control_claim`, `tests/test_amos_v1.py::test_external_processor_import_path_loading` |
+| Durable-agent / replaceable-processor identity contract | `README.md`, `docs/design-spec.md::25.1.2`, `docs/developer-guide.md::9`, `docs/mirror-agent-demo-spec.md::LM and agent identity boundary` |
 | Mirror Agent integration demo spec | `docs/mirror-agent-demo-spec.md` |
 | Mirror Agent integration demo | `examples/mirror_agent_demo.py` |
 | Mirror Agent browser UI and LM-backed chat adapter | `examples/mirror_agent_ui.py`, `tests/test_mirror_agent_demo.py::test_mirror_agent_ui_serves_report_chat_and_non_llm_maintenance` |
@@ -54,6 +55,7 @@ runtime backend for this repository state is SQLite behind the service boundary.
 | SMP gate | Required SMP output envelope and review-required high-risk recommendations |
 | Memory policy gate | Background worker ticks and explicit operator runs perform deterministic distillation, SMP/steward maintenance, processor-pack distillation, decay-policy execution, lexical/LSA derived-index refresh, packet-cache invalidation, persisted policy state, and `memory_policy_run` journal events; HTTP health remains observational |
 | Processor-pack policy gate | Externally registered processors emit side-effect-free proposals; supported low-risk add-atom lessons commit as derived semantic atoms; sanitized/confounded claims are deferred with draft-only reviewer status |
+| Agent/processor identity documentation gate | `agent_id` is the durable subject; processor, client, and model metadata are distinct; first-person LM output is delegated agent voice; prior output is non-authoritative; model-derived self changes are evidence-linked proposals; model replacement preserves agent identity and lineage. Runtime enforcement remains an integration responsibility until covered by dedicated tests. |
 | Observability gate | Memory/capacity health, background policy worker status, projection lag, index freshness, retrieval outcomes, deletion residuals |
 | Procedure policy | Advisory default, autonomous execution denied, external executor eligibility only after approvals |
 | LLM reviewer default | Disabled by default; forbidden actions exposed by policy |

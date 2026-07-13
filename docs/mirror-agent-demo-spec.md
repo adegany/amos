@@ -38,6 +38,27 @@ AMOS maintenance must remain non-LLM by default. SMP analysis, stewardship,
 index maintenance, packet-cache invalidation, and capacity reporting must not
 call the chat LM. The UI should make this separation visible.
 
+### LM and agent identity boundary
+
+`ent:agent:mirror` is the durable subject whose self-model and continuity AMOS
+stores. The configured LM is a stateless, replaceable cognitive processor with
+respect to that identity. Provider, model, checkpoint, quantization, prompt,
+and inference-runtime details are substrate metadata, not properties of the
+Mirror Agent's self.
+
+First-person chat text is the Mirror Agent's delegated voice, rendered by the
+LM from the active AMOS self-awareness and retrieval packets. The prompt must
+identify the Mirror Agent as the speaker and the LM as its processor; the LM
+must not answer as its provider persona or describe model traits as the agent's
+role, purpose, personality, biography, capabilities, or limitations.
+
+Prior LM output is fallible generated expression, not canonical memory or
+independent evidence about the Mirror Agent. Any LM-suggested memory or
+self-model update must be stored as a provenance-bearing, evidence-linked
+proposal and may become active only through the authorized AMOS validation and
+lifecycle path. Changing LM providers or models must not change
+`ent:agent:mirror`, its lineage, or its established self-model.
+
 ## Demonstrated Questions
 
 The scripted flow must produce enough state to answer:
@@ -75,6 +96,10 @@ Acceptance:
 - `retrieve_self_awareness(agent_id=ent:agent:mirror)` returns the self-model,
   capabilities, limitations, runtime state, commitments, and calibration data.
 - The chat answer is rendered from AMOS memory, not from hard-coded prose alone.
+- The chat prompt identifies `ent:agent:mirror` as the first-person subject and
+  identifies the configured LM only as a replaceable cognitive processor.
+- Model or provider identity is absent from the Mirror Agent self-model unless
+  it is explicitly stored as non-self substrate metadata.
 
 ### 2. Cross-Session Continuity
 
@@ -219,6 +244,8 @@ view for humans.
 
 - No autonomous external action execution.
 - No claim that the demo agent is conscious.
+- No promotion of an LM provider persona, model identity, or generated
+  self-description into the Mirror Agent's self-model.
 - No production web UI requirement in v1. The inspector is a local browser and
   JSON UI.
 - No bundled Postgres deployment. V1 uses the service-owned SQLite profile.

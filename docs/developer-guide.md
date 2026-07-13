@@ -242,10 +242,12 @@ side-effect-free maintenance proposals. AMOS applies policy gates, commits
 low-risk derived atoms, journals the mutation, and defers ambiguous or high-risk
 work for review.
 
-## 9. Model Agent Identity As Memory
+## 9. Model Durable Agent Identity Separately From Processors
 
-For multi-agent systems, store each role's self-model, capabilities,
-limitations, procedures, commitments, and runtime state as Amos atoms:
+For multi-agent systems, store each durable agent's self-model, capabilities,
+limitations, procedures, commitments, and runtime state as Amos atoms. Do not
+create a durable self-model for every transient processor role unless that
+processor is intentionally modeled as a distinct, persistent agent:
 
 ```text
 self_model
@@ -256,14 +258,40 @@ commitment
 runtime_state
 ```
 
-Retrieve those atoms through role-specific packets instead of hard-coding large
-static prompt blocks. Static context can remain a fallback for startup or Amos
-outage handling.
+Retrieve those atoms through agent-scoped packets with processor-specific views
+instead of hard-coding large static prompt blocks. Static context can remain a
+fallback for startup or Amos outage handling.
+
+Keep the identity fields explicit at the integration boundary:
+
+| Field | Meaning |
+| --- | --- |
+| `agent_id` | Durable subject whose self-model, commitments, autobiography, and continuity AMOS preserves. |
+| `processor_id` / `target_processor` | Functional reasoner, planner, executor, critic, or other processing role for a request. |
+| model profile | Replaceable provider, model, checkpoint, weights, quantization, prompt, and runtime metadata. |
+| `client_identity` | Authenticated service or process actor, including its permissions and trust level. |
+
+An LLM may receive bounded prompt context and use an ephemeral cache, but it
+must be treated as stateless with respect to durable identity and memory. The
+active agent is the first-person subject; the LLM is a replaceable cognitive
+processor delegated to render that agent's response. Do not infer the agent's
+role, purpose, personality, biography, capabilities, or limitations from the
+model name, provider persona, training claims, or the model speaking about
+itself.
+
+Prior generated output is neither authoritative self-knowledge nor independent
+evidence. If generated output suggests a memory or self-model change, record it
+as a provenance-bearing, evidence-linked proposal and apply the normal schema,
+authorization, contradiction, review, and lifecycle gates. A model replacement
+must leave `agent_id` and established lineage intact; newly observed substrate
+capabilities or limitations belong in model/runtime metadata until evidence
+supports an agent-level learning.
 
 Do not merge learned experience directly into a static role contract. Keep three
 surfaces separate:
 
-- Durable self-model: stable role, delegated authority, standing commitments.
+- Durable self-model: stable agent role or purpose, delegated authority, and
+  standing commitments.
 - Runtime state: current tool availability, denied capabilities, budgets,
   active task, and recent errors.
 - Experience profile: recurring demonstrated capabilities, recurring
@@ -279,11 +307,12 @@ lesson; telemetry should retain the raw packet and evidence for audit.
 AMOS packets are context inputs, not a license to fill a prompt with every
 available memory. A good integration renders:
 
-- The current role identity and authority.
+- The current agent identity and authority, with the current processor role
+  shown separately.
 - Current runtime constraints and denied capabilities.
 - The active task or mission policy.
 - A small set of materially relevant memories, including counterevidence.
-- Learned experience-profile capabilities and limitations for the role.
+- Learned experience-profile capabilities and limitations for the agent.
 - Citation candidates and a rule for when to cite or explain non-use.
 
 The model should be instructed to cite AMOS atom refs only when a memory
@@ -294,7 +323,9 @@ signal.
 ## 11. Integration Lessons
 
 - Run one logical Amos instance per coordinated agent system.
-- Give each role a stable `agent_id` and keep per-role self-models separate.
+- Give each durable agent a stable `agent_id`; give transient reasoner, planner,
+  executor, and critic roles stable processor identifiers instead of separate
+  selves by default.
 - Use scopes for tenant, project, run, mission, and agent visibility.
 - Keep static contracts as bootstrap or fallback context; prefer AMOS packets
   once current self-awareness and mission policy atoms are available.
@@ -318,6 +349,8 @@ signal.
   AMOS as an append-only logging sink.
 - Monitor memory health, capacity health, worker status, and journal verify.
 - Keep packet payloads in telemetry for audit and debugging.
+- Keep model and provider metadata out of the durable self-model, and route all
+  model-derived memory changes through evidence-linked proposal review.
 
 For small deployments, the HTTP service plus SQLite is the intended v1 starting
 point. The stdlib HTTP adapter serializes service calls through one in-process
