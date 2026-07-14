@@ -1,3 +1,5 @@
+![Amos banner](amos-banner.png)
+
 # Amos
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
