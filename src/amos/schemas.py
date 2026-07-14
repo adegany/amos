@@ -221,6 +221,44 @@ def _require_payload_list(
         raise ValidationError(f"{atom_type} payload field {field} must not be empty")
 
 
+def _require_payload_types(
+    atom_type: str,
+    payload: Mapping[str, Any],
+    fields: Mapping[str, type | tuple[type, ...]],
+) -> None:
+    """Enforce the JSON Schema property types for fields that are present."""
+
+    for field, expected in fields.items():
+        if field not in payload or payload[field] is None:
+            continue
+        if not isinstance(payload[field], expected):
+            expected_types = expected if isinstance(expected, tuple) else (expected,)
+            rendered = " or ".join(item.__name__ for item in expected_types)
+            raise ValidationError(
+                f"{atom_type} payload field {field} must be {rendered}"
+            )
+
+
+def _require_payload_string_list(
+    atom_type: str, payload: Mapping[str, Any], field: str
+) -> None:
+    if field not in payload or payload[field] is None:
+        return
+    _require_payload_list(atom_type, payload, field)
+    if not all(isinstance(item, str) for item in payload[field]):
+        raise ValidationError(
+            f"{atom_type} payload field {field} must contain only strings"
+        )
+
+
+def _require_agent_identity_types(atom_type: str, payload: Mapping[str, Any]) -> None:
+    _require_payload_types(
+        atom_type,
+        payload,
+        {"agent_id": str, "subject_agent": str},
+    )
+
+
 def validate_atom_payload(atom_type: str, payload: Mapping[str, Any]) -> None:
     """Enforce the v1 typed payload contracts used by MemoryAtom.type."""
 
@@ -234,6 +272,11 @@ def validate_atom_payload(atom_type: str, payload: Mapping[str, Any]) -> None:
                 ("subject", "relation", "object"),
             ),
         )
+        _require_payload_types(
+            atom_type,
+            payload,
+            {"claim": str, "predicate": str, "relation": str, "qualifiers": Mapping},
+        )
         return
     if atom_type == "preference":
         _require_payload_fields(
@@ -244,12 +287,24 @@ def validate_atom_payload(atom_type: str, payload: Mapping[str, Any]) -> None:
         polarity = str(payload["polarity"])
         if polarity not in PREFERENCE_POLARITIES:
             raise ValidationError(f"unsupported preference polarity: {polarity}")
+        _require_payload_types(atom_type, payload, {"holder": str})
         return
     if atom_type == "goal":
         _require_payload_alternative(
             atom_type,
             payload,
             (("description",), ("objective",), ("desired_state",)),
+        )
+        _require_payload_types(
+            atom_type,
+            payload,
+            {
+                "description": str,
+                "objective": str,
+                "goal_status": str,
+                "status": str,
+                "owner": str,
+            },
         )
         return
     if atom_type == "commitment":
@@ -258,33 +313,75 @@ def validate_atom_payload(atom_type: str, payload: Mapping[str, Any]) -> None:
             payload,
             (("description",), ("promised_action",)),
         )
+        _require_payload_types(
+            atom_type,
+            payload,
+            {
+                "agent_id": str,
+                "agent": str,
+                "description": str,
+                "commitment_status": str,
+                "status": str,
+                "due": str,
+            },
+        )
         return
     if atom_type == "procedure":
         _require_payload_fields(atom_type, payload, ("trigger_context", "steps"))
         _require_payload_list(atom_type, payload, "steps", non_empty=True)
+        _require_payload_types(atom_type, payload, {"review_status": str})
         return
     if atom_type == "episode":
         _require_payload_alternative(atom_type, payload, (("summary",), ("task",)))
+        _require_payload_types(
+            atom_type,
+            payload,
+            {"summary": str, "started_at": str, "ended_at": str},
+        )
+        _require_payload_string_list(atom_type, payload, "participants")
+        _require_payload_string_list(atom_type, payload, "external_refs")
         return
     if atom_type == "self_model":
         _require_payload_alternative(atom_type, payload, (("agent_id",), ("subject_agent",)))
+        _require_agent_identity_types(atom_type, payload)
+        _require_payload_types(atom_type, payload, {"name": str, "role": str})
         return
     if atom_type == "capability":
         _require_payload_alternative(atom_type, payload, (("agent_id",), ("subject_agent",)))
         _require_payload_alternative(atom_type, payload, (("name",), ("capability",)))
+        _require_agent_identity_types(atom_type, payload)
+        _require_payload_types(
+            atom_type,
+            payload,
+            {"name": str, "capability": str, "description": str},
+        )
         return
     if atom_type == "limitation":
         _require_payload_alternative(atom_type, payload, (("agent_id",), ("subject_agent",)))
         _require_payload_alternative(atom_type, payload, (("name",), ("limitation",)))
+        _require_agent_identity_types(atom_type, payload)
+        _require_payload_types(
+            atom_type,
+            payload,
+            {"name": str, "limitation": str, "description": str},
+        )
         return
     if atom_type == "runtime_state":
         _require_payload_alternative(atom_type, payload, (("agent_id",), ("subject_agent",)))
+        _require_agent_identity_types(atom_type, payload)
+        _require_payload_types(
+            atom_type, payload, {"capabilities": Mapping, "load": Mapping}
+        )
+        _require_payload_string_list(atom_type, payload, "denied_capabilities")
+        _require_payload_string_list(atom_type, payload, "constraints")
         return
     if atom_type == "self_assessment":
         _require_payload_alternative(atom_type, payload, (("agent_id",), ("subject_agent",)))
         _require_payload_fields(atom_type, payload, ("claim", "calibration"))
         if not isinstance(payload["calibration"], Mapping):
             raise ValidationError("self_assessment payload field calibration must be an object")
+        _require_agent_identity_types(atom_type, payload)
+        _require_payload_types(atom_type, payload, {"claim": str})
         return
     if atom_type == "agentic_trace":
         _require_payload_fields(atom_type, payload, ("task", "action", "outcome"))
@@ -293,16 +390,53 @@ def validate_atom_payload(atom_type: str, payload: Mapping[str, Any]) -> None:
             raise ValidationError(
                 "agentic_trace payload field external_constraints must be a list"
             )
+        _require_payload_types(
+            atom_type,
+            payload,
+            {
+                "agent_id": str,
+                "subject_agent": str,
+                "task": str,
+                "action": str,
+                "outcome": str,
+                "responsibility": str,
+                "lesson": (str, type(None)),
+            },
+        )
+        _require_payload_string_list(atom_type, payload, "external_constraints")
         return
     if atom_type == "action_outcome":
         _require_payload_alternative(atom_type, payload, (("agent_id",), ("subject_agent",)))
         _require_payload_fields(atom_type, payload, ("action_ref", "status"))
+        _require_agent_identity_types(atom_type, payload)
+        _require_payload_types(
+            atom_type,
+            payload,
+            {
+                "action_ref": str,
+                "status": str,
+                "correction": (str, type(None)),
+                "limitation": (str, type(None)),
+            },
+        )
         return
     if atom_type == "self_narrative":
         _require_payload_alternative(atom_type, payload, (("agent_id",), ("subject_agent",)))
         _require_payload_fields(atom_type, payload, ("narrative", "artifact"))
         if payload["artifact"] is not True:
             raise ValidationError("self_narrative payload field artifact must be true")
+        _require_agent_identity_types(atom_type, payload)
+        _require_payload_types(
+            atom_type,
+            payload,
+            {"narrative": str, "generated_from_graph_version": int},
+        )
+        _require_payload_string_list(atom_type, payload, "source_refs")
+        graph_version = payload.get("generated_from_graph_version")
+        if isinstance(graph_version, int) and graph_version < 0:
+            raise ValidationError(
+                "self_narrative payload field generated_from_graph_version must be non-negative"
+            )
         return
     if atom_type == "semantic":
         _require_payload_alternative(
@@ -377,8 +511,8 @@ def normalize_atom(atom: Mapping[str, Any], *, require_id: bool = False) -> dict
     }
     if normalized["schema_version"] != SCHEMA_VERSION:
         raise ValidationError(f"unsupported schema_version: {normalized['schema_version']}")
-    if normalized["salience"] < 0 or normalized["utility"] < 0:
-        raise ValidationError("salience and utility must be non-negative")
+    if not 0 <= normalized["salience"] <= 1 or not 0 <= normalized["utility"] <= 1:
+        raise ValidationError("salience and utility must be between 0 and 1")
     return normalized
 
 

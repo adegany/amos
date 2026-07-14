@@ -1,66 +1,58 @@
 # AMOS V1-Local Verification Matrix
 
-This document maps the V1 implementation baseline and acceptance gates from
-`docs/design-spec.md` to repository artifacts and tests for the first usable
-deployment profile: an AMOS HTTP service with one in-process SQLite store. The
-Postgres DDL is included as the target migration contract, but the verified
-runtime backend for this repository state is SQLite behind the service boundary.
+This document maps the verified implementation boundary in
+[`v1-local-contract.md`](v1-local-contract.md) to code and tests. The checked-in
+runtime profile is one AMOS HTTP service process with one service-owned SQLite
+store. Postgres DDL is a future migration contract, not a verified backend.
 
-## Artifact Coverage
+Status terms:
 
-| Spec area | Evidence |
-| --- | --- |
-| JSON Schema 2020-12 artifacts | `schemas/*.schema.json` |
-| Atom envelope and payload boundary | `src/amos/schemas.py`, `tests/test_amos_v1.py::test_schema_rejects_payload_envelope_duplication` |
-| Typed payload schemas and runtime validation | `schemas/core_payloads.schema.json`, `schemas/self_awareness_atoms.schema.json`, `schemas/agentic_recall.schema.json`, `src/amos/schemas.py::validate_atom_payload`, `tests/test_amos_v1.py::test_runtime_enforces_typed_payload_contracts` |
-| Evidence, edge, packet, event, access, scope, deletion, capacity, SMP schemas | `schemas/` |
-| SQLite service migration | `migrations/sqlite/001_initial.sql` |
-| Postgres target migration contract | `migrations/postgres/001_initial.sql` |
-| Canonical store and journal | `src/amos/store.py` |
-| Service API surface | `src/amos/service.py` |
-| HTTP V1 API adapter with service-owned store | `src/amos/http_api.py` |
-| CLI | `src/amos/cli.py` |
-| Seed ontology governance | `src/amos/ontology.py` |
-| Worker artifacts | `src/amos/workers.py` |
-| Non-generative SMP | `src/amos/smp.py`, `tests/test_amos_v1.py::test_smp_encoder_uses_idf_weighting_and_character_ngrams` |
-| Automatic memory policy | `src/amos/service.py`, `src/amos/workers.py`, `src/amos/http_api.py`, `src/amos/cli.py`, `tests/test_amos_v1.py::test_automatic_memory_policy_distills_and_maintains_on_retrieval`, `tests/test_amos_v1.py::test_health_memory_can_skip_foreground_policy_tick`, `tests/test_amos_v1.py::test_memory_policy_archives_superseded_atoms_and_retrieval_omits_them`, `tests/test_amos_v1.py::test_background_memory_policy_worker_runs_queued_tick`, `tests/test_amos_v1.py::test_memory_policy_worker_force_runs_without_manual_maintenance` |
-| Attention-aware packet ranking | `src/amos/service.py::retrieve_packet`, `src/amos/service.py::_attention_policy`, `tests/test_amos_v1.py::test_retrieve_packet_attention_context_shapes_ranking_and_trace`, `tests/test_amos_v1.py::test_attention_context_is_part_of_packet_cache_key` |
-| Rebuildable SQLite token candidate index | `src/amos/store.py::candidate_atom_ids_for_tokens`, `src/amos/service.py::_indexed_retrieval_candidates`, `tests/test_amos_v1.py::test_retrieve_packet_uses_sqlite_token_candidate_index` |
-| Rebuildable lexical/LSA vector indexes | `src/amos/smp.py::SemanticMaintenanceProcessor.configure_vector_model`, `src/amos/store.py::token_document_frequencies`, `src/amos/store.py::replace_token_latent_vectors`, `src/amos/service.py::_build_lsa_token_vectors`, `tests/test_amos_v1.py::test_index_rebuild_persists_lsa_vectors_and_refreshes_atom_vectors`, `tests/test_amos_v1.py::test_retrieval_falls_back_to_semantic_similarity_for_morphology` |
-| Retrieval outcome utility feedback | `src/amos/service.py::record_retrieval_outcome`, `tests/test_amos_v1.py::test_retrieval_outcome_telemetry_is_reportable`, `tests/test_amos_v1.py::test_retrieval_outcome_corrections_demote_atom_utility` |
-| Decay policy execution | `src/amos/service.py::_run_decay_policy`, `tests/test_amos_v1.py::test_memory_policy_executes_atom_decay_policy`, `tests/test_amos_v1.py::test_memory_policy_pressure_archives_policyless_atoms_to_limit`, `tests/test_amos_v1.py::test_memory_policy_pressure_reports_residual_protected_atoms`, `tests/test_amos_v1.py::test_memory_policy_archives_superseded_atoms_and_retrieval_omits_them` |
-| Memory health diagnostics | `src/amos/service.py::health_memory`, `tests/test_amos_v1.py::test_health_memory_reports_quality_diagnostics` |
-| Generic maintenance distiller and external processor packs | `src/amos/maintenance.py`, `src/amos/service.py`, `src/amos/workers.py`, `tests/test_amos_v1.py::test_external_processor_distills_supported_control_lesson`, `tests/test_amos_v1.py::test_external_processor_defers_sanitized_control_claim`, `tests/test_amos_v1.py::test_external_processor_import_path_loading` |
-| Durable-agent / replaceable-processor identity contract | `README.md`, `docs/design-spec.md::25.1.2`, `docs/developer-guide.md::9`, `docs/mirror-agent-demo-spec.md::LM and agent identity boundary` |
-| Mirror Agent integration demo spec | `docs/mirror-agent-demo-spec.md` |
-| Mirror Agent integration demo | `examples/mirror_agent_demo.py` |
-| Mirror Agent browser UI and LM-backed chat adapter | `examples/mirror_agent_ui.py`, `tests/test_mirror_agent_demo.py::test_mirror_agent_ui_serves_report_chat_and_non_llm_maintenance` |
+- **Implemented:** checked-in behavior with automated verification.
+- **Partial:** only the stated v1-local subset is implemented.
+- **Evidence only:** reproducible evidence exists, but no automated acceptance
+  threshold is enforced.
 
-## Acceptance Gates
+## Architecture and artifact coverage
 
-| Gate | Current verification evidence |
-| --- | --- |
-| Schema gate | Payload envelope duplication rejection test; runtime typed payload validation; SMP shape validation for advisory maintenance reports |
-| Journal gate | Event entries include idempotency, authorization context, expected versions, checksum, projection status |
-| Projection gate | Mutations append events and project graph changes in one transaction |
-| Replay gate | `verify_journal_chain`, `verify_replay`, replay/cache invalidation tests |
-| Retrieval gate | Packet graph version, provenance, omissions, degradation, score components, budgets, token-index candidate prefilter with graph-neighbor expansion, candidate-scoped edge reads, and semantic fallback when token prefiltering has no direct hits |
-| Attention gate | Optional `attention_context` changes packet ranking through explicit focus/type/counterevidence/suppression score components, emits `attention_trace`, and participates in graph-version packet cache keys |
-| Self-awareness gate | Capability suppression, runtime state, limitations, open commitments, calibration tests |
-| Agentic recall gate | Success/failure/blocked/correction/limitation/external constraint, self/other/shared/external/unknown attribution, counterevidence, self-narrative drift tests, and no foreground memory-policy tick on recall reads |
-| Shared-memory gate | Shared common graph version with per-processor overlays, identity-specific omissions, and least-common-denominator evidence in common items |
-| Authorization gate | Read/evidence access filtering and mutation trust/capability tests |
-| Deletion gate | Atom deletion, edge suppression, packet cache purge, tombstone content prevention, residual-retention report |
-| Capacity gate | Configured pressure modes and degraded packet disclosure |
-| SMP gate | Required SMP output envelope and review-required high-risk recommendations |
-| Memory policy gate | Background worker ticks and explicit operator runs perform deterministic distillation, SMP/steward maintenance, processor-pack distillation, decay-policy execution, lexical/LSA derived-index refresh, packet-cache invalidation, persisted policy state, and `memory_policy_run` journal events; HTTP health remains observational |
-| Processor-pack policy gate | Externally registered processors emit side-effect-free proposals; supported low-risk add-atom lessons commit as derived semantic atoms; sanitized/confounded claims are deferred with draft-only reviewer status |
-| Agent/processor identity documentation gate | `agent_id` is the durable subject; processor, client, and model metadata are distinct; first-person LM output is delegated agent voice; prior output is non-authoritative; model-derived self changes are evidence-linked proposals; model replacement preserves agent identity and lineage. Runtime enforcement remains an integration responsibility until covered by dedicated tests. |
-| Observability gate | Memory/capacity health, background policy worker status, projection lag, index freshness, retrieval outcomes, deletion residuals |
-| Procedure policy | Advisory default, autonomous execution denied, external executor eligibility only after approvals |
-| LLM reviewer default | Disabled by default; forbidden actions exposed by policy |
+| Area | Implementation | Primary tests |
+| --- | --- | --- |
+| Public API composition | `src/amos/service.py` thin `Amos` facade | `tests/test_architecture.py`, plus the entire suite through the stable facade |
+| Mutations and lifecycle | `src/amos/mutations_service.py`, `src/amos/access_service.py`, `src/amos/graph_service.py` | `tests/test_schema_and_mutations.py` |
+| Retrieval, attention, and ranking | `src/amos/retrieval_service.py`, `src/amos/index_service.py` | `tests/test_retrieval.py` |
+| Self-model and shared views | `src/amos/views_service.py` | `tests/test_self_models.py` |
+| Stewardship and SMP | `src/amos/stewardship_service.py`, `src/amos/maintenance.py`, `src/amos/smp.py` | `tests/test_maintenance.py` |
+| Automatic policy and capacity | `src/amos/policy_service.py`, `src/amos/capacity_service.py`, `src/amos/workers.py` | `tests/test_policy_and_capacity.py` |
+| External processor packs | `src/amos/maintenance.py`, `src/amos/stewardship_service.py` | `tests/test_processor_packs.py` |
+| Journal and health verification | `src/amos/diagnostics_service.py`, `src/amos/store.py` | `tests/test_schema_and_mutations.py`, `tests/test_policy_and_capacity.py` |
+| HTTP and CLI adapters | `src/amos/http_api.py`, `src/amos/cli.py` | `tests/test_cli_http.py` |
+| Mirror Agent example | `examples/mirror_agent_demo.py`, `examples/mirror_agent_ui.py` | `tests/test_mirror_agent_demo.py` |
+| JSON Schema artifacts | `schemas/*.schema.json`, dependency-free runtime mirror in `src/amos/schemas.py` | `tests/test_schema_and_mutations.py::test_runtime_enforces_typed_payload_contracts`, `tests/test_schema_and_mutations.py::test_runtime_enforces_json_schema_property_types_and_score_bounds` |
+| SQLite migration | `migrations/sqlite/001_initial.sql` | Migration smoke command below |
+| Postgres target contract | `migrations/postgres/001_initial.sql` | Artifact only; runtime verification is intentionally absent |
 
-## Verification Commands
+## Acceptance status
+
+| Gate | Status | Current verification evidence and boundary |
+| --- | --- | --- |
+| Schema | Implemented | Envelope/payload separation, required fields, property types, enum constraints, and score bounds are tested. |
+| Journal | Implemented | Events include authorization context, expected versions, checksums, and projection status. |
+| Projection | Implemented | Canonical mutations append events and project graph changes transactionally. |
+| Replay | Partial | `DiagnosticsService.verify_replay()` rebuilds from the full retained journal. Snapshot-plus-tail recovery and segment compaction are not implemented. |
+| Retrieval and attention | Implemented | Graph-version cache keys, token candidate indexing, semantic fallback, scoped edge activation, score components, omissions, provenance, degradation, and attention traces are tested. |
+| Self-awareness and agentic recall | Implemented | Runtime capability suppression, commitments, calibration, responsibility attribution, counterevidence, and self-narrative expiry are tested. |
+| Shared memory | Implemented | Common graph-version views plus identity-specific overlays and evidence omissions are tested. |
+| Authorization | Implemented | Scope, visibility, mutation roles, trust levels, capabilities, and evidence visibility are independently exercised. |
+| Deletion | Partial | Atom/edge suppression, hot index/cache cleanup, tombstones, replay exclusion, and residual-retention disclosure are tested. External evidence archives, snapshots, key management, and backups are not owned by v1-local. |
+| Capacity | Partial | One SQLite-file byte budget produces one pressure mode and packet degradation. Per-tier and external-store budgets are planned. |
+| SMP and processor packs | Implemented | Deterministic proposal envelopes, review gates, low-risk auto-commit policy, and external processor loading are tested. |
+| Memory policy | Implemented | Background and forced deterministic maintenance, decay, cleanup, distillation, index refresh, cache invalidation, and journal summaries are tested. |
+| Performance | Evidence only | `benchmarks/benchmark_amos.py` is reproducible, but CI enforces no scale or latency threshold. |
+| Observability | Implemented with declared constants | Health, capacity, index freshness, retrieval outcomes, and deletion residuals are reportable. Projection lag is fixed at zero for the transactional single-process profile. |
+| Procedure policy | Implemented | Procedures are advisory; autonomous execution is denied by default. |
+| LLM reviewer default | Implemented | Disabled and non-authoritative by default. |
+| Durable-agent identity | Documentation contract | Agent identity is distinct from processor/model identity; dedicated runtime enforcement remains integration work. |
+
+## Verification commands
 
 ```bash
 python -m compileall src
@@ -92,6 +84,5 @@ print("sqlite migration ok")
 PY
 ```
 
-The HTTP endpoint smoke test is included in the pytest suite. In sandboxes that
-forbid loopback sockets it is skipped with an explicit reason; when sockets are
-available it verifies the real HTTP adapter.
+The HTTP endpoint tests skip explicitly when a sandbox forbids loopback
+sockets. Outside such sandboxes they exercise the real stdlib HTTP adapter.

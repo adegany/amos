@@ -23,8 +23,13 @@ The core thesis is that long-term agent memory should not be stored primarily as
 ```mermaid
 flowchart LR
     A[Agents and tools] -->|capture events, evidence, atoms| H[AMOS HTTP API]
-    H --> S[AMOS service]
-    S --> V[Schema validation and access policy]
+    H --> F[Thin Amos facade]
+    F --> MU[Mutation service]
+    F --> RE[Retrieval service]
+    F --> VW[Self-model and shared-view service]
+    F --> ST[Stewardship service]
+    F --> PO[Memory-policy service]
+    MU --> V[Schema validation and access policy]
     V --> J[Append-only journal]
     V --> M[Typed memory atoms]
     V --> E[Evidence records]
@@ -33,7 +38,7 @@ flowchart LR
     M --> P[Packet renderer]
     E --> P
     G --> P
-    S --> W[Background memory policy worker]
+    PO --> W[Background memory policy worker]
     W --> D[Deterministic distillation]
     W --> SMP[Semantic Maintenance Processor]
     W --> C[Capacity and cleanup]
@@ -42,7 +47,9 @@ flowchart LR
     C --> M
     P --> AT[Attention policy and trace]
     AT -->|bounded memory packets| A
-    S --> DB[(SQLite v1-local\nPostgres planned)]
+    MU --> DB[(SQLite v1-local\nPostgres planned)]
+    RE --> DB
+    ST --> DB
 ```
 
 AMOS exposes memory as a service boundary. Agents submit structured evidence
@@ -85,6 +92,11 @@ Use AMOS when you want:
 This repository now includes a dependency-free AMOS v1-local implementation
 alongside the design spec.
 
+The public `Amos` class is a compatibility facade over explicit mutation,
+retrieval, self-view, stewardship, policy, capacity, indexing, graph, and
+diagnostic components. Domain components depend on the store and named
+collaborators; they do not call back into the facade.
+
 The first usable deployment profile is an AMOS HTTP service that owns one
 in-process SQLite store and serializes access through the service boundary:
 
@@ -98,7 +110,8 @@ in-process SQLite store and serializes access through the service boundary:
   hashed character 3/4-grams for morphology and typo tolerance, and a
   maintenance-built LSA token projection stored as disposable derived state.
 - Schema validation for envelope/payload separation, typed payload contracts,
-  and JSON-compatible atoms.
+  JSON Schema property types, bounded canonical scores, and JSON-compatible
+  atoms.
 - Idempotent capture/commit operations and compare-and-swap update checks.
 - Memory packets with scope isolation, access filtering, omissions, conflicts,
   provenance, and degradation metadata; normal retrieval omits superseded atoms
@@ -131,9 +144,10 @@ in-process SQLite store and serializes access through the service boundary:
   tombstones, compacts old idempotency responses, checkpoints WAL, and runs
   SQLite `VACUUM` on a bounded interval.
 - Journal chain and replay verification.
-- Worker artifacts for background memory policy ticks, projection checks, index
-  maintenance, packet-cache invalidation, capacity governance, stewardship,
-  self-model calibration, agentic-recall auditing, and SMP analysis.
+- An active background memory-policy worker plus in-process adapters for journal
+  verification, index maintenance, packet-cache invalidation, capacity
+  governance, stewardship, self-model calibration, agentic-recall auditing, and
+  SMP analysis.
 - Dependency-free HTTP adapter for the V1 JSON API surface; connected agents
   call the service instead of embedding their own stores. In HTTP service mode,
   memory health is observational and packet retrieval queues policy work on the
@@ -143,8 +157,10 @@ in-process SQLite store and serializes access through the service boundary:
 Start here:
 
 - [Amos Design Spec](docs/design-spec.md)
+- [AMOS V1-Local Contract](docs/v1-local-contract.md)
 - [Amos Developer Guide](docs/developer-guide.md)
 - [AMOS V1 Verification Matrix](docs/v1-verification.md)
+- [AMOS Roadmap](docs/roadmap.md)
 - [Amos Mirror Agent Demo Spec](docs/mirror-agent-demo-spec.md)
 
 ## Quick start
@@ -265,20 +281,21 @@ planner packets, verifies replay, and optionally runs the automatic memory
 policy once. It measures the current v1-local SQLite baseline, not HTTP,
 network, or background-worker scheduling overhead.
 
-Reference result from a local workstation run on 2026-07-04:
+Reference result from a local workstation run on 2026-07-14. These values are
+evidence for the 100-atom v1-local profile, not an enforced performance gate:
 
 | Benchmark | Result |
 | --- | ---: |
 | Atoms committed | 100 |
 | Retrievals | 20 |
-| Commit throughput | 1120.0 atoms/s |
-| Commit latency p50 / p95 | 0.841 ms / 1.024 ms |
-| Retrieval latency p50 / p95 | 0.243 ms / 15.1 ms |
-| Average packet items | 9 |
-| Replay verification | 20.036 ms (ok) |
-| Forced memory policy run | 195.668 ms (completed) |
+| Commit throughput | 345.75 atoms/s |
+| Commit latency p50 / p95 | 2.778 ms / 3.977 ms |
+| Retrieval latency p50 / p95 | 0.344 ms / 22.078 ms |
+| Average packet items | 8.75 |
+| Replay verification | 29.108 ms (ok) |
+| Forced memory policy run | 21530.287 ms (completed) |
 | Final atoms / edges | 101 / 60 |
-| SQLite DB size | 1126400 bytes |
+| SQLite DB size | 1179648 bytes |
 | Environment | Python 3.12.2; 24 CPUs; Linux-6.17.0-35-generic-x86_64-with-glibc2.39 |
 
 ## Integration boundary
@@ -359,38 +376,8 @@ behavior from their own traces.
 
 ## Roadmap
 
-### v1.0
-
-- Stabilize the V1 HTTP API envelopes and schema contracts.
-- Keep SQLite as the first supported shared-service deployment profile.
-- Expand replay verification and background-maintenance acceptance tests.
-- Improve attention policy diagnostics, packet-ranking diagnostics, omissions
-  reporting, and retrieval-outcome utility learning.
-- Harden the Mirror Agent demo as the reference self-awareness integration.
-
-### Storage and Scale
-
-- Add production Postgres support using the existing migration contract.
-- Split the v1-local serialized HTTP adapter into reader/writer-safe concurrency
-  when retrieval throughput requires parallel reads.
-- Add optional external vector and full-text index integrations for larger
-  deployments while keeping index data rebuildable and non-canonical.
-- Support larger multi-tenant deployments with clearer capacity budgets, pressure modes, and retention policy controls.
-- Add export/import tooling for moving v1-local SQLite stores into production deployments.
-
-### Memory Quality
-
-- Broaden deterministic SMP coverage for deduplication, contradiction detection, stale-memory demotion, and graph repair.
-- Add more domain-processor examples for task-specific distillation without changing AMOS core.
-- Improve self-model calibration reports and agentic-recall audits.
-- Add governance surfaces for reviewing deferred or high-risk maintenance proposals.
-
-### Ecosystem
-
-- Publish package artifacts when the API stabilizes.
-- Add GitHub Actions CI badges once repository CI is configured.
-- Document integration adapters for agent runtimes and orchestration frameworks.
-- Provide deployment recipes for local service, containerized service, and hosted Postgres-backed service profiles.
+Planned work is maintained separately in [docs/roadmap.md](docs/roadmap.md) so
+future architecture is not presented as current v1-local behavior.
 
 ## Non-goals for this phase
 
@@ -398,5 +385,12 @@ behavior from their own traces.
 - No prompt-only memory architecture.
 - No autonomous external-state procedure execution.
 - No irreversible autonomous deletion policy without audit controls.
+- No canonical graph snapshots or compacted journal segments yet; replay uses
+  the full retained journal.
+- No v1-local ownership of evidence-object deletion, encryption keys, snapshots,
+  or offline-backup enforcement.
+- No per-tier capacity accounting or production-scale latency guarantee; the
+  current capacity mode covers one SQLite file and the benchmark is evidence,
+  not an acceptance threshold.
 - No bundled production Postgres service yet; Postgres DDL is included as the
   target migration contract, while v1-local uses SQLite behind the HTTP API.

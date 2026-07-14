@@ -24,7 +24,7 @@ class IndexMaintainer:
         self.amos = amos
 
     def rebuild(self) -> dict[str, Any]:
-        return self.amos._rebuild_derived_indexes(
+        return self.amos.indexes.rebuild(
             graph_version=self.amos.store.graph_version()
         )
 

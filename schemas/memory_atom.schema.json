@@ -65,6 +65,8 @@
         "score": { "type": "number", "minimum": 0, "maximum": 1 }
       }
     },
+    "salience": { "type": "number", "minimum": 0, "maximum": 1 },
+    "utility": { "type": "number", "minimum": 0, "maximum": 1 },
     "lifecycle_state": {
       "enum": ["active", "archived", "deleted", "proposed", "superseded", "tombstoned"]
     },

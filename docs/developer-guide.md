@@ -70,6 +70,9 @@ POST /v1/atoms:commit
     "scope": {"project": "qandl", "mission": "performance_search"},
     "layer": "episodic",
     "payload": {
+      "agent_id": "pilot",
+      "action_ref": "run-42:chunk-7:increase-exploration-floor",
+      "status": "success",
       "action": "increase exploration floor",
       "outcome": "improved candidate diversity",
       "context": "UPRO chunk 7"
