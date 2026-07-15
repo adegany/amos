@@ -3178,7 +3178,8 @@ failures and must not be retried blindly.
 
 AMOS owns canonical memory semantics, lifecycle, maintenance, retrieval
 diagnostics, and audit. Client systems own domain interpretation, runtime
-authority, prompt rendering, and domain-specific maintenance processors.
+authority, prompt rendering, producer-normalized canonical graph metadata, and
+domain-specific maintenance processors.
 
 A production client should treat AMOS as a memory service, not as a prompt log:
 
@@ -3207,6 +3208,13 @@ agent, or support bot may promote recurring role experiences into capability,
 limitation, procedure, or semantic atoms. AMOS should provide the generic
 proposal and policy machinery; it should not encode that client's domain rules
 in core.
+
+A client-specific processor is not required merely to construct the graph. If
+the producer already knows the typed semantics, it should attach canonical
+`payload.semantic_facets` and `payload.graph_relations`; the built-in generic
+processor validates those structures and proposes governed edges. External
+processors remain appropriate for domain-specific aggregation, calibration,
+causal review, or legacy payloads that cannot emit the canonical contract.
 
 Prompt rendering should keep these sources distinct:
 
