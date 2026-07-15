@@ -14,6 +14,9 @@ from typing import Any, Mapping, Sequence
 from .errors import AccessDenied, CASConflict, IdempotencyConflict, ValidationError
 from .maintenance import (
     EvidenceWindow,
+    GENERIC_GRAPH_PROCESSOR_ID,
+    GENERIC_GRAPH_PROCESSOR_VERSION,
+    LOW_RISK_EXPLICIT_RELATIONS,
     MaintenanceProcessor,
     SEMANTIC_RELATION_PROCESSOR_ID,
     SEMANTIC_RELATION_PROCESSOR_VERSION,
@@ -308,4 +311,3 @@ def _deterministic_unit_vector(labels: Sequence[str], salt: int) -> list[float]:
         values[0] = 1.0
         norm = 1.0
     return [value / norm for value in values] if norm > 0 else []
-

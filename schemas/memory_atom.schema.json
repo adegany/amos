@@ -31,6 +31,16 @@
     },
     "payload": {
       "type": "object",
+      "properties": {
+        "semantic_facets": {
+          "type": "array",
+          "items": { "$ref": "core_payloads.schema.json#/$defs/SemanticFacet" }
+        },
+        "graph_relations": {
+          "type": "array",
+          "items": { "$ref": "core_payloads.schema.json#/$defs/GraphRelation" }
+        }
+      },
       "not": {
         "anyOf": [
           { "required": ["access_policy"] },

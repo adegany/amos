@@ -2,6 +2,7 @@
 
 from ._service_support import (
     Any,
+    LOW_RISK_EXPLICIT_RELATIONS,
     Mapping,
     SCHEMA_VERSION,
     Sequence,
@@ -303,6 +304,20 @@ class GraphService:
                 source = active_atom(ref)
                 if source and source.get("type") == "self_model":
                     add(source["id"], atom_id, relation)
+
+        for raw in payload.get("graph_relations", []):
+            if not isinstance(raw, Mapping):
+                continue
+            relation = str(raw.get("relation") or "")
+            if relation not in LOW_RISK_EXPLICIT_RELATIONS:
+                continue
+            source_ref = raw.get("source_ref", "$self")
+            target_ref = raw.get("target_ref")
+            source_ref = atom_id if source_ref == "$self" else source_ref
+            target_ref = atom_id if target_ref == "$self" else target_ref
+            if atom_id not in {str(source_ref or ""), str(target_ref or "")}:
+                continue
+            add(source_ref, target_ref, relation)
 
         return edges
 

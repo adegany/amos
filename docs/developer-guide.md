@@ -334,6 +334,11 @@ signal.
   once current self-awareness and mission policy atoms are available.
 - Store raw experiences as evidence-backed traces or outcomes, then promote
   recurring patterns through maintenance processors.
+- When a producer already has typed semantics, write canonical
+  `payload.semantic_facets` and `payload.graph_relations`. The built-in generic
+  processor can then construct provenance and associative edges without a
+  client-specific processor pack. Keep free-form model interpretations in the
+  proposed lifecycle until separately reviewed.
 - Keep generated prompt digests compact and role-specific.
 - Treat memory retrieval as advisory. Application schemas, permissions,
   guardrails, and control registries remain hard authority.

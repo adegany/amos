@@ -467,6 +467,7 @@ def normalize_atom(atom: Mapping[str, Any], *, require_id: bool = False) -> dict
         )
     ensure_jsonable(payload)
     validate_atom_payload(atom_type, payload)
+    validate_canonical_graph_metadata(payload)
 
     atom_id = data.get("id")
     if require_id and not atom_id:
@@ -514,6 +515,116 @@ def normalize_atom(atom: Mapping[str, Any], *, require_id: bool = False) -> dict
     if not 0 <= normalized["salience"] <= 1 or not 0 <= normalized["utility"] <= 1:
         raise ValidationError("salience and utility must be between 0 and 1")
     return normalized
+
+
+def validate_canonical_graph_metadata(payload: Mapping[str, Any]) -> None:
+    """Validate optional domain-neutral graph metadata carried by an atom.
+
+    Producers may attach normalized semantic facets and explicit graph
+    relations to any typed payload.  AMOS never derives these structures from
+    prose; malformed structures are rejected at the ingestion boundary.
+    """
+
+    facets = payload.get("semantic_facets")
+    if facets is not None:
+        if not isinstance(facets, list):
+            raise ValidationError("payload semantic_facets must be a list")
+        for index, raw in enumerate(facets):
+            if not isinstance(raw, Mapping):
+                raise ValidationError(
+                    f"payload semantic_facets[{index}] must be an object"
+                )
+            subject = raw.get("subject")
+            if not isinstance(subject, str) or not subject.strip():
+                raise ValidationError(
+                    f"payload semantic_facets[{index}].subject must be a non-empty string"
+                )
+            for field in ("intent", "outcome", "outcome_direction", "facet_id"):
+                value = raw.get(field)
+                if value is not None and not isinstance(value, str):
+                    raise ValidationError(
+                        f"payload semantic_facets[{index}].{field} must be a string"
+                    )
+            confidence = raw.get("confidence")
+            if confidence is not None and (
+                not isinstance(confidence, (int, float))
+                or isinstance(confidence, bool)
+                or not 0 <= float(confidence) <= 1
+            ):
+                raise ValidationError(
+                    f"payload semantic_facets[{index}].confidence must be between 0 and 1"
+                )
+            for field in ("controls", "metrics", "scope", "attributes"):
+                value = raw.get(field)
+                if value is not None and not isinstance(value, Mapping):
+                    raise ValidationError(
+                        f"payload semantic_facets[{index}].{field} must be an object"
+                    )
+            refs = raw.get("evidence_refs")
+            if refs is not None and (
+                not isinstance(refs, list)
+                or not all(isinstance(ref, str) and ref for ref in refs)
+            ):
+                raise ValidationError(
+                    f"payload semantic_facets[{index}].evidence_refs must be a list of strings"
+                )
+            time_index = raw.get("time_index")
+            if time_index is not None and (
+                isinstance(time_index, bool)
+                or not isinstance(time_index, (str, int, float))
+            ):
+                raise ValidationError(
+                    f"payload semantic_facets[{index}].time_index must be scalar"
+                )
+
+    relations = payload.get("graph_relations")
+    if relations is not None:
+        if not isinstance(relations, list):
+            raise ValidationError("payload graph_relations must be a list")
+        for index, raw in enumerate(relations):
+            if not isinstance(raw, Mapping):
+                raise ValidationError(
+                    f"payload graph_relations[{index}] must be an object"
+                )
+            relation = raw.get("relation")
+            if not isinstance(relation, str) or relation not in EDGE_RELATIONS:
+                raise ValidationError(
+                    f"payload graph_relations[{index}].relation is unsupported"
+                )
+            source = raw.get("source_ref", "$self")
+            target = raw.get("target_ref")
+            if not isinstance(source, str) or not source:
+                raise ValidationError(
+                    f"payload graph_relations[{index}].source_ref must be a non-empty string"
+                )
+            if not isinstance(target, str) or not target:
+                raise ValidationError(
+                    f"payload graph_relations[{index}].target_ref must be a non-empty string"
+                )
+            if source == target:
+                raise ValidationError(
+                    f"payload graph_relations[{index}] endpoints must differ"
+                )
+            refs = raw.get("evidence_refs")
+            if refs is not None and (
+                not isinstance(refs, list)
+                or not all(isinstance(ref, str) and ref for ref in refs)
+            ):
+                raise ValidationError(
+                    f"payload graph_relations[{index}].evidence_refs must be a list of strings"
+                )
+            confidence = raw.get("confidence")
+            if confidence is not None:
+                if isinstance(confidence, Mapping):
+                    normalize_confidence(confidence)
+                elif (
+                    not isinstance(confidence, (int, float))
+                    or isinstance(confidence, bool)
+                    or not 0 <= float(confidence) <= 1
+                ):
+                    raise ValidationError(
+                        f"payload graph_relations[{index}].confidence must be between 0 and 1"
+                    )
 
 
 def normalize_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:

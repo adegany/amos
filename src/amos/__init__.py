@@ -10,6 +10,7 @@ from .errors import (
 from .ontology import ontology_snapshot
 from .service import Amos
 from .maintenance import (
+    canonical_relation_proposals_from_atoms,
     EvidenceWindow,
     GenericMaintenanceProcessor,
     MaintenanceProposal,
@@ -18,6 +19,7 @@ from .maintenance import (
     SemanticFacet,
     load_maintenance_processor,
     semantic_relation_proposals_from_facets,
+    semantic_facets_from_atoms,
 )
 from .smp import SemanticMaintenanceProcessor
 from .store import SQLiteStore
@@ -43,6 +45,7 @@ __all__ = [
     "BackgroundMemoryPolicyWorker",
     "CASConflict",
     "CapacityGovernor",
+    "canonical_relation_proposals_from_atoms",
     "DistillerMaintenanceWorker",
     "EvidenceWindow",
     "GenericMaintenanceProcessor",
@@ -64,4 +67,5 @@ __all__ = [
     "load_maintenance_processor",
     "ontology_snapshot",
     "semantic_relation_proposals_from_facets",
+    "semantic_facets_from_atoms",
 ]

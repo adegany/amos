@@ -647,7 +647,10 @@ archive active atoms that are superseded by active replacement atoms when
 create provenance-linked semantic distillations when enough eligible source
   atoms are available
 build a bounded evidence window and run registered maintenance processor packs
+read canonical `semantic_facets` and `graph_relations` directly from active
+  atoms through the built-in generic processor
 commit only low-risk, policy-allowed proposals such as add_atom distillations
+  and explicit structural graph relations with active endpoints
 defer medium/high-risk proposals, health changes, merges, archives, access
   policy changes, and ambiguous claims to explicit review
 prune archived/stale atoms from hot retrieval indexes during idle cleanup
@@ -663,6 +666,15 @@ invalidate packet cache
 persist memory_policy_state
 append a memory_policy_run event
 ```
+
+Canonical graph metadata is producer-normalized, deterministic input rather
+than an AMOS inference from prose. `semantic_facets` declare subject, intent,
+outcome direction, confidence, provenance, and optional time/metric/control
+dimensions. `graph_relations` declare ontology relation ids and endpoints,
+using `$self` for the owning atom. AMOS validates both structures at ingestion,
+ignores them while the owning atom is proposed, and re-evaluates them on later
+maintenance passes after authorized promotion. Structural relations may be
+auto-committed; causal and other non-low-risk declarations remain reviewable.
 
 Decay execution is deterministic and non-generative. By default, v1-local only
 applies time, utility, and expiry rules to atoms with explicit atom-level

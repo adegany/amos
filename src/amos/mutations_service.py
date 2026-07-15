@@ -264,6 +264,13 @@ class MutationService:
                     updated["payload"] = dict(value)
                 else:
                     updated[key] = value
+            if updated == current:
+                return {
+                    "status": "unchanged",
+                    "atom": current,
+                    "event": None,
+                    "projected_edges": [],
+                }
             updated["revision_history"] = list(updated["revision_history"])
             updated["revision_history"].append(
                 {

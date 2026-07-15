@@ -3,6 +3,57 @@
   "$id": "https://amos.local/schemas/core_payloads.schema.json",
   "title": "AMOS Core Typed Payloads",
   "$defs": {
+    "SemanticFacet": {
+      "type": "object",
+      "required": ["subject"],
+      "properties": {
+        "subject": { "type": "string", "minLength": 1 },
+        "intent": { "type": "string" },
+        "outcome": { "type": "string" },
+        "outcome_direction": { "type": "string" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "evidence_refs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "controls": { "type": "object" },
+        "metrics": { "type": "object" },
+        "time_index": { "type": ["string", "number", "null"] },
+        "scope": { "type": "object" },
+        "attributes": { "type": "object" },
+        "facet_id": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "GraphRelation": {
+      "type": "object",
+      "required": ["target_ref", "relation"],
+      "properties": {
+        "source_ref": { "type": "string", "minLength": 1, "default": "$self" },
+        "target_ref": { "type": "string", "minLength": 1 },
+        "relation": {
+          "type": "string",
+          "pattern": "^rel:[a-z_]+$"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "confidence": {
+          "oneOf": [
+            { "type": "number", "minimum": 0, "maximum": 1 },
+            {
+              "type": "object",
+              "properties": {
+                "level": { "type": "string" },
+                "score": { "type": "number", "minimum": 0, "maximum": 1 }
+              }
+            }
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
     "BeliefAtom": {
       "type": "object",
       "anyOf": [

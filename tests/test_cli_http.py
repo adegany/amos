@@ -81,6 +81,25 @@ def test_http_v1_endpoints_smoke(tmp_path):
             },
         )
         assert committed["status"] == "committed"
+        updated = http_json(
+            f"{base}/v1/atoms:update",
+            {
+                "atom_id": "http_atom",
+                "payload_patch": {
+                    "semantic_facets": [
+                        {
+                            "subject": "http endpoint",
+                            "intent": "exercise update",
+                            "outcome_direction": "positive",
+                        }
+                    ]
+                },
+                "actor": "system",
+                "expected_version": committed["atom"]["version"],
+            },
+        )
+        assert updated["status"] == "updated"
+        assert updated["atom"]["payload"]["semantic_facets"][0]["subject"] == "http endpoint"
         assert server.amos.health_memory()["atoms"] == 1
         packet = http_json(
             f"{base}/v1/packets:retrieve",

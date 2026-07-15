@@ -175,6 +175,18 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         authorization_context=body.get("authorization_context"),
                     )
                 )
+            if path == "/v1/atoms:update":
+                return self._write_json(
+                    amos.update_atom(
+                        body["atom_id"],
+                        payload_patch=body.get("payload_patch"),
+                        set_fields=body.get("set_fields"),
+                        expected_version=body.get("expected_version"),
+                        actor=body.get("actor", "http"),
+                        authorization_context=body.get("authorization_context"),
+                        idempotency_key=body.get("idempotency_key"),
+                    )
+                )
             if path == "/v1/atoms:archive":
                 return self._write_json(
                     amos.archive_atom(

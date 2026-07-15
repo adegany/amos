@@ -134,8 +134,10 @@ in-process SQLite store and serializes access through the service boundary:
 - Generic maintenance proposal records, a processor registry, and a policy gate
   that auto-commits only low-risk derived atoms while deferring review items.
 - A generic maintenance processor registry. AMOS ships the built-in generic SMP
-  adapter; domain-specific processors are loaded from client packages with
-  explicit import paths.
+  adapter and canonical graph builder. Any producer can attach validated
+  `semantic_facets` and `graph_relations` to typed atoms; AMOS builds governed
+  edges without a domain processor. Domain-specific processors remain optional
+  adapters for payloads that cannot emit the canonical contract directly.
 - Advisory maintenance for deduplication and contradiction marking, with
   high-risk mutation requests gated behind explicit approval.
 - Capacity pressure reporting and degraded packet disclosure.
@@ -267,6 +269,34 @@ PYTHONPATH=src python -m amos.cli \
   --domain training_flight \
   --processor-id my.training.flight.v1
 ```
+
+Producers that already know their semantics can avoid a processor pack:
+
+```json
+{
+  "id": "observed_outcome_2",
+  "type": "semantic",
+  "payload": {
+    "summary": "A second supported observation.",
+    "semantic_facets": [{
+      "subject": "shared maintenance policy",
+      "intent": "evaluate cleanup",
+      "outcome": "supported",
+      "outcome_direction": "positive",
+      "time_index": 2
+    }],
+    "graph_relations": [{
+      "source_ref": "$self",
+      "target_ref": "observed_outcome_1",
+      "relation": "rel:derived_from"
+    }]
+  }
+}
+```
+
+Only active endpoints are materialized. Metadata on proposed atoms stays
+dormant until lifecycle promotion; medium-risk explicit relations such as
+causal claims remain deferred for review.
 
 ## Benchmark
 

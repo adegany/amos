@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol, Sequence
 
 from .errors import ValidationError
-from .schemas import SCHEMA_VERSION, digest, stable_id, utc_now
+from .schemas import SCHEMA_VERSION, digest, normalize_relation, stable_id, utc_now
 from .smp import SemanticMaintenanceProcessor
 
 
@@ -21,6 +21,23 @@ LOW_RISK_PROPOSAL_ACTIONS = {"add_atom", "add_edge"}
 
 SEMANTIC_RELATION_PROCESSOR_ID = "amos.semantic_relations.v1"
 SEMANTIC_RELATION_PROCESSOR_VERSION = "amos.semantic_relations.v1"
+
+GENERIC_GRAPH_PROCESSOR_ID = "amos.graph.canonical.v1"
+GENERIC_GRAPH_PROCESSOR_VERSION = "amos.graph.canonical.v1"
+
+LOW_RISK_EXPLICIT_RELATIONS = {
+    "rel:attributed_to",
+    "rel:constrained_by",
+    "rel:corrected_by",
+    "rel:derived_from",
+    "rel:has_capability",
+    "rel:has_limitation",
+    "rel:made_commitment",
+    "rel:part_of",
+    "rel:produced_outcome",
+    "rel:supersedes",
+    "rel:uses",
+}
 
 
 @dataclass(frozen=True)
@@ -284,7 +301,18 @@ class GenericMaintenanceProcessor:
                     title="Review candidate contradiction",
                 )
             )
+        proposals.extend(
+            canonical_relation_proposals_from_atoms(
+                window.atoms,
+                existing_edges=window.edges,
+            )
+        )
         return proposals
+
+    def extract_facets(self, window: EvidenceWindow) -> list[SemanticFacet]:
+        """Read the canonical facet contract without domain-specific code."""
+
+        return semantic_facets_from_atoms(window.atoms)
 
 
 def coerce_semantic_facet(value: SemanticFacet | Mapping[str, Any]) -> dict[str, Any]:
@@ -318,14 +346,256 @@ def coerce_semantic_facet(value: SemanticFacet | Mapping[str, Any]) -> dict[str,
     return facet
 
 
+def semantic_facets_from_atoms(
+    atoms: Sequence[Mapping[str, Any]],
+) -> list[SemanticFacet]:
+    """Extract producer-normalized facets from active canonical atoms.
+
+    Proposed atoms deliberately remain isolated.  Their facet metadata is
+    retained and becomes eligible on a later maintenance pass after an
+    authorized lifecycle promotion.
+    """
+
+    facets: list[SemanticFacet] = []
+    for atom in atoms:
+        if atom.get("deleted") or atom.get("lifecycle_state") != "active":
+            continue
+        payload = atom.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        raw_facets = payload.get("semantic_facets")
+        if not isinstance(raw_facets, list):
+            continue
+        atom_ref = str(atom.get("id") or "")
+        if not atom_ref:
+            continue
+        atom_confidence = atom.get("confidence")
+        if isinstance(atom_confidence, Mapping):
+            default_confidence = float(atom_confidence.get("score", 0.5) or 0.5)
+        else:
+            default_confidence = 0.5
+        default_evidence = tuple(
+            str(ref) for ref in atom.get("evidence_refs", []) if str(ref)
+        )
+        for raw in raw_facets:
+            if not isinstance(raw, Mapping):
+                continue
+            facets.append(
+                SemanticFacet(
+                    atom_ref=atom_ref,
+                    subject=str(raw.get("subject") or ""),
+                    intent=str(raw.get("intent") or ""),
+                    outcome=str(raw.get("outcome") or ""),
+                    outcome_direction=str(
+                        raw.get("outcome_direction") or "neutral"
+                    ),
+                    confidence=float(
+                        raw.get("confidence", default_confidence)
+                        or default_confidence
+                    ),
+                    evidence_refs=tuple(
+                        str(ref)
+                        for ref in raw.get("evidence_refs", default_evidence)
+                        if str(ref)
+                    ),
+                    controls=dict(raw.get("controls") or {}),
+                    metrics=dict(raw.get("metrics") or {}),
+                    time_index=raw.get("time_index"),
+                    scope=dict(raw.get("scope") or atom.get("scope") or {}),
+                    attributes=dict(raw.get("attributes") or {}),
+                    facet_id=(str(raw["facet_id"]) if raw.get("facet_id") else None),
+                )
+            )
+    return facets
+
+
+def canonical_relation_proposals_from_atoms(
+    atoms: Sequence[Mapping[str, Any]],
+    *,
+    existing_edges: Sequence[Mapping[str, Any]] = (),
+) -> list[MaintenanceProposal]:
+    """Build graph proposals from explicit, domain-neutral atom structure."""
+
+    active_atoms = {
+        str(atom.get("id") or ""): atom
+        for atom in atoms
+        if atom.get("id")
+        and not atom.get("deleted")
+        and atom.get("lifecycle_state") == "active"
+    }
+    existing_keys = {
+        (
+            str(edge.get("source_ref") or ""),
+            str(edge.get("target_ref") or ""),
+            str(edge.get("relation") or ""),
+        )
+        for edge in existing_edges
+        if not edge.get("deleted") and edge.get("lifecycle_state", "active") == "active"
+    }
+    proposed_keys: set[tuple[str, str, str]] = set()
+    proposals: list[MaintenanceProposal] = []
+
+    def add(
+        owner: Mapping[str, Any],
+        source_ref: Any,
+        target_ref: Any,
+        relation: str,
+        *,
+        reason_code: str,
+        evidence_refs: Sequence[str] = (),
+        confidence: float | Mapping[str, Any] | None = None,
+        explicit: bool = False,
+    ) -> None:
+        owner_ref = str(owner.get("id") or "")
+        source = owner_ref if str(source_ref or "$self") == "$self" else str(source_ref or "")
+        target = owner_ref if str(target_ref or "") == "$self" else str(target_ref or "")
+        if (
+            not source
+            or not target
+            or source == target
+            or source not in active_atoms
+            or target not in active_atoms
+        ):
+            return
+        if explicit and owner_ref not in {source, target}:
+            return
+        normalized_relation = normalize_relation(relation)
+        key = (source, target, normalized_relation)
+        if key in existing_keys or key in proposed_keys:
+            return
+        proposed_keys.add(key)
+        if isinstance(confidence, Mapping):
+            score = float(confidence.get("score", 0.75) or 0.75)
+        elif isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+            score = float(confidence)
+        else:
+            score = min(
+                float(active_atoms[source].get("confidence", {}).get("score", 0.75)),
+                float(active_atoms[target].get("confidence", {}).get("score", 0.75)),
+            )
+        score = round(max(0.0, min(1.0, score)), 4)
+        risk_level = (
+            "low" if normalized_relation in LOW_RISK_EXPLICIT_RELATIONS else "medium"
+        )
+        refs = tuple(
+            dict.fromkeys(
+                [
+                    *[str(ref) for ref in owner.get("evidence_refs", []) if str(ref)],
+                    *[str(ref) for ref in evidence_refs if str(ref)],
+                    source,
+                    target,
+                ]
+            )
+        )
+        proposals.append(
+            MaintenanceProposal(
+                processor_id=GENERIC_GRAPH_PROCESSOR_ID,
+                processor_version=GENERIC_GRAPH_PROCESSOR_VERSION,
+                action="add_edge",
+                risk_level=risk_level,
+                confidence=score,
+                reason_code=reason_code,
+                source_refs=(source, target),
+                target_refs=(source, target),
+                evidence_refs=refs,
+                payload={
+                    "edge": {
+                        "source_ref": source,
+                        "target_ref": target,
+                        "relation": normalized_relation,
+                        "scope": dict(owner.get("scope") or {}),
+                        "confidence": {
+                            "level": _confidence_level(score),
+                            "score": score,
+                        },
+                        "evidence_refs": list(refs),
+                    },
+                    "canonical_owner_ref": owner_ref,
+                },
+                title=f"Build canonical {normalized_relation} edge",
+            )
+        )
+
+    for atom in active_atoms.values():
+        atom_ref = str(atom["id"])
+        payload = atom.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        for ref in _structured_refs(atom.get("supersedes")):
+            add(
+                atom,
+                atom_ref,
+                ref,
+                "rel:supersedes",
+                reason_code="canonical_atom_supersedes",
+            )
+        for ref in _structured_refs(payload.get("source_refs")):
+            add(
+                atom,
+                atom_ref,
+                ref,
+                "rel:derived_from",
+                reason_code="canonical_payload_source_ref",
+            )
+        for ref in _structured_refs(payload.get("memory_references")):
+            add(
+                atom,
+                atom_ref,
+                ref,
+                "rel:uses",
+                reason_code="canonical_payload_memory_reference",
+            )
+        directive_ref = payload.get("directive_atom_ref") or payload.get(
+            "source_directive_ref"
+        )
+        if atom.get("type") == "agentic_trace" and directive_ref:
+            add(
+                atom,
+                directive_ref,
+                atom_ref,
+                "rel:produced_outcome",
+                reason_code="canonical_directive_outcome",
+            )
+        for raw in payload.get("graph_relations", []):
+            if not isinstance(raw, Mapping):
+                continue
+            add(
+                atom,
+                raw.get("source_ref", "$self"),
+                raw.get("target_ref"),
+                str(raw.get("relation") or ""),
+                reason_code="canonical_explicit_relation",
+                evidence_refs=tuple(raw.get("evidence_refs") or ()),
+                confidence=raw.get("confidence"),
+                explicit=True,
+            )
+    return proposals
+
+
+def _structured_refs(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, Mapping):
+        ref = value.get("atom_ref") or value.get("id") or value.get("ref")
+        return [str(ref)] if ref else []
+    if not isinstance(value, Sequence):
+        return []
+    refs: list[str] = []
+    for item in value:
+        refs.extend(_structured_refs(item))
+    return list(dict.fromkeys(refs))
+
+
 def semantic_relation_proposals_from_facets(
     facets: Sequence[Mapping[str, Any]],
     *,
     existing_edges: Sequence[Mapping[str, Any]] = (),
     processor_id: str = SEMANTIC_RELATION_PROCESSOR_ID,
     processor_version: str = SEMANTIC_RELATION_PROCESSOR_VERSION,
+    max_new_relations_per_facet: int = 4,
 ) -> list[MaintenanceProposal]:
-    """Convert domain-normalized facets into generic graph edge proposals."""
+    """Convert facets into a bounded set of generic graph edge proposals."""
 
     normalized = [coerce_semantic_facet(facet) for facet in facets]
     normalized = sorted(
@@ -346,9 +616,19 @@ def semantic_relation_proposals_from_facets(
     }
     proposals: list[MaintenanceProposal] = []
     seen: set[tuple[str, str, str]] = set()
+    new_degree: dict[str, int] = {}
+    for source_ref, target_ref, _relation in existing_keys:
+        new_degree[source_ref] = new_degree.get(source_ref, 0) + 1
+        new_degree[target_ref] = new_degree.get(target_ref, 0) + 1
+    degree_limit = max(1, int(max_new_relations_per_facet or 1))
     for left_index, left in enumerate(normalized):
         for right in normalized[left_index + 1 :]:
             if left["atom_ref"] == right["atom_ref"]:
+                continue
+            if (
+                new_degree.get(str(left["atom_ref"]), 0) >= degree_limit
+                or new_degree.get(str(right["atom_ref"]), 0) >= degree_limit
+            ):
                 continue
             pair = _semantic_relation_for_pair(left, right)
             if pair is None:
@@ -361,6 +641,8 @@ def semantic_relation_proposals_from_facets(
             if relation in {"rel:supports", "rel:similar_to"} and reverse_key in existing_keys:
                 continue
             seen.add(key)
+            new_degree[source_ref] = new_degree.get(source_ref, 0) + 1
+            new_degree[target_ref] = new_degree.get(target_ref, 0) + 1
             scope = _common_scope(left.get("scope", {}), right.get("scope", {}))
             evidence_refs = tuple(
                 dict.fromkeys(

@@ -54,6 +54,34 @@ def test_schema_rejects_payload_envelope_duplication(amos):
         )
 
 
+def test_schema_validates_canonical_graph_metadata(amos):
+    with pytest.raises(ValidationError, match="semantic_facets.*subject"):
+        amos.commit_atom(
+            {
+                "type": "semantic",
+                "payload": {
+                    "summary": "Malformed facet",
+                    "semantic_facets": [{"intent": "missing subject"}],
+                },
+            }
+        )
+    with pytest.raises(ValidationError, match="graph_relations.*unsupported"):
+        amos.commit_atom(
+            {
+                "type": "semantic",
+                "payload": {
+                    "summary": "Malformed relation",
+                    "graph_relations": [
+                        {
+                            "target_ref": "other_atom",
+                            "relation": "rel:not_in_the_ontology",
+                        }
+                    ],
+                },
+            }
+        )
+
+
 def test_seed_ontology_uses_v1_relation_ids_without_aliases():
     snapshot = ontology_snapshot()
     assert "agent" in snapshot["entity_types"]
@@ -69,6 +97,8 @@ def test_core_typed_payload_schema_artifact_defines_required_payloads():
     schema = json.loads(Path("schemas/core_payloads.schema.json").read_text())
     defs = schema["$defs"]
     for name in [
+        "SemanticFacet",
+        "GraphRelation",
         "BeliefAtom",
         "PreferenceAtom",
         "Goal",
@@ -397,6 +427,28 @@ def test_compare_and_swap_update_conflict(amos):
     assert updated["version"] == 2
     with pytest.raises(CASConflict):
         amos.update_atom(atom["id"], payload_patch={"claim": "stale"}, expected_version=1)
+
+
+def test_identical_update_is_a_noop_without_revision_or_event(amos):
+    atom = amos.commit_atom(
+        {
+            "id": "atom_noop_update",
+            "type": "belief",
+            "payload": {"claim": "stable"},
+        }
+    )["atom"]
+    event_count = len(amos.store.list_events())
+
+    result = amos.update_atom(
+        atom["id"],
+        payload_patch={"claim": "stable"},
+        expected_version=atom["version"],
+    )
+
+    assert result["status"] == "unchanged"
+    assert result["atom"]["version"] == atom["version"]
+    assert result["event"] is None
+    assert len(amos.store.list_events()) == event_count
 
 
 def test_merge_atoms_requires_review_and_replays_projection(amos):

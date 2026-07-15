@@ -372,6 +372,231 @@ def test_generic_semantic_facets_propose_similarity_for_neutral_matches():
     assert proposal["payload"]["edge"]["relation"] == "rel:similar_to"
 
 
+def test_generic_semantic_graph_degree_is_bounded():
+    proposals = semantic_relation_proposals_from_facets(
+        [
+            SemanticFacet(
+                atom_ref=f"bounded_note_{index}",
+                subject="shared bounded graph subject",
+                intent="observe bounded graph construction",
+                outcome="observed",
+                outcome_direction="neutral",
+                confidence=0.75,
+                scope={"tenant": "bounded-graph"},
+            )
+            for index in range(10)
+        ],
+        max_new_relations_per_facet=3,
+    )
+
+    degree: dict[str, int] = {}
+    for proposal in proposals:
+        edge = proposal.to_dict()["payload"]["edge"]
+        degree[edge["source_ref"]] = degree.get(edge["source_ref"], 0) + 1
+        degree[edge["target_ref"]] = degree.get(edge["target_ref"], 0) + 1
+    assert proposals
+    assert max(degree.values()) <= 3
+
+
+def test_canonical_atom_facets_build_graph_without_domain_processor(amos):
+    scope = {"tenant": "canonical-facets"}
+    for atom_id, time_index in (("canonical_note_one", 1), ("canonical_note_two", 2)):
+        amos.commit_atom(
+            {
+                "id": atom_id,
+                "type": "semantic",
+                "payload": {
+                    "summary": f"Canonical observation {time_index}",
+                    "semantic_facets": [
+                        {
+                            "subject": "shared memory maintenance",
+                            "intent": "observe graph construction",
+                            "outcome": "supported",
+                            "outcome_direction": "positive",
+                            "time_index": time_index,
+                        }
+                    ],
+                },
+                "scope": scope,
+                "confidence": {"level": "medium-high", "score": 0.8},
+            }
+        )
+
+    result = amos.run_maintenance_distiller(
+        scope=scope,
+        domain="generic",
+        processor_ids=["amos.maintenance.generic.v1"],
+        auto_commit_low_risk=True,
+    )
+
+    assert any(
+        proposal["processor_id"] == "amos.semantic_relations.v1"
+        and proposal["payload"]["edge"]["relation"] == "rel:supports"
+        for proposal in result["proposals"]
+    )
+    assert any(
+        edge["relation"] == "rel:supports" for edge in amos.store.list_edges()
+    )
+    assert amos.verify_replay()["status"] == "ok"
+
+
+def test_canonical_graph_relations_are_gated_and_reprocessable(amos):
+    scope = {"tenant": "canonical-relations"}
+    source = amos.commit_atom(
+        {
+            "id": "canonical_relation_source",
+            "type": "semantic",
+            "payload": {"summary": "Canonical source"},
+            "scope": scope,
+        }
+    )["atom"]
+    target = amos.commit_atom(
+        {
+            "id": "canonical_relation_target",
+            "type": "semantic",
+            "payload": {"summary": "Canonical target"},
+            "scope": scope,
+        }
+    )["atom"]
+    target = amos.update_atom(
+        target["id"],
+        payload_patch={
+            "graph_relations": [
+                {
+                    "source_ref": "$self",
+                    "target_ref": source["id"],
+                    "relation": "rel:derived_from",
+                },
+                {
+                    "source_ref": "$self",
+                    "target_ref": source["id"],
+                    "relation": "rel:caused_by",
+                },
+            ]
+        },
+        expected_version=target["version"],
+    )["atom"]
+
+    result = amos.run_maintenance_distiller(
+        scope=scope,
+        processor_ids=["amos.maintenance.generic.v1"],
+        auto_commit_low_risk=True,
+    )
+
+    assert any(
+        item.get("edge", {}).get("relation") == "rel:derived_from"
+        for item in result["committed"]
+    )
+    assert any(
+        item["action"] == "add_edge"
+        and item["risk_level"] == "medium"
+        and item["source_refs"] == [target["id"], source["id"]]
+        for item in result["proposals"]
+    )
+    assert any(
+        item["reason"] == "requires_review_or_unsupported_action"
+        for item in result["deferred"]
+    )
+
+    committed_edge = next(
+        item["edge"]
+        for item in result["committed"]
+        if item.get("edge", {}).get("relation") == "rel:derived_from"
+    )
+    amos.archive_atom(target["id"], reason="exercise graph reprocessing")
+    archived_edge = amos.store.get_edge(committed_edge["edge_id"])
+    assert bool(archived_edge["deleted"]) is True
+    current = amos.store.get_atom(target["id"])
+    promoted = amos.update_atom(
+        target["id"],
+        set_fields={"lifecycle_state": "active", "health_status": "healthy"},
+        expected_version=current["version"],
+    )
+    assert any(
+        edge["relation"] == "rel:derived_from"
+        for edge in promoted["projected_edges"]
+    )
+
+    reprocessed = amos.run_maintenance_distiller(
+        scope=scope,
+        processor_ids=["amos.maintenance.generic.v1"],
+        auto_commit_low_risk=True,
+    )
+
+    assert not any(
+        item.get("edge", {}).get("relation") == "rel:derived_from"
+        for item in reprocessed["committed"]
+    )
+    revived = amos.store.get_edge(committed_edge["edge_id"])
+    assert bool(revived["deleted"]) is False
+    assert revived["version"] > archived_edge["version"]
+
+
+def test_proposed_canonical_facets_remain_dormant_until_promotion(amos):
+    scope = {"tenant": "canonical-proposal"}
+    active = amos.commit_atom(
+        {
+            "id": "canonical_active_facet",
+            "type": "semantic",
+            "payload": {
+                "summary": "Reviewed graph observation",
+                "semantic_facets": [
+                    {
+                        "subject": "proposal lifecycle",
+                        "intent": "observe promotion",
+                        "outcome_direction": "positive",
+                    }
+                ],
+            },
+            "scope": scope,
+        }
+    )["atom"]
+    proposed = amos.propose_memory_atoms(
+        [
+            {
+                "id": "canonical_proposed_facet",
+                "type": "semantic",
+                "payload": {
+                    "summary": "Unreviewed graph observation",
+                    "semantic_facets": [
+                        {
+                            "subject": "proposal lifecycle",
+                            "intent": "observe promotion",
+                            "outcome_direction": "positive",
+                        }
+                    ],
+                },
+            }
+        ],
+        scope=scope,
+    )["proposals"][0]["atom"]
+
+    amos.run_maintenance_distiller(
+        scope=scope,
+        processor_ids=["amos.maintenance.generic.v1"],
+    )
+    assert not any(
+        {edge["source_ref"], edge["target_ref"]} == {active["id"], proposed["id"]}
+        for edge in amos.store.list_edges()
+    )
+
+    amos.update_atom(
+        proposed["id"],
+        set_fields={"lifecycle_state": "active"},
+        expected_version=proposed["version"],
+    )
+    amos.run_maintenance_distiller(
+        scope=scope,
+        processor_ids=["amos.maintenance.generic.v1"],
+    )
+    assert any(
+        edge["relation"] == "rel:supports"
+        and {edge["source_ref"], edge["target_ref"]}
+        == {active["id"], proposed["id"]}
+        for edge in amos.store.list_edges()
+    )
+
+
 def test_maintenance_distiller_skips_empty_windows_without_journal_event(amos):
     event_count = len(amos.store.list_events())
 

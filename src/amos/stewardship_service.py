@@ -3,6 +3,8 @@
 from ._service_support import (
     Any,
     EvidenceWindow,
+    GENERIC_GRAPH_PROCESSOR_ID,
+    GENERIC_GRAPH_PROCESSOR_VERSION,
     HIGH_RISK_MAINTENANCE,
     MaintenanceProcessor,
     Mapping,
@@ -212,6 +214,16 @@ class StewardshipService:
                 {
                     "processor_id": SEMANTIC_RELATION_PROCESSOR_ID,
                     "processor_version": SEMANTIC_RELATION_PROCESSOR_VERSION,
+                }
+            )
+        if any(
+            proposal.get("processor_id") == GENERIC_GRAPH_PROCESSOR_ID
+            for proposal in proposals
+        ):
+            processor_records.append(
+                {
+                    "processor_id": GENERIC_GRAPH_PROCESSOR_ID,
+                    "processor_version": GENERIC_GRAPH_PROCESSOR_VERSION,
                 }
             )
         reviewer_status = self._maintenance_reviewer_status(reviewer)
@@ -906,22 +918,36 @@ class StewardshipService:
             edge_payload.get("confidence")
             or {"level": "medium-high", "score": proposal.get("confidence", 0.75)}
         )
-        if any(existing["edge_id"] == edge["edge_id"] for existing in self.store.list_edges()):
+        existing_edge = self.store.get_edge(str(edge["edge_id"]))
+        if existing_edge and not existing_edge.get("deleted") and existing_edge.get(
+            "lifecycle_state", "active"
+        ) == "active":
             return {
                 "status": "already_committed",
                 "proposal_id": proposal["proposal_id"],
-                "edge": edge,
+                "edge": existing_edge,
                 "source_refs": list(proposal.get("source_refs", [])),
             }
         with self.store.transaction() as conn:
-            inserted = self.store.insert_edge(conn, edge)
-            if not inserted:
-                return {
-                    "status": "already_committed",
-                    "proposal_id": proposal["proposal_id"],
-                    "edge": edge,
-                    "source_refs": list(proposal.get("source_refs", [])),
+            if existing_edge:
+                edge = {
+                    **edge,
+                    "created_at": existing_edge["created_at"],
+                    "updated_at": utc_now(),
+                    "version": int(existing_edge.get("version", 1)) + 1,
+                    "deleted": False,
+                    "lifecycle_state": "active",
                 }
+                self.store.upsert_edge(conn, edge)
+            else:
+                inserted = self.store.insert_edge(conn, edge)
+                if not inserted:
+                    return {
+                        "status": "already_committed",
+                        "proposal_id": proposal["proposal_id"],
+                        "edge": edge,
+                        "source_refs": list(proposal.get("source_refs", [])),
+                    }
             event = self.store.append_event(
                 conn,
                 event_type="edge_committed",
