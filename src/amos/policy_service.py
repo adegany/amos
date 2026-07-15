@@ -836,13 +836,29 @@ class PolicyService:
         indexes: Sequence[Mapping[str, Any]],
     ) -> dict[str, Any]:
         atoms = self.store.list_atoms_filtered(lifecycle_states=["active", "proposed"])
+        active_atoms = [
+            atom for atom in atoms if atom.get("lifecycle_state") == "active"
+        ]
+        proposed_atoms = [
+            atom for atom in atoms if atom.get("lifecycle_state") == "proposed"
+        ]
         by_ref = {str(atom["id"]): atom for atom in atoms}
+        # The capacity ceiling historically applies to the whole hot set:
+        # active canonical atoms plus dormant proposals. Keep that contract
+        # distinct from lifecycle-active graph quality below.
         active_count = len(atoms)
         decay = dict(policy.get("decay") or {})
         max_atoms = int(decay.get("max_atoms", 256) or 256)
         edge_degrees = self.store.edge_degree_counts()
         isolated = [
-            atom for atom in atoms if int(edge_degrees.get(str(atom["id"]), 0)) == 0
+            atom
+            for atom in active_atoms
+            if int(edge_degrees.get(str(atom["id"]), 0)) == 0
+        ]
+        isolated_proposed = [
+            atom
+            for atom in proposed_atoms
+            if int(edge_degrees.get(str(atom["id"]), 0)) == 0
         ]
         isolated_by_type: dict[str, int] = {}
         for atom in isolated:
@@ -917,6 +933,11 @@ class PolicyService:
         return {
             "status": "warning" if warnings else "ok",
             "warnings": warnings,
+            "lifecycle_counts": {
+                "active": len(active_atoms),
+                "proposed": len(proposed_atoms),
+                "hot_total": active_count,
+            },
             "active_atom_count": active_count,
             "active_atom_limit": max_atoms,
             "active_atom_pressure": "over_limit"
@@ -961,6 +982,13 @@ class PolicyService:
                 "count": len(isolated),
                 "by_type": isolated_by_type,
                 "sample_refs": sorted(str(atom["id"]) for atom in isolated)[:10],
+            },
+            "isolated_proposed_atoms": {
+                "count": len(isolated_proposed),
+                "expected_dormant": True,
+                "sample_refs": sorted(
+                    str(atom["id"]) for atom in isolated_proposed
+                )[:10],
             },
             "derived_index_lag": {
                 "max_graph_delta": max_index_lag,

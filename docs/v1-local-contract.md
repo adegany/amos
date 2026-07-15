@@ -693,6 +693,13 @@ configured candidate targets. It recommends the smallest target that preserves
 configured target no longer has that headroom. Deployments should use this
 signal with retrieval-quality and maintenance-latency measurements rather than
 raising `max_atoms` solely to suppress pressure warnings.
+
+Capacity diagnostics retain the v1-local hot-set definition: lifecycle-active
+atoms plus dormant proposals. `quality.lifecycle_counts` makes that composition
+explicit. Graph isolation is narrower: `isolated_active_atoms` contains only
+lifecycle-active canonical atoms, while `isolated_proposed_atoms` reports
+proposal isolation separately as expected dormant state and does not raise the
+active-graph isolation warning.
 Supported v1-local rules include `expires_at`, `retain_until`,
 `mark_stale_after_seconds`, `archive_after_seconds`, and
 `low_utility_threshold`; operator policy can relax `require_atom_policy` to

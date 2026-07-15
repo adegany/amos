@@ -616,6 +616,40 @@ def test_health_memory_reports_quality_diagnostics(amos):
     assert isolated["id"] in health["quality"]["isolated_active_atoms"]["sample_refs"]
 
 
+def test_health_isolation_separates_active_graph_from_dormant_proposals(amos):
+    active = amos.commit_atom(
+        {
+            "id": "quality_active_isolated",
+            "type": "semantic",
+            "payload": {"summary": "Active graph-quality subject"},
+        }
+    )["atom"]
+    proposed = amos.propose_memory_atoms(
+        [
+            {
+                "id": "quality_proposed_dormant",
+                "type": "semantic",
+                "payload": {"summary": "Dormant proposal"},
+            }
+        ]
+    )["proposals"][0]["atom"]
+
+    health = amos.health_memory(run_policy=False)
+    quality = health["quality"]
+
+    assert quality["lifecycle_counts"] == {
+        "active": 1,
+        "proposed": 1,
+        "hot_total": 2,
+    }
+    assert quality["active_atom_count"] == 2
+    assert quality["isolated_active_atoms"]["count"] == 1
+    assert quality["isolated_active_atoms"]["sample_refs"] == [active["id"]]
+    assert quality["isolated_proposed_atoms"]["count"] == 1
+    assert quality["isolated_proposed_atoms"]["expected_dormant"] is True
+    assert quality["isolated_proposed_atoms"]["sample_refs"] == [proposed["id"]]
+
+
 def test_memory_policy_storage_cleanup_deletes_expired_archived_and_stale_atoms(amos):
     old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat().replace(
         "+00:00", "Z"
