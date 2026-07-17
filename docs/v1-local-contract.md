@@ -564,8 +564,13 @@ maintenance_distiller:
 decay:
   enabled: true
   max_atoms: 256
+  max_active_atoms: 256
+  max_proposed_atoms: 256
   require_atom_policy: true
   pressure_archive_policyless: true
+  pressure_archive_proposed: true
+  proposal_pressure_min_age_seconds: 3600
+  archive_proposed_after_seconds: null
   pressure_max_archives_per_run: 256
   pressure_protected_types:
     - commitment
@@ -675,13 +680,32 @@ using `$self` for the owning atom. AMOS validates both structures at ingestion,
 ignores them while the owning atom is proposed, and re-evaluates them on later
 maintenance passes after authorized promotion. Structural relations may be
 auto-committed; causal and other non-low-risk declarations remain reviewable.
+Intrinsic and explicitly declared edges carry the owning atom's evidence and
+confidence by default. A relation may supply narrower evidence/confidence
+directly; graph replay preserves those values. Steward maintenance refreshes
+legacy intrinsic edges by merging newly available provenance and retaining the
+stronger confidence instead of leaving structurally current edges evidentially
+empty.
 
 Decay execution is deterministic and non-generative. By default, v1-local only
-applies time, utility, and expiry rules to atoms with explicit atom-level
+applies time, utility, and expiry rules to active atoms with explicit atom-level
 `decay_policy` rules, except for active atoms superseded by active replacements
-when `archive_superseded` is enabled. When the active/proposed count exceeds
-`max_atoms`, `pressure_archive_policyless` separately archives the minimum
-eligible excess. It preserves proposed atoms, `decay_policy.enabled = false`,
+when `archive_superseded` is enabled. `max_atoms` bounds the complete hot set,
+while `max_active_atoms` and `max_proposed_atoms` independently bound canonical
+and proposal populations. When any bound is exceeded, the worker first archives
+the minimum eligible proposal excess, then the minimum eligible policyless
+active excess. Proposed atoms are pressure-eligible only when their producer
+attached `payload.proposal_retention`; `proposal_pressure_min_age_seconds`
+prevents newly generated review work from being removed immediately.
+
+The same producer-owned retention object may declare a stable
+`deduplication_key` and `archive_after_seconds`. Maintenance archives duplicate
+proposals only when that explicit key, atom type, and scope match, retaining the
+candidate with stronger evidence and then stable age/id ordering. It archives a
+proposal after its explicit retention window; the global
+`archive_proposed_after_seconds` is an optional fallback. AMOS does not infer
+semantic equivalence from prose and does not delete the producer's separate
+audit history. Active pressure cleanup preserves `decay_policy.enabled = false`,
 future `retain_until` rules, recognized explicit atom decay rules, and configured
 `pressure_protected_types`. Candidates are ordered deterministically: isolated
 before connected, unhealthy before healthy, then lower utility, lower salience,
@@ -696,7 +720,10 @@ raising `max_atoms` solely to suppress pressure warnings.
 
 Capacity diagnostics retain the v1-local hot-set definition: lifecycle-active
 atoms plus dormant proposals. `quality.lifecycle_counts` makes that composition
-explicit. Graph isolation is narrower: `isolated_active_atoms` contains only
+explicit. `quality.hot_atom_*`, `quality.lifecycle_active_atom_*`, and
+`quality.proposed_atom_*` expose each count and configured bound; the legacy
+`quality.active_atom_count` field remains a hot-total compatibility alias.
+Graph isolation is narrower: `isolated_active_atoms` contains only
 lifecycle-active canonical atoms, while `isolated_proposed_atoms` reports
 proposal isolation separately as expected dormant state and does not raise the
 active-graph isolation warning.

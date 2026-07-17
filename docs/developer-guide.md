@@ -230,9 +230,18 @@ POST /v1/memory-policy:run
 
 The built-in policy covers deterministic distillation, SMP analysis, low-risk
 maintenance proposals, search-index refresh, dependency-free lexical/LSA vector
-index refresh, decay checks, superseded-memory archiving, cache invalidation,
-and capacity governance. It does not require an LLM or an external vector
-database.
+index refresh, decay checks, superseded-memory archiving, producer-explicit
+proposal retention/deduplication, separate active/proposed quota enforcement,
+cache invalidation, and capacity governance. It does not require an LLM or an
+external vector database.
+
+Clients that retain every cognitive occurrence in their own audit store may
+bound the AMOS review queue by attaching
+`payload.proposal_retention.deduplication_key` and
+`payload.proposal_retention.archive_after_seconds` to proposed atoms. AMOS acts
+only on those explicit semantics (or an explicitly configured global proposal
+TTL); it does not guess duplicates from generated prose. Memory health reports
+hot-total, lifecycle-active, and proposed counts and limits separately.
 
 For request-time retrieval, an empty scope only sees global/unscoped memory. For
 service-owned decay and storage cleanup, an empty maintenance scope means

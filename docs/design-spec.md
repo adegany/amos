@@ -3215,6 +3215,15 @@ the producer already knows the typed semantics, it should attach canonical
 processor validates those structures and proposes governed edges. External
 processors remain appropriate for domain-specific aggregation, calibration,
 causal review, or legacy payloads that cannot emit the canonical contract.
+Canonical relation projections inherit evidence and confidence from their
+owning atom unless the relation supplies a narrower provenance set.
+
+Proposal-queue maintenance is likewise generic when the producer supplies an
+explicit `payload.proposal_retention` contract. AMOS may deterministically
+archive same-scope/type proposals sharing the producer's stable deduplication
+key, honor a proposal TTL, and enforce distinct lifecycle-active and proposed
+quotas. It must not infer semantic duplication from prose or treat proposal
+cleanup as permission to discard a client's independent occurrence journal.
 
 Prompt rendering should keep these sources distinct:
 

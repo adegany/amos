@@ -140,6 +140,10 @@ class MirrorAgentUIState:
             include_conflicts=True,
             include_low_health=True,
             max_items=8,
+            # Interactive reads must not synchronously rebuild every derived
+            # index. The service/background worker and explicit maintenance
+            # endpoint own that work.
+            run_policy=False,
         )
         self_view = self.amos.retrieve_self_awareness(agent_id=AGENT_ID, scope=SCOPE)
         recall = self.amos.retrieve_agentic_recall(

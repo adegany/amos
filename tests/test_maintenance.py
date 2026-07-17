@@ -314,6 +314,8 @@ def test_steward_backfills_intrinsic_edges_for_existing_atoms(amos):
                 "summary": "semantic arrived before source",
                 "source_refs": ["late_source"],
             },
+            "evidence_refs": ["evt_semantic_observation"],
+            "confidence": {"level": "high", "score": 0.91},
             "scope": {"tenant": "graph"},
         }
     )["atom"]
@@ -342,6 +344,73 @@ def test_steward_backfills_intrinsic_edges_for_existing_atoms(amos):
         for edge in amos.store.list_edges()
     }
     assert (semantic["id"], "rel:derived_from", source["id"]) in triples
+    edge = next(
+        edge
+        for edge in amos.store.list_edges()
+        if edge["source_ref"] == semantic["id"]
+        and edge["relation"] == "rel:derived_from"
+        and edge["target_ref"] == source["id"]
+    )
+    assert edge["evidence_refs"] == ["evt_semantic_observation"]
+    assert edge["confidence"] == {"level": "high", "score": 0.91}
+    assert amos.verify_replay()["status"] == "ok"
+
+
+def test_steward_refreshes_legacy_intrinsic_edge_provenance(amos):
+    source = amos.commit_atom(
+        {
+            "id": "provenance_source",
+            "type": "agentic_trace",
+            "payload": {
+                "task": "provenance",
+                "action": "record source",
+                "outcome": "observed",
+            },
+            "scope": {"tenant": "graph"},
+        }
+    )["atom"]
+    semantic = amos.commit_atom(
+        {
+            "id": "provenance_semantic",
+            "type": "semantic",
+            "payload": {
+                "summary": "Semantic relation awaiting provenance",
+                "source_refs": [source["id"]],
+            },
+            "scope": {"tenant": "graph"},
+        }
+    )["atom"]
+    edge = next(
+        edge
+        for edge in amos.store.list_edges()
+        if edge["source_ref"] == semantic["id"]
+        and edge["target_ref"] == source["id"]
+    )
+    assert edge["evidence_refs"] == []
+
+    updated = amos.update_atom(
+        semantic["id"],
+        set_fields={
+            "evidence_refs": ["evt_later_provenance"],
+            "confidence": {"level": "high", "score": 0.92},
+        },
+        expected_version=semantic["version"],
+    )["atom"]
+    unchanged_edge = amos.store.get_edge(edge["edge_id"])
+    assert unchanged_edge["evidence_refs"] == []
+
+    result = amos.run_steward(scope={"tenant": "graph"})
+
+    assert any(
+        action["action"] == "refresh_intrinsic_edges"
+        and action["edge_count"] == 1
+        for action in result["actions"]
+    )
+    refreshed = amos.store.get_edge(edge["edge_id"])
+    assert refreshed["evidence_refs"] == ["evt_later_provenance"]
+    assert refreshed["confidence"] == {"level": "high", "score": 0.92}
+    assert refreshed["version"] == unchanged_edge["version"] + 1
+    assert updated["version"] == semantic["version"] + 1
     assert amos.verify_replay()["status"] == "ok"
 
 

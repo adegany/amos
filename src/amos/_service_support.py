@@ -109,8 +109,13 @@ DEFAULT_MEMORY_POLICY = {
     "decay": {
         "enabled": True,
         "max_atoms": 256,
+        "max_active_atoms": 256,
+        "max_proposed_atoms": 256,
         "require_atom_policy": True,
         "pressure_archive_policyless": True,
+        "pressure_archive_proposed": True,
+        "proposal_pressure_min_age_seconds": 3600,
+        "archive_proposed_after_seconds": None,
         "pressure_max_archives_per_run": 256,
         "pressure_protected_types": ["commitment", "policy", "self_model"],
         "capacity_assessment_targets": [256, 512, 768],

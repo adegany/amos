@@ -966,6 +966,7 @@ class MirrorAgentDemo:
             type_filter=["goal", "commitment", "procedure", "limitation"],
             max_items=12,
             include_archived=True,
+            run_policy=False,
         )
         atoms = self.amos.store.list_atoms()
         events = self.amos.store.list_events()
@@ -979,7 +980,7 @@ class MirrorAgentDemo:
         verification = {
             "journal": self.amos.verify_journal_chain(),
             "replay": self.amos.verify_replay(),
-            "memory": self.amos.health_memory(),
+            "memory": self.amos.health_memory(run_policy=False),
             "llm_reviewer_policy": self.amos.llm_reviewer_policy(),
         }
         archived = [
@@ -1127,6 +1128,7 @@ class MirrorAgentDemo:
         max_items: int = 8,
         include_archived: bool = False,
         include_low_health: bool = True,
+        run_policy: bool = True,
     ) -> dict[str, Any]:
         packet = self.amos.retrieve_packet(
             cues=cues,
@@ -1138,6 +1140,7 @@ class MirrorAgentDemo:
             include_archived=include_archived,
             include_low_health=include_low_health,
             include_conflicts=True,
+            run_policy=run_policy,
         )
         self.packets[f"{role}:{len(self.packets)}"] = packet
         self.service_views[role] = {

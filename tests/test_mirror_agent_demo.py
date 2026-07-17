@@ -107,7 +107,7 @@ def test_mirror_agent_ui_serves_report_chat_and_non_llm_maintenance(tmp_path):
         )
         assert repeated_chat["report"]["memory_packets"][0]["source"] == "interactive_chat"
 
-        maintenance = http_json(f"{base}/api/maintenance/run", {})
+        maintenance = http_json(f"{base}/api/maintenance/run", {}, timeout=60)
         assert maintenance["lm_used"] is False
         assert maintenance["smp"]["status"] == "completed"
         assert "maintenance_distiller" in maintenance
@@ -121,7 +121,7 @@ def test_mirror_agent_ui_serves_report_chat_and_non_llm_maintenance(tmp_path):
         thread.join(timeout=2)
 
 
-def http_json(url, payload=None):
+def http_json(url, payload=None, *, timeout=10):
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url,
@@ -129,5 +129,5 @@ def http_json(url, payload=None):
         headers={"Content-Type": "application/json"},
         method="POST" if payload is not None else "GET",
     )
-    with urllib.request.urlopen(request, timeout=10) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))

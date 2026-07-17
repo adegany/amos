@@ -356,13 +356,24 @@ def test_memory_policy_pressure_archives_policyless_atoms_to_limit(amos):
         "enabled": True,
         "triggered": True,
         "max_atoms": 3,
+        "max_active_atoms": 3,
+        "max_proposed_atoms": 3,
         "hot_count_before": 5,
         "hot_count_after_rules": 5,
+        "active_count_after_rules": 5,
+        "proposed_count_after_rules": 0,
+        "active_pressure_needed": 2,
+        "proposed_pressure_needed": 0,
         "eligible_policyless_count": 3,
+        "eligible_proposed_count": 0,
         "archive_limit": 10,
         "archive_count": 2,
+        "proposal_archive_count": 0,
+        "active_archive_count": 2,
         "remaining_hot_count": 3,
         "remaining_over_limit": 0,
+        "remaining_active_over_limit": 0,
+        "remaining_proposed_over_limit": 0,
     }
     pressure_actions = [
         action
@@ -382,6 +393,178 @@ def test_memory_policy_pressure_archives_policyless_atoms_to_limit(amos):
     assert health["quality"]["active_atom_count"] == 3
     assert health["quality"]["active_atom_pressure"] == "within_limit"
     assert health["quality"]["pressure_cleanup"]["eligible_policyless_count"] == 1
+
+
+def test_memory_policy_enforces_proposed_quota_separately_from_active_atoms(amos):
+    old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    for index in range(2):
+        amos.commit_atom(
+            {
+                "id": f"separate_quota_active_{index}",
+                "type": "semantic",
+                "payload": {"summary": f"Canonical memory {index}"},
+            }
+        )
+    for index in range(3):
+        amos.propose_memory_atoms(
+            [
+                {
+                    "id": f"separate_quota_proposed_{index}",
+                    "type": "episode",
+                    "payload": {
+                        "summary": f"Review candidate {index}",
+                        "task": "quota test",
+                        "outcome": "pending",
+                        "started_at": old,
+                        "participants": ["test"],
+                        "proposal_retention": {
+                            "profile": "test.v1",
+                            "deduplication_key": f"candidate-{index}",
+                        },
+                    },
+                    "created_at": old,
+                    "observed_at": old,
+                    "updated_at": old,
+                }
+            ]
+        )
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={
+            "enabled": True,
+            "max_atoms": 10,
+            "max_active_atoms": 2,
+            "max_proposed_atoms": 2,
+            "proposal_pressure_min_age_seconds": 0,
+            "pressure_archive_proposed": True,
+        },
+        storage_cleanup={"enabled": False},
+    )
+
+    result = amos.run_memory_policy(force=True, trigger="separate_quota_test")
+    pressure = result["results"]["decay"]["pressure"]
+
+    assert pressure["triggered"] is True
+    assert pressure["active_pressure_needed"] == 0
+    assert pressure["proposed_pressure_needed"] == 1
+    assert pressure["archive_count"] == 1
+    assert pressure["proposal_archive_count"] == 1
+    assert pressure["remaining_proposed_over_limit"] == 0
+    assert result["results"]["decay"]["actions"][0]["reason"] == (
+        "proposed_atom_pressure_fallback"
+    )
+    health = amos.health_memory(run_policy=False)["quality"]
+    assert health["lifecycle_active_atom_count"] == 2
+    assert health["lifecycle_active_atom_limit"] == 2
+    assert health["proposed_atom_count"] == 2
+    assert health["proposed_atom_limit"] == 2
+    assert health["hot_atom_count"] == 4
+    assert health["hot_atom_limit"] == 10
+
+
+def test_memory_policy_deduplicates_only_explicitly_keyed_proposals(amos):
+    base = {
+        "type": "semantic",
+        "payload": {
+            "summary": "Repeated bounded reflection",
+            "proposal_retention": {
+                "profile": "test.v1",
+                "deduplication_key": "same-bounded-meaning",
+            },
+        },
+    }
+    first = amos.propose_memory_atoms(
+        [{**base, "id": "explicit_duplicate_first", "evidence_refs": ["evt_a"]}]
+    )["proposals"][0]["atom"]
+    second = amos.propose_memory_atoms(
+        [
+            {
+                **base,
+                "id": "explicit_duplicate_second",
+                "evidence_refs": ["evt_a", "evt_b"],
+            }
+        ]
+    )["proposals"][0]["atom"]
+    unkeyed = amos.propose_memory_atoms(
+        [
+            {
+                "id": "similar_but_unkeyed",
+                "type": "semantic",
+                "payload": {"summary": "Repeated bounded reflection"},
+            }
+        ]
+    )["proposals"][0]["atom"]
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": True, "max_atoms": 10},
+        storage_cleanup={"enabled": False},
+    )
+
+    result = amos.run_memory_policy(force=True, trigger="proposal_dedupe_test")
+
+    actions = result["results"]["decay"]["actions"]
+    assert actions == [
+        {
+            "atom_ref": first["id"],
+            "action": "archive",
+            "reason": "explicit_proposal_deduplication",
+            "superseded_by": [second["id"]],
+            "health_status": "merged",
+            "lifecycle_state": "archived",
+        }
+    ]
+    assert amos.store.get_atom(second["id"])["lifecycle_state"] == "proposed"
+    assert amos.store.get_atom(unkeyed["id"])["lifecycle_state"] == "proposed"
+
+
+def test_memory_policy_archives_proposal_after_explicit_retention_window(amos):
+    old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    proposal = amos.propose_memory_atoms(
+        [
+            {
+                "id": "expired_proposal_retention",
+                "type": "semantic",
+                "payload": {
+                    "summary": "Temporary review candidate",
+                    "proposal_retention": {
+                        "profile": "test.v1",
+                        "deduplication_key": "temporary-review-candidate",
+                        "archive_after_seconds": 60,
+                    },
+                },
+                "created_at": old,
+                "observed_at": old,
+                "updated_at": old,
+            }
+        ]
+    )["proposals"][0]["atom"]
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": True, "max_atoms": 10},
+        storage_cleanup={"enabled": False},
+    )
+
+    result = amos.run_memory_policy(force=True, trigger="proposal_retention_test")
+
+    assert result["results"]["decay"]["actions"] == [
+        {
+            "atom_ref": proposal["id"],
+            "action": "archive",
+            "reason": "proposed_retention_elapsed",
+            "health_status": "stale",
+            "lifecycle_state": "archived",
+        }
+    ]
 
 
 def test_memory_policy_pressure_reports_residual_protected_atoms(amos):

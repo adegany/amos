@@ -81,7 +81,11 @@ class PolicyService:
                 **dict(maintenance_distiller),
             }
         if decay is not None:
-            policy["decay"] = {**policy["decay"], **dict(decay)}
+            decay_update = dict(decay)
+            if "max_atoms" in decay_update:
+                decay_update.setdefault("max_active_atoms", decay_update["max_atoms"])
+                decay_update.setdefault("max_proposed_atoms", decay_update["max_atoms"])
+            policy["decay"] = {**policy["decay"], **decay_update}
         if storage_cleanup is not None:
             cleanup = dict(policy["storage_cleanup"])
             for key, value in dict(storage_cleanup).items():
@@ -436,9 +440,27 @@ class PolicyService:
         decay = normalized["decay"]
         decay["enabled"] = bool(decay.get("enabled", True))
         decay["max_atoms"] = max(1, int(decay.get("max_atoms", 256) or 256))
+        decay["max_active_atoms"] = max(
+            1,
+            int(decay.get("max_active_atoms", decay["max_atoms"]) or decay["max_atoms"]),
+        )
+        decay["max_proposed_atoms"] = max(
+            1,
+            int(decay.get("max_proposed_atoms", decay["max_atoms"]) or decay["max_atoms"]),
+        )
         decay["require_atom_policy"] = bool(decay.get("require_atom_policy", True))
         decay["pressure_archive_policyless"] = bool(
             decay.get("pressure_archive_policyless", True)
+        )
+        decay["pressure_archive_proposed"] = bool(
+            decay.get("pressure_archive_proposed", True)
+        )
+        decay["proposal_pressure_min_age_seconds"] = max(
+            0, int(decay.get("proposal_pressure_min_age_seconds", 3600) or 0)
+        )
+        proposed_ttl = decay.get("archive_proposed_after_seconds")
+        decay["archive_proposed_after_seconds"] = (
+            None if proposed_ttl in (None, "") else max(0, int(proposed_ttl))
         )
         decay["pressure_max_archives_per_run"] = max(
             1,
@@ -846,9 +868,11 @@ class PolicyService:
         # The capacity ceiling historically applies to the whole hot set:
         # active canonical atoms plus dormant proposals. Keep that contract
         # distinct from lifecycle-active graph quality below.
-        active_count = len(atoms)
+        hot_count = len(atoms)
         decay = dict(policy.get("decay") or {})
         max_atoms = int(decay.get("max_atoms", 256) or 256)
+        max_active_atoms = int(decay.get("max_active_atoms", max_atoms) or max_atoms)
+        max_proposed_atoms = int(decay.get("max_proposed_atoms", max_atoms) or max_atoms)
         edge_degrees = self.store.edge_degree_counts()
         isolated = [
             atom
@@ -883,7 +907,16 @@ class PolicyService:
         pressure_eligible = [
             atom
             for atom in atoms
-            if self._pressure_archive_eligible(atom, decay=decay, scope={})
+            if self._pressure_archive_eligible(
+                atom, decay=decay, scope={}, lifecycle_state="active"
+            )
+        ]
+        proposed_pressure_eligible = [
+            atom
+            for atom in atoms
+            if self._pressure_archive_eligible(
+                atom, decay=decay, scope={}, lifecycle_state="proposed"
+            )
         ]
         pressure_eligible_by_type: dict[str, int] = {}
         for atom in pressure_eligible:
@@ -891,7 +924,9 @@ class PolicyService:
             pressure_eligible_by_type[atom_type] = (
                 pressure_eligible_by_type.get(atom_type, 0) + 1
             )
-        archives_needed = max(0, active_count - max_atoms)
+        archives_needed = max(0, hot_count - max_atoms)
+        active_archives_needed = max(0, len(active_atoms) - max_active_atoms)
+        proposed_archives_needed = max(0, len(proposed_atoms) - max_proposed_atoms)
         capacity_headroom_ratio = float(
             decay.get("capacity_headroom_ratio", 0.2) or 0.0
         )
@@ -904,22 +939,39 @@ class PolicyService:
             | {max_atoms}
         )
         required_with_headroom = int(
-            math.ceil(active_count / max(0.1, 1.0 - capacity_headroom_ratio))
+            math.ceil(hot_count / max(0.1, 1.0 - capacity_headroom_ratio))
         )
         recommended_target = next(
             (target for target in capacity_targets if target >= required_with_headroom),
             capacity_targets[-1],
         )
-        capacity_utilization = active_count / max(1, max_atoms)
+        capacity_utilization = hot_count / max(1, max_atoms)
         capacity_near_limit = capacity_utilization >= 1.0 - capacity_headroom_ratio
 
         warnings: list[str] = []
-        if active_count > max_atoms:
+        if hot_count > max_atoms:
             warnings.append("active_atom_count_exceeds_decay_max_atoms")
-            if len(pressure_eligible) < archives_needed:
+            if (
+                len(pressure_eligible) + len(proposed_pressure_eligible)
+                < archives_needed
+            ):
                 warnings.append("active_atom_pressure_not_fully_enforceable")
         if capacity_near_limit:
             warnings.append("active_atom_capacity_headroom_low")
+        if len(active_atoms) >= max_active_atoms:
+            warnings.append("lifecycle_active_atom_limit_reached")
+            if (
+                len(active_atoms) > max_active_atoms
+                and len(pressure_eligible) < active_archives_needed
+            ):
+                warnings.append("lifecycle_active_atom_limit_not_fully_enforceable")
+        if len(proposed_atoms) >= max_proposed_atoms:
+            warnings.append("proposed_atom_limit_reached")
+            if (
+                len(proposed_atoms) > max_proposed_atoms
+                and len(proposed_pressure_eligible) < proposed_archives_needed
+            ):
+                warnings.append("proposed_atom_limit_not_fully_enforceable")
         if superseded_refs:
             warnings.append("active_superseded_atoms_present")
         if isolated:
@@ -936,20 +988,34 @@ class PolicyService:
             "lifecycle_counts": {
                 "active": len(active_atoms),
                 "proposed": len(proposed_atoms),
-                "hot_total": active_count,
+                "hot_total": hot_count,
             },
-            "active_atom_count": active_count,
+            # Compatibility aliases retain the historical hot-set meaning.
+            "active_atom_count": hot_count,
             "active_atom_limit": max_atoms,
+            "active_atom_count_semantics": "hot_total_legacy",
+            "hot_atom_count": hot_count,
+            "hot_atom_limit": max_atoms,
+            "lifecycle_active_atom_count": len(active_atoms),
+            "lifecycle_active_atom_limit": max_active_atoms,
+            "proposed_atom_count": len(proposed_atoms),
+            "proposed_atom_limit": max_proposed_atoms,
             "active_atom_pressure": "over_limit"
-            if active_count > max_atoms
+            if hot_count > max_atoms
             else "within_limit",
             "pressure_cleanup": {
                 "policyless_fallback_enabled": bool(
                     decay.get("pressure_archive_policyless", True)
                 ),
+                "proposed_fallback_enabled": bool(
+                    decay.get("pressure_archive_proposed", True)
+                ),
                 "archives_needed": archives_needed,
+                "active_archives_needed": active_archives_needed,
+                "proposed_archives_needed": proposed_archives_needed,
                 "eligible_policyless_count": len(pressure_eligible),
                 "eligible_policyless_by_type": pressure_eligible_by_type,
+                "eligible_proposed_count": len(proposed_pressure_eligible),
                 "max_archives_per_run": int(
                     decay.get("pressure_max_archives_per_run", 256) or 256
                 ),
@@ -957,8 +1023,8 @@ class PolicyService:
             },
             "capacity_assessment": {
                 "configured_target": max_atoms,
-                "active_count": active_count,
-                "headroom_atoms": max(0, max_atoms - active_count),
+                "active_count": hot_count,
+                "headroom_atoms": max(0, max_atoms - hot_count),
                 "utilization": round(capacity_utilization, 4),
                 "headroom_ratio_target": capacity_headroom_ratio,
                 "near_limit": capacity_near_limit,
@@ -966,8 +1032,8 @@ class PolicyService:
                 "candidate_targets": [
                     {
                         "target": target,
-                        "headroom_atoms": target - active_count,
-                        "utilization": round(active_count / max(1, target), 4),
+                        "headroom_atoms": target - hot_count,
+                        "utilization": round(hot_count / max(1, target), 4),
                         "meets_headroom_target": target >= required_with_headroom,
                     }
                     for target in capacity_targets
@@ -1285,6 +1351,12 @@ class PolicyService:
         actor: str,
     ) -> dict[str, Any]:
         max_atoms = max(1, int(decay.get("max_atoms", 256) or 256))
+        max_active_atoms = max(
+            1, int(decay.get("max_active_atoms", max_atoms) or max_atoms)
+        )
+        max_proposed_atoms = max(
+            1, int(decay.get("max_proposed_atoms", max_atoms) or max_atoms)
+        )
         require_atom_policy = bool(decay.get("require_atom_policy", True))
         actions: list[dict[str, Any]] = []
         projected_atoms: list[dict[str, Any]] = []
@@ -1309,6 +1381,7 @@ class PolicyService:
         atoms = list(atoms_by_ref.values())
         planned: list[tuple[dict[str, Any], dict[str, Any]]] = []
         planned_archives: set[str] = set()
+        duplicate_actions = self._proposed_duplicate_archive_actions(atoms)
         for atom in atoms:
             if not maintenance_scope_visible(atom["scope"], scope):
                 continue
@@ -1320,11 +1393,17 @@ class PolicyService:
             explicit_atom_policy = self._has_explicit_atom_decay_policy(atom_policy)
             if atom_policy.get("enabled") is False:
                 continue
-            superseded_action = self._decay_action_for_superseded_atom(
-                atom,
-                superseded_by=superseded_refs.get(atom["id"], []),
-                policy=decay,
-            )
+            superseded_action = duplicate_actions.get(str(atom["id"]))
+            if superseded_action is None:
+                superseded_action = self._decay_action_for_superseded_atom(
+                    atom,
+                    superseded_by=superseded_refs.get(atom["id"], []),
+                    policy=decay,
+                )
+            if superseded_action is None:
+                superseded_action = self._decay_action_for_proposed_atom(
+                    atom, policy=decay
+                )
             if superseded_action is not None:
                 action = superseded_action
             else:
@@ -1349,21 +1428,78 @@ class PolicyService:
             1 for atom in atoms if atom.get("lifecycle_state") in {"active", "proposed"}
         )
         hot_count_after_rules = hot_count_before - len(planned_archives)
-        pressure_needed = max(0, hot_count_after_rules - max_atoms)
+        active_count_after_rules = sum(
+            1
+            for atom in atoms
+            if atom.get("lifecycle_state") == "active"
+            and str(atom["id"]) not in planned_archives
+        )
+        proposed_count_after_rules = sum(
+            1
+            for atom in atoms
+            if atom.get("lifecycle_state") == "proposed"
+            and str(atom["id"]) not in planned_archives
+        )
+        total_pressure_needed = max(0, hot_count_after_rules - max_atoms)
+        active_pressure_needed = max(0, active_count_after_rules - max_active_atoms)
+        proposed_pressure_needed = max(
+            0, proposed_count_after_rules - max_proposed_atoms
+        )
         pressure_limit = int(decay.get("pressure_max_archives_per_run", 256) or 256)
-        pressure_candidates = [
+        proposal_pressure_candidates = [
             atom
             for atom in atoms
             if str(atom["id"]) not in planned_archives
-            and self._pressure_archive_eligible(atom, decay=decay, scope=scope)
+            and self._pressure_archive_eligible(
+                atom, decay=decay, scope=scope, lifecycle_state="proposed"
+            )
         ]
-        edge_degrees = self.store.edge_degree_counts() if pressure_needed else {}
-        pressure_candidates.sort(
+        active_pressure_candidates = [
+            atom
+            for atom in atoms
+            if str(atom["id"]) not in planned_archives
+            and self._pressure_archive_eligible(
+                atom, decay=decay, scope=scope, lifecycle_state="active"
+            )
+        ]
+        pressure_required = bool(
+            total_pressure_needed or active_pressure_needed or proposed_pressure_needed
+        )
+        edge_degrees = self.store.edge_degree_counts() if pressure_required else {}
+        proposal_pressure_candidates.sort(
+            key=lambda atom: self._pressure_archive_sort_key(atom, edge_degrees)
+        )
+        active_pressure_candidates.sort(
             key=lambda atom: self._pressure_archive_sort_key(atom, edge_degrees)
         )
         pressure_archive_count = 0
-        if decay.get("pressure_archive_policyless", True) and pressure_needed:
-            for atom in pressure_candidates[: min(pressure_needed, pressure_limit)]:
+        proposal_archive_count = 0
+        active_archive_count = 0
+        proposal_archive_target = max(
+            proposed_pressure_needed, total_pressure_needed
+        )
+        if decay.get("pressure_archive_proposed", True) and proposal_archive_target:
+            for atom in proposal_pressure_candidates[
+                : min(proposal_archive_target, pressure_limit)
+            ]:
+                action = {
+                    "action": "archive",
+                    "reason": "proposed_atom_pressure_fallback",
+                    "health_status": "stale",
+                }
+                planned.append((atom, action))
+                planned_archives.add(str(atom["id"]))
+                pressure_archive_count += 1
+                proposal_archive_count += 1
+        remaining_total_pressure = max(
+            0, total_pressure_needed - pressure_archive_count
+        )
+        active_archive_target = max(active_pressure_needed, remaining_total_pressure)
+        remaining_archive_budget = max(0, pressure_limit - pressure_archive_count)
+        if decay.get("pressure_archive_policyless", True) and active_archive_target:
+            for atom in active_pressure_candidates[
+                : min(active_archive_target, remaining_archive_budget)
+            ]:
                 action = {
                     "action": "archive",
                     "reason": "active_atom_pressure_policyless_fallback",
@@ -1372,20 +1508,43 @@ class PolicyService:
                 planned.append((atom, action))
                 planned_archives.add(str(atom["id"]))
                 pressure_archive_count += 1
+                active_archive_count += 1
 
         pressure = {
-            "enabled": bool(decay.get("pressure_archive_policyless", True)),
-            "triggered": pressure_needed > 0,
+            "enabled": bool(
+                decay.get("pressure_archive_policyless", True)
+                or decay.get("pressure_archive_proposed", True)
+            ),
+            "triggered": pressure_required,
             "max_atoms": max_atoms,
+            "max_active_atoms": max_active_atoms,
+            "max_proposed_atoms": max_proposed_atoms,
             "hot_count_before": hot_count_before,
             "hot_count_after_rules": hot_count_after_rules,
-            "eligible_policyless_count": len(pressure_candidates),
+            "active_count_after_rules": active_count_after_rules,
+            "proposed_count_after_rules": proposed_count_after_rules,
+            "active_pressure_needed": active_pressure_needed,
+            "proposed_pressure_needed": proposed_pressure_needed,
+            "eligible_policyless_count": len(active_pressure_candidates),
+            "eligible_proposed_count": len(proposal_pressure_candidates),
             "archive_limit": pressure_limit,
             "archive_count": pressure_archive_count,
+            "proposal_archive_count": proposal_archive_count,
+            "active_archive_count": active_archive_count,
             "remaining_hot_count": hot_count_after_rules - pressure_archive_count,
             "remaining_over_limit": max(
                 0,
                 hot_count_after_rules - pressure_archive_count - max_atoms,
+            ),
+            "remaining_active_over_limit": max(
+                0,
+                active_count_after_rules - active_archive_count - max_active_atoms,
+            ),
+            "remaining_proposed_over_limit": max(
+                0,
+                proposed_count_after_rules
+                - proposal_archive_count
+                - max_proposed_atoms,
             ),
         }
 
@@ -1482,10 +1641,14 @@ class PolicyService:
         *,
         decay: Mapping[str, Any],
         scope: Mapping[str, Any],
+        lifecycle_state: str = "active",
     ) -> bool:
-        if not decay.get("pressure_archive_policyless", True):
+        if lifecycle_state == "proposed":
+            if not decay.get("pressure_archive_proposed", True):
+                return False
+        elif not decay.get("pressure_archive_policyless", True):
             return False
-        if atom.get("lifecycle_state") != "active":
+        if atom.get("lifecycle_state") != lifecycle_state:
             return False
         if not maintenance_scope_visible(atom.get("scope", {}), scope):
             return False
@@ -1493,6 +1656,15 @@ class PolicyService:
             decay.get("pressure_protected_types", [])
         ):
             return False
+        if lifecycle_state == "proposed":
+            if not self._proposal_retention(atom):
+                return False
+            age = self._seconds_since(atom.get("created_at"))
+            if age is None or age < int(
+                decay.get("proposal_pressure_min_age_seconds", 3600) or 0
+            ):
+                return False
+            return True
         atom_policy = (
             dict(atom.get("decay_policy") or {})
             if isinstance(atom.get("decay_policy"), Mapping)
@@ -1506,6 +1678,76 @@ class PolicyService:
         if retain_until and not self._timestamp_elapsed(retain_until):
             return False
         return True
+
+
+    @staticmethod
+    def _proposal_retention(atom: Mapping[str, Any]) -> dict[str, Any]:
+        payload = atom.get("payload")
+        if not isinstance(payload, Mapping):
+            return {}
+        retention = payload.get("proposal_retention")
+        return dict(retention) if isinstance(retention, Mapping) else {}
+
+
+    def _decay_action_for_proposed_atom(
+        self, atom: Mapping[str, Any], *, policy: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        if atom.get("lifecycle_state") != "proposed":
+            return None
+        retention = self._proposal_retention(atom)
+        value = retention.get(
+            "archive_after_seconds", policy.get("archive_proposed_after_seconds")
+        )
+        if value in (None, ""):
+            return None
+        age = self._seconds_since(atom.get("created_at"))
+        if age is None or age < max(0, int(value)):
+            return None
+        return {
+            "action": "archive",
+            "reason": "proposed_retention_elapsed",
+            "health_status": "stale",
+        }
+
+
+    def _proposed_duplicate_archive_actions(
+        self, atoms: Sequence[Mapping[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
+        groups: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
+        for atom in atoms:
+            if atom.get("lifecycle_state") != "proposed":
+                continue
+            retention = self._proposal_retention(atom)
+            key = str(retention.get("deduplication_key") or "")
+            if not key:
+                continue
+            group_key = (
+                str(atom.get("type") or ""),
+                canonical_json(atom.get("scope") or {}),
+                key,
+            )
+            groups.setdefault(group_key, []).append(atom)
+        actions: dict[str, dict[str, Any]] = {}
+        for members in groups.values():
+            if len(members) < 2:
+                continue
+            ranked = sorted(
+                members,
+                key=lambda atom: (
+                    -len(atom.get("evidence_refs") or []),
+                    str(atom.get("created_at") or ""),
+                    str(atom.get("id") or ""),
+                ),
+            )
+            keeper = str(ranked[0]["id"])
+            for duplicate in ranked[1:]:
+                actions[str(duplicate["id"])] = {
+                    "action": "archive",
+                    "reason": "explicit_proposal_deduplication",
+                    "health_status": "merged",
+                    "superseded_by": [keeper],
+                }
+        return actions
 
 
     def _pressure_archive_sort_key(

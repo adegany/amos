@@ -255,7 +255,14 @@ class GraphService:
                 return None
             return existing
 
-        def add(source_ref: Any, target_ref: Any, relation: str) -> None:
+        def add(
+            source_ref: Any,
+            target_ref: Any,
+            relation: str,
+            *,
+            evidence_refs: Sequence[str] | None = None,
+            confidence: float | Mapping[str, Any] | None = None,
+        ) -> None:
             source = str(source_ref or "")
             target = str(target_ref or "")
             if not source or not target or source == target:
@@ -268,7 +275,29 @@ class GraphService:
             if key in seen:
                 return
             seen.add(key)
-            edges.append(self._edge(source, target, relation, scope))
+            relation_evidence = list(
+                dict.fromkeys(
+                    str(ref)
+                    for ref in (
+                        evidence_refs
+                        if evidence_refs is not None
+                        else atom.get("evidence_refs", [])
+                    )
+                    if str(ref)
+                )
+            )
+            edges.append(
+                self._edge(
+                    source,
+                    target,
+                    relation,
+                    scope,
+                    evidence_refs=relation_evidence,
+                    confidence=(
+                        confidence if confidence is not None else atom.get("confidence")
+                    ),
+                )
+            )
 
         for ref in _structured_ref_list(atom.get("supersedes")):
             add(atom_id, ref, "rel:supersedes")
@@ -317,7 +346,13 @@ class GraphService:
             target_ref = atom_id if target_ref == "$self" else target_ref
             if atom_id not in {str(source_ref or ""), str(target_ref or "")}:
                 continue
-            add(source_ref, target_ref, relation)
+            add(
+                source_ref,
+                target_ref,
+                relation,
+                evidence_refs=raw.get("evidence_refs"),
+                confidence=raw.get("confidence"),
+            )
 
         return edges
 
@@ -328,9 +363,22 @@ class GraphService:
         target_ref: str,
         relation: str,
         scope: Mapping[str, Any],
+        *,
+        evidence_refs: Sequence[str] | None = None,
+        confidence: float | Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         relation = normalize_relation(relation)
         now = utc_now()
+        if isinstance(confidence, Mapping):
+            score = float(confidence.get("score", 0.75) or 0.75)
+        elif isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+            score = float(confidence)
+        else:
+            score = 0.75
+        score = max(0.0, min(1.0, score))
+        level = (
+            "high" if score >= 0.85 else "medium-high" if score >= 0.65 else "medium"
+        )
         return {
             "edge_id": stable_id(
                 "edge",
@@ -345,9 +393,11 @@ class GraphService:
             "target_ref": target_ref,
             "relation": relation,
             "schema_version": SCHEMA_VERSION,
-            "evidence_refs": [],
+            "evidence_refs": list(
+                dict.fromkeys(str(ref) for ref in evidence_refs or [] if str(ref))
+            ),
             "scope": dict(scope),
-            "confidence": {"level": "medium-high", "score": 0.75},
+            "confidence": {"level": level, "score": score},
             "lifecycle_state": "active",
             "health_status": "healthy",
             "created_at": now,

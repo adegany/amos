@@ -576,16 +576,71 @@ class StewardshipService:
                     }
                 )
             smp_outputs = self.smp.cluster(atoms) + self.smp.detect_conflicts(atoms)
-            existing_edge_ids = {
-                edge["edge_id"] for edge in self.store.list_edges()
+            existing_edges = {
+                edge["edge_id"]: edge for edge in self.store.list_edges()
             }
             intrinsic_edge_count = 0
+            refreshed_intrinsic_edge_count = 0
             for atom in atoms:
                 for edge in self._intrinsic_edges_for_atom(atom):
-                    if edge["edge_id"] in existing_edge_ids:
+                    existing_edge = existing_edges.get(edge["edge_id"])
+                    if existing_edge is not None:
+                        evidence_refs = sorted(
+                            {
+                                *(
+                                    str(ref)
+                                    for ref in existing_edge.get("evidence_refs", [])
+                                    if str(ref)
+                                ),
+                                *(
+                                    str(ref)
+                                    for ref in edge.get("evidence_refs", [])
+                                    if str(ref)
+                                ),
+                            }
+                        )
+                        existing_score = float(
+                            (existing_edge.get("confidence") or {}).get(
+                                "score", 0.0
+                            )
+                        )
+                        projected_score = float(
+                            (edge.get("confidence") or {}).get("score", 0.0)
+                        )
+                        score = max(existing_score, projected_score)
+                        confidence = {
+                            "level": (
+                                "high"
+                                if score >= 0.85
+                                else "medium-high"
+                                if score >= 0.65
+                                else "medium"
+                            ),
+                            "score": score,
+                        }
+                        if (
+                            not existing_edge.get("deleted")
+                            and existing_edge.get("lifecycle_state") == "active"
+                            and existing_edge.get("health_status") == "healthy"
+                            and existing_edge.get("evidence_refs") == evidence_refs
+                            and existing_edge.get("confidence") == confidence
+                        ):
+                            continue
+                        edge = {
+                            **edge,
+                            "evidence_refs": evidence_refs,
+                            "confidence": confidence,
+                            "created_at": existing_edge["created_at"],
+                            "updated_at": utc_now(),
+                            "version": int(existing_edge.get("version", 1)) + 1,
+                        }
+                        self.store.upsert_edge(conn, edge)
+                        existing_edges[edge["edge_id"]] = edge
+                        projected_edges.append(edge)
+                        refreshed_intrinsic_edge_count += 1
                         continue
                     self.store.insert_edge(conn, edge)
-                    existing_edge_ids.add(edge["edge_id"])
+                    existing_edges[edge["edge_id"]] = edge
                     projected_edges.append(edge)
                     intrinsic_edge_count += 1
             if intrinsic_edge_count:
@@ -594,6 +649,14 @@ class StewardshipService:
                         "action": "project_intrinsic_edges",
                         "edge_count": intrinsic_edge_count,
                         "policy": "deterministic_structured_atom_refs",
+                    }
+                )
+            if refreshed_intrinsic_edge_count:
+                actions.append(
+                    {
+                        "action": "refresh_intrinsic_edges",
+                        "edge_count": refreshed_intrinsic_edge_count,
+                        "policy": "merge_structured_edge_provenance",
                     }
                 )
             seen: dict[str, dict[str, Any]] = {}
