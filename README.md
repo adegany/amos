@@ -134,12 +134,16 @@ in-process SQLite store and serializes access through the service boundary:
 - Deterministic non-generative Semantic Maintenance Processor (SMP) outputs
   using the required audit envelope.
 - Generic maintenance proposal records, a processor registry, and a policy gate
-  that auto-commits only low-risk derived atoms while deferring review items.
+  that auto-commits only low-risk derived atoms or active-endpoint edges while
+  deferring review items.
 - A generic maintenance processor registry. AMOS ships the built-in generic SMP
   adapter and canonical graph builder. Any producer can attach validated
   `semantic_facets` and `graph_relations` to typed atoms; AMOS builds governed
   edges without a domain processor. Domain-specific processors remain optional
   adapters for payloads that cannot emit the canonical contract directly.
+- Processor-specific bounded worksets, hierarchical evidence coverage,
+  explicit producer hints/cohorts, edge derivation provenance, and graph,
+  proposal-backlog, and per-processor effectiveness diagnostics.
 - Advisory maintenance for deduplication and contradiction marking, with
   high-risk mutation requests gated behind explicit approval.
 - Capacity pressure reporting and degraded packet disclosure.
@@ -337,9 +341,11 @@ views, and advisory maintenance. It does not directly execute external actions.
 Integrations such as the Mirror Agent demo should keep live control authority,
 validation, approval checks, and runtime packet application outside AMOS.
 Domain-specific maintenance packs should follow the same boundary: they inspect
-bounded AMOS evidence windows and return side-effect-free proposals; the AMOS
-service applies policy gates, journals accepted low-risk mutations, and defers
-ambiguous or high-risk work for review.
+bounded AMOS evidence windows and return side-effect-free proposals; optional
+`window_request` metadata narrows lifecycle/type/profile and evidence needs but
+cannot widen scope or budgets. The AMOS service applies policy gates, journals
+accepted low-risk mutations, records edge derivation, and defers ambiguous or
+high-risk work for review.
 
 ### Agent identity and cognitive-processor boundary
 

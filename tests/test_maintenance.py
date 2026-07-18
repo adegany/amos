@@ -30,6 +30,7 @@ from amos import (
     SemanticFacet,
     SemanticMaintenanceProcessor,
     SelfModelCalibrator,
+    SQLiteStore,
     ValidationError,
     ontology_snapshot,
     semantic_relation_proposals_from_facets,
@@ -37,8 +38,138 @@ from amos import (
 from amos.cli import main as cli_main
 from amos.http_api import AmosHTTPServer
 from amos.smp import cosine
+from amos.schemas import canonical_json, digest
 
 from .helpers import ExampleTrainingFlightProcessor, item_refs
+
+
+def test_edge_derivation_migrates_legacy_rows(tmp_path):
+    path = tmp_path / "legacy-edges.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE amos_edges (
+            edge_id TEXT PRIMARY KEY,
+            source_ref TEXT NOT NULL,
+            target_ref TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            schema_version TEXT NOT NULL,
+            evidence_refs TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            lifecycle_state TEXT NOT NULL,
+            health_status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            deleted INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO amos_edges VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "legacy_edge",
+            "source",
+            "target",
+            "rel:derived_from",
+            "amos.v1",
+            "[]",
+            "{}",
+            '{"level":"medium","score":0.5}',
+            "active",
+            "healthy",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+            1,
+            0,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    store = SQLiteStore(path)
+    try:
+        edge = store.get_edge("legacy_edge")
+        assert edge["derivation"] == {
+            "kind": "migrated_relation_classification",
+            "relation_class": "structural",
+            "exact_producer_unknown": True,
+        }
+    finally:
+        store.close()
+
+
+def test_legacy_edge_derivation_migration_preserves_journal_replay(tmp_path):
+    path = tmp_path / "legacy-edge-replay.sqlite3"
+    amos = Amos(path)
+    amos.commit_atom(
+        {
+            "id": "legacy_replay_source",
+            "type": "semantic",
+            "payload": {"summary": "Source"},
+            "scope": {"tenant": "migration-test"},
+        }
+    )
+    amos.commit_atom(
+        {
+            "id": "legacy_replay_target",
+            "type": "semantic",
+            "payload": {
+                "summary": "Target",
+                "graph_relations": [
+                    {
+                        "source_ref": "$self",
+                        "target_ref": "legacy_replay_source",
+                        "relation": "rel:derived_from",
+                    }
+                ],
+            },
+            "scope": {"tenant": "migration-test"},
+        }
+    )
+    edge = next(
+        item
+        for item in amos.store.list_edges()
+        if item["source_ref"] == "legacy_replay_target"
+    )
+    event = amos.store.list_events()[-1]
+    amos.close()
+
+    payload = dict(event["payload"])
+    payload["projected_edges"] = [
+        {key: value for key, value in item.items() if key != "derivation"}
+        for item in payload.get("projected_edges", [])
+    ]
+    body = dict(event)
+    body.pop("checksum", None)
+    body["payload"] = payload
+    body["payload_digest"] = digest(payload)
+    checksum = digest(body)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "UPDATE amos_edges SET derivation = '{}' WHERE edge_id = ?",
+        (edge["edge_id"],),
+    )
+    conn.execute(
+        "UPDATE amos_event_journal SET payload = ?, payload_digest = ?, checksum = ? WHERE event_id = ?",
+        (canonical_json(payload), body["payload_digest"], checksum, event["event_id"]),
+    )
+    conn.execute(
+        "UPDATE amos_meta SET value = ? WHERE key = 'last_event_hash'",
+        (checksum,),
+    )
+    conn.commit()
+    conn.close()
+
+    migrated = Amos(path)
+    try:
+        migrated_edge = migrated.store.get_edge(edge["edge_id"])
+        assert migrated_edge["derivation"]["exact_producer_unknown"] is True
+        assert migrated.verify_journal_chain()["status"] == "ok"
+        assert migrated.verify_replay()["status"] == "ok"
+    finally:
+        migrated.close()
 
 
 def test_steward_removes_legacy_active_edges_touching_proposed_atoms(amos):

@@ -23,6 +23,9 @@ Status terms:
 | Stewardship and SMP | `src/amos/stewardship_service.py`, `src/amos/maintenance.py`, `src/amos/smp.py` | `tests/test_maintenance.py` |
 | Automatic policy and capacity | `src/amos/policy_service.py`, `src/amos/capacity_service.py`, `src/amos/workers.py` | `tests/test_policy_and_capacity.py` |
 | External processor packs | `src/amos/maintenance.py`, `src/amos/stewardship_service.py` | `tests/test_processor_packs.py` |
+| Processor worksets and hierarchical evidence coverage | `src/amos/maintenance.py`, `src/amos/stewardship_service.py` | `tests/test_processor_packs.py` |
+| Edge derivation and legacy migration | `src/amos/graph_service.py`, `src/amos/store.py` | `tests/test_maintenance.py` |
+| Graph/proposal/processor quality diagnostics | `src/amos/policy_service.py` | `tests/test_policy_and_capacity.py` |
 | Journal and health verification | `src/amos/diagnostics_service.py`, `src/amos/store.py` | `tests/test_schema_and_mutations.py`, `tests/test_policy_and_capacity.py` |
 | HTTP and CLI adapters | `src/amos/http_api.py`, `src/amos/cli.py` | `tests/test_cli_http.py` |
 | Mirror Agent example | `examples/mirror_agent_demo.py`, `examples/mirror_agent_ui.py` | `tests/test_mirror_agent_demo.py` |

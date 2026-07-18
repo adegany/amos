@@ -727,6 +727,12 @@ Graph isolation is narrower: `isolated_active_atoms` contains only
 lifecycle-active canonical atoms, while `isolated_proposed_atoms` reports
 proposal isolation separately as expected dormant state and does not raise the
 active-graph isolation warning.
+`quality.graph_quality` additionally reports active connected components,
+atom-type and relation distributions, top-degree concentration, confidence and
+edge-derivation histograms, and unresolved reference samples. Proposal age,
+explicit deduplication, covered-source counts, and recent per-processor proposal,
+commit, deferral, and idempotent-replay totals are exposed separately. These are
+diagnostics, not deterministic semantic acceptance rules.
 Supported v1-local rules include `expires_at`, `retain_until`,
 `mark_stale_after_seconds`, `archive_after_seconds`, and
 `low_utility_threshold`; operator policy can relax `require_atom_policy` to
@@ -756,9 +762,14 @@ SMP analysis:
 
 maintenance evidence window:
   uses configured limits for atoms, events, and retrieval outcomes
-  prioritizes active and proposed atoms before filling remaining atom capacity
-  with archived provenance, so recent archival cannot displace hot self-models
-  reads visible active graph neighborhoods for selected atoms
+  lets each processor request a narrower lifecycle/type/profile workset without
+  widening caller scope or limits
+  applies hierarchical maintenance scope to atoms and evidence, so whole-store
+  or tenant passes include evidence retained at narrower run/project scopes
+  may add bounded graph neighbors after typed candidates
+  prioritizes directly referenced evidence before other visible evidence
+  reports candidate, truncation, lifecycle/type, graph-boundary, and unresolved
+  evidence coverage per processor
   keeps processor packs side-effect-free
 
 retrieval policy scheduling:
@@ -790,7 +801,7 @@ Evidence window:
 
 ```text
 atoms:
-  visible active atoms in scope
+  processor-requested visible lifecycle/type/profile workset in scope
 edges:
   visible graph neighborhood for selected atoms
 evidence:
@@ -805,6 +816,8 @@ domain:
   generic or domain-specific label
 graph_version:
   source graph version
+coverage:
+  candidate, selected, truncated, edge-boundary, and evidence-resolution counts
 ```
 
 Maintenance proposal:
@@ -835,11 +848,13 @@ payload:
   proposed mutation or review details
 ```
 
-Only `risk_level = low` and `action = add_atom` is auto-committable in V1.
-The committed atom must be a derived canonical atom with source refs,
-proposal id, processor id, and policy metadata. Other actions are returned as
-deferred proposals and journaled in `maintenance_distillation_run`; they are
-not silently discarded.
+Only `risk_level = low` with `action = add_atom` or `action = add_edge` is
+auto-committable in V1. A committed atom must be a derived canonical atom with
+source refs, proposal id, processor id, and policy metadata. A committed edge
+must have two active endpoints, allowed relation semantics, evidence/confidence,
+and a derivation record naming the processor and proposal. Other actions are
+returned as deferred proposals and journaled in `maintenance_distillation_run`;
+they are not silently discarded.
 
 The default registry in the AMOS package includes only generic AMOS
 maintenance:
@@ -858,6 +873,19 @@ agents: integrations write typed atoms and evidence into shared AMOS; client
 processors inspect those canonical records; low-risk derived memories are
 committed through the shared service policy; high-risk or ambiguous changes
 remain review items.
+
+A processor may optionally implement `window_request(scope=..., domain=...)`
+and return a `MaintenanceWindowRequest`. Lifecycle, atom-type, producer-profile,
+neighbor, evidence/event/outcome, and size preferences narrow its workset; the
+service still enforces the caller's scope and ceilings. Shared helpers expose
+explicit producer hints, cohort keys, source coverage, evidence diversity, and
+idempotent derived-memory proposal construction without interpreting free prose.
+
+Every newly projected edge carries `derivation`. Intrinsic/canonical structural
+edges, explicit producer relations, semantic-facet associations, and
+processor-reviewed relations use distinct derivation kinds. Existing databases
+receive an explicit `migrated_relation_classification` marker; migration does
+not pretend to know an unavailable historical producer.
 
 Processor packs should promote repeated, evidence-backed experiences into
 compact reusable memories rather than copying every source event into a prompt

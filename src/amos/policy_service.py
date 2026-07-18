@@ -889,6 +889,152 @@ class PolicyService:
             atom_type = str(atom.get("type") or "unknown")
             isolated_by_type[atom_type] = isolated_by_type.get(atom_type, 0) + 1
 
+        active_refs = {str(atom["id"]) for atom in active_atoms}
+        edges = [
+            edge
+            for edge in self.store.list_edges()
+            if not edge.get("deleted")
+            and edge.get("lifecycle_state", "active") == "active"
+        ]
+        active_edges = [
+            edge
+            for edge in edges
+            if str(edge.get("source_ref") or "") in active_refs
+            and str(edge.get("target_ref") or "") in active_refs
+        ]
+        adjacency: dict[str, set[str]] = {ref: set() for ref in active_refs}
+        relation_distribution: dict[str, int] = {}
+        derivation_distribution: dict[str, int] = {}
+        confidence_histogram = {
+            "0.00-0.24": 0,
+            "0.25-0.49": 0,
+            "0.50-0.74": 0,
+            "0.75-0.89": 0,
+            "0.90-1.00": 0,
+        }
+        for edge in active_edges:
+            source_ref = str(edge["source_ref"])
+            target_ref = str(edge["target_ref"])
+            adjacency[source_ref].add(target_ref)
+            adjacency[target_ref].add(source_ref)
+            relation = str(edge.get("relation") or "unknown")
+            relation_distribution[relation] = relation_distribution.get(relation, 0) + 1
+            derivation = edge.get("derivation")
+            derivation = derivation if isinstance(derivation, Mapping) else {}
+            derivation_kind = str(derivation.get("kind") or "unclassified")
+            derivation_distribution[derivation_kind] = (
+                derivation_distribution.get(derivation_kind, 0) + 1
+            )
+            confidence = edge.get("confidence")
+            confidence = confidence if isinstance(confidence, Mapping) else {}
+            score = max(0.0, min(1.0, float(confidence.get("score", 0.0) or 0.0)))
+            bucket = (
+                "0.00-0.24"
+                if score < 0.25
+                else "0.25-0.49"
+                if score < 0.5
+                else "0.50-0.74"
+                if score < 0.75
+                else "0.75-0.89"
+                if score < 0.9
+                else "0.90-1.00"
+            )
+            confidence_histogram[bucket] += 1
+        components: list[list[str]] = []
+        remaining = set(active_refs)
+        while remaining:
+            seed = min(remaining)
+            stack = [seed]
+            component: list[str] = []
+            remaining.remove(seed)
+            while stack:
+                current = stack.pop()
+                component.append(current)
+                for neighbor in sorted(adjacency.get(current, set())):
+                    if neighbor in remaining:
+                        remaining.remove(neighbor)
+                        stack.append(neighbor)
+            components.append(sorted(component))
+        components.sort(key=lambda item: (-len(item), item[0] if item else ""))
+        active_degrees = {ref: len(adjacency.get(ref, set())) for ref in active_refs}
+        total_degree = sum(active_degrees.values())
+        top_hubs = sorted(active_degrees.items(), key=lambda item: (-item[1], item[0]))[:10]
+        top_five_degree = sum(degree for _ref, degree in top_hubs[:5])
+
+        evidence_records = self.store.list_evidence()
+        known_refs = active_refs | {str(atom["id"]) for atom in proposed_atoms} | {
+            str(record.get("evidence_id") or "") for record in evidence_records
+        }
+        unresolved_refs: set[str] = set()
+        for atom in atoms:
+            unresolved_refs.update(
+                str(ref)
+                for ref in atom.get("evidence_refs", [])
+                if str(ref) and str(ref) not in known_refs
+            )
+        for edge in edges:
+            for ref in (
+                edge.get("source_ref"),
+                edge.get("target_ref"),
+                *edge.get("evidence_refs", []),
+            ):
+                text = str(ref or "")
+                if text and text not in known_refs:
+                    unresolved_refs.add(text)
+
+        proposal_age = {"under_24h": 0, "1d_to_7d": 0, "over_7d": 0, "unknown": 0}
+        dedupe_groups: dict[str, int] = {}
+        for atom in proposed_atoms:
+            elapsed = self._seconds_since(atom.get("created_at"))
+            if elapsed is None:
+                proposal_age["unknown"] += 1
+            elif elapsed < 86400:
+                proposal_age["under_24h"] += 1
+            elif elapsed < 7 * 86400:
+                proposal_age["1d_to_7d"] += 1
+            else:
+                proposal_age["over_7d"] += 1
+            payload = atom.get("payload")
+            payload = payload if isinstance(payload, Mapping) else {}
+            retention = payload.get("proposal_retention")
+            retention = retention if isinstance(retention, Mapping) else {}
+            dedupe_key = str(retention.get("deduplication_key") or "").strip()
+            if dedupe_key:
+                dedupe_groups[dedupe_key] = dedupe_groups.get(dedupe_key, 0) + 1
+
+        covered_sources: set[str] = set()
+        for atom in active_atoms:
+            payload = atom.get("payload")
+            payload = payload if isinstance(payload, Mapping) else {}
+            if not (
+                payload.get("maintenance_proposal_id")
+                or payload.get("created_by_processor")
+                or payload.get("distillation_type")
+            ):
+                continue
+            for field in ("source_refs", "maintenance_source_refs", "reviewed_refs"):
+                covered_sources.update(
+                    str(ref) for ref in payload.get(field, []) if str(ref)
+                )
+
+        processor_effectiveness: dict[str, dict[str, int]] = {}
+        maintenance_runs = 0
+        for event in self.store.list_events(limit=200):
+            if event.get("event_type") != "maintenance_distillation_run":
+                continue
+            maintenance_runs += 1
+            payload = event.get("payload")
+            payload = payload if isinstance(payload, Mapping) else {}
+            for processor_id, counters in dict(payload.get("processor_results") or {}).items():
+                target = processor_effectiveness.setdefault(
+                    str(processor_id),
+                    {"runs": 0, "proposed": 0, "committed": 0, "already_committed": 0, "deferred": 0, "skipped": 0},
+                )
+                target["runs"] += 1
+                if isinstance(counters, Mapping):
+                    for key in ("proposed", "committed", "already_committed", "deferred", "skipped"):
+                        target[key] += int(counters.get(key, 0) or 0)
+
         superseded_refs = self._active_superseded_refs()
         superseded_by_type: dict[str, int] = {}
         for atom_ref in superseded_refs:
@@ -1059,6 +1205,39 @@ class PolicyService:
             "derived_index_lag": {
                 "max_graph_delta": max_index_lag,
                 "by_index": index_lag,
+            },
+            "graph_quality": {
+                "active_atom_type_distribution": self._counts(active_atoms, "type"),
+                "active_relation_distribution": dict(sorted(relation_distribution.items())),
+                "active_edge_count": len(active_edges),
+                "component_count": len(components),
+                "largest_component_size": len(components[0]) if components else 0,
+                "component_sizes": [len(component) for component in components[:20]],
+                "hub_concentration_top_five": round(
+                    top_five_degree / max(1, total_degree), 4
+                ),
+                "top_hubs": [
+                    {"atom_ref": ref, "degree": degree} for ref, degree in top_hubs
+                ],
+                "edge_confidence_histogram": confidence_histogram,
+                "edge_derivation_distribution": dict(sorted(derivation_distribution.items())),
+                "unresolved_ref_count": len(unresolved_refs),
+                "unresolved_ref_samples": sorted(unresolved_refs)[:32],
+            },
+            "proposal_quality": {
+                "age_distribution": proposal_age,
+                "dedupe_key_count": len(dedupe_groups),
+                "duplicate_dedupe_key_count": sum(
+                    1 for count in dedupe_groups.values() if count > 1
+                ),
+                "duplicate_proposal_count": sum(
+                    count - 1 for count in dedupe_groups.values() if count > 1
+                ),
+                "covered_source_count": len(covered_sources),
+            },
+            "maintenance_processor_effectiveness": {
+                "recent_run_count": maintenance_runs,
+                "by_processor": processor_effectiveness,
             },
         }
 
@@ -1968,12 +2147,19 @@ class PolicyService:
         payload = atom.get("payload", {})
         payload = payload if isinstance(payload, Mapping) else {}
         score = 0
-        kind = str(payload.get("qandl_kind") or payload.get("kind") or "").lower()
+        hints = payload.get("maintenance_hints")
+        hints = hints if isinstance(hints, Mapping) else {}
+        kind = str(hints.get("kind") or payload.get("kind") or "").lower()
         outcome = str(
             payload.get("outcome") or payload.get("status") or payload.get("result") or ""
         ).lower()
         if kind in {"reflection", "outcome", "evaluation"}:
             score += 6
+        priority = hints.get("priority")
+        if isinstance(priority, (int, float)) and not isinstance(priority, bool):
+            score += max(-4, min(8, int(priority)))
+        if hints.get("distill") is True:
+            score += 4
         if outcome and outcome not in {"issued", "pending", "planned", "started"}:
             score += 4
         for key in (

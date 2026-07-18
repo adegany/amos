@@ -32,7 +32,40 @@ JSON_COLUMNS = {
     "target_refs",
     "vector_json",
     "details_json",
+    "derivation",
 }
+
+
+LEGACY_STRUCTURAL_RELATIONS = {
+    "rel:attributed_to",
+    "rel:constrained_by",
+    "rel:corrected_by",
+    "rel:derived_from",
+    "rel:has_capability",
+    "rel:has_limitation",
+    "rel:made_commitment",
+    "rel:part_of",
+    "rel:produced_outcome",
+    "rel:supersedes",
+    "rel:uses",
+}
+
+
+def migrated_edge_derivation(relation: str) -> dict[str, Any]:
+    """Return the conservative provenance assigned to a legacy edge.
+
+    Migration can classify the relation family, but it cannot reconstruct an
+    exact historical producer that was never journaled.
+    """
+
+    return {
+        "kind": "migrated_relation_classification",
+        "relation_class": (
+            "structural" if str(relation or "") in LEGACY_STRUCTURAL_RELATIONS
+            else "associative"
+        ),
+        "exact_producer_unknown": True,
+    }
 
 
 class SQLiteStore:
@@ -147,6 +180,7 @@ class SQLiteStore:
                 evidence_refs TEXT NOT NULL,
                 scope TEXT NOT NULL,
                 confidence TEXT NOT NULL,
+                derivation TEXT NOT NULL DEFAULT '{}',
                 lifecycle_state TEXT NOT NULL,
                 health_status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -242,11 +276,36 @@ class SQLiteStore:
             """
         )
         with self.transaction() as conn:
+            self._migrate_edge_derivation(conn)
             if self._get_meta(conn, "graph_version") is None:
                 self._set_meta(conn, "graph_version", "0")
             if self._get_meta(conn, "last_event_hash") is None:
                 self._set_meta(conn, "last_event_hash", "genesis")
             self._backfill_atom_text_index(conn)
+
+    def _migrate_edge_derivation(self, conn: sqlite3.Connection) -> None:
+        """Add explicit edge provenance and classify legacy rows for migration."""
+
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(amos_edges)").fetchall()
+        }
+        if "derivation" not in columns:
+            conn.execute(
+                "ALTER TABLE amos_edges ADD COLUMN derivation TEXT NOT NULL DEFAULT '{}'"
+            )
+        rows = conn.execute(
+            "SELECT edge_id, relation, derivation FROM amos_edges"
+        ).fetchall()
+        for row in rows:
+            raw = str(row["derivation"] or "").strip()
+            if raw not in {"", "{}", "null"}:
+                continue
+            derivation = migrated_edge_derivation(str(row["relation"] or ""))
+            conn.execute(
+                "UPDATE amos_edges SET derivation = ? WHERE edge_id = ?",
+                (canonical_json(derivation), str(row["edge_id"])),
+            )
 
     def _get_meta(self, conn: sqlite3.Connection, key: str) -> str | None:
         row = conn.execute("SELECT value FROM amos_meta WHERE key = ?", (key,)).fetchone()
@@ -860,10 +919,10 @@ class SQLiteStore:
             """
             INSERT INTO amos_edges(
                 edge_id, source_ref, target_ref, relation, schema_version,
-                evidence_refs, scope, confidence, lifecycle_state, health_status,
-                created_at, updated_at, version, deleted
+                evidence_refs, scope, confidence, derivation, lifecycle_state,
+                health_status, created_at, updated_at, version, deleted
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(edge_id) DO NOTHING
             """,
             (
@@ -875,6 +934,7 @@ class SQLiteStore:
                 canonical_json(edge["evidence_refs"]),
                 canonical_json(edge["scope"]),
                 canonical_json(edge["confidence"]),
+                canonical_json(edge.get("derivation") or {}),
                 edge["lifecycle_state"],
                 edge["health_status"],
                 edge["created_at"],
@@ -897,10 +957,10 @@ class SQLiteStore:
             """
             INSERT INTO amos_edges(
                 edge_id, source_ref, target_ref, relation, schema_version,
-                evidence_refs, scope, confidence, lifecycle_state, health_status,
-                created_at, updated_at, version, deleted
+                evidence_refs, scope, confidence, derivation, lifecycle_state,
+                health_status, created_at, updated_at, version, deleted
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(edge_id) DO UPDATE SET
                 source_ref = excluded.source_ref,
                 target_ref = excluded.target_ref,
@@ -909,6 +969,7 @@ class SQLiteStore:
                 evidence_refs = excluded.evidence_refs,
                 scope = excluded.scope,
                 confidence = excluded.confidence,
+                derivation = excluded.derivation,
                 lifecycle_state = excluded.lifecycle_state,
                 health_status = excluded.health_status,
                 created_at = excluded.created_at,
@@ -925,6 +986,7 @@ class SQLiteStore:
                 canonical_json(edge["evidence_refs"]),
                 canonical_json(edge["scope"]),
                 canonical_json(edge["confidence"]),
+                canonical_json(edge.get("derivation") or {}),
                 edge["lifecycle_state"],
                 edge["health_status"],
                 edge["created_at"],

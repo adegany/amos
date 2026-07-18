@@ -1,6 +1,7 @@
 """DiagnosticsService implementation for the AMOS service facade."""
 
 from ._service_support import Any, digest
+from .store import migrated_edge_derivation
 
 
 class DiagnosticsService:
@@ -117,6 +118,16 @@ class DiagnosticsService:
         atoms: dict[str, dict[str, Any]] = {}
         edges: dict[str, dict[str, Any]] = {}
         tombstones: dict[str, dict[str, Any]] = {}
+
+        def replay_edge_projection(edge: dict[str, Any]) -> dict[str, Any]:
+            projected = dict(edge)
+            derivation = projected.get("derivation")
+            if not isinstance(derivation, dict) or not derivation:
+                projected["derivation"] = migrated_edge_derivation(
+                    str(projected.get("relation") or "")
+                )
+            return projected
+
         for event in self.store.list_events():
             payload = event["payload"]
             event_type = event["event_type"]
@@ -127,7 +138,7 @@ class DiagnosticsService:
                     if edge.get("deleted"):
                         edges.pop(edge["edge_id"], None)
                     else:
-                        edges[edge["edge_id"]] = edge
+                        edges[edge["edge_id"]] = replay_edge_projection(edge)
             elif event_type == "atom_updated":
                 atom = payload["after"]
                 atoms[atom["id"]] = atom
@@ -135,7 +146,7 @@ class DiagnosticsService:
                     if edge.get("deleted"):
                         edges.pop(edge["edge_id"], None)
                     else:
-                        edges[edge["edge_id"]] = edge
+                        edges[edge["edge_id"]] = replay_edge_projection(edge)
             elif event_type == "atom_deleted":
                 before = payload["before"]
                 atom_id = before["id"]
@@ -151,13 +162,13 @@ class DiagnosticsService:
                     if edge.get("deleted"):
                         edges.pop(edge["edge_id"], None)
                     else:
-                        edges[edge["edge_id"]] = edge
+                        edges[edge["edge_id"]] = replay_edge_projection(edge)
             elif event_type == "edge_committed":
                 for edge in payload.get("projected_edges", []):
                     if edge.get("deleted"):
                         edges.pop(edge["edge_id"], None)
                     else:
-                        edges[edge["edge_id"]] = edge
+                        edges[edge["edge_id"]] = replay_edge_projection(edge)
             elif event_type in {
                 "atom_merged",
                 "steward_run",
@@ -174,7 +185,7 @@ class DiagnosticsService:
                     if edge.get("deleted"):
                         edges.pop(edge["edge_id"], None)
                     else:
-                        edges[edge["edge_id"]] = edge
+                        edges[edge["edge_id"]] = replay_edge_projection(edge)
                 for tombstone in payload.get("tombstones", []):
                     tombstones[tombstone["target_ref"]] = tombstone
         return {

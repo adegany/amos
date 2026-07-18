@@ -262,6 +262,7 @@ class GraphService:
             *,
             evidence_refs: Sequence[str] | None = None,
             confidence: float | Mapping[str, Any] | None = None,
+            derivation_kind: str = "intrinsic_structural",
         ) -> None:
             source = str(source_ref or "")
             target = str(target_ref or "")
@@ -296,6 +297,11 @@ class GraphService:
                     confidence=(
                         confidence if confidence is not None else atom.get("confidence")
                     ),
+                    derivation={
+                        "kind": derivation_kind,
+                        "processor_id": "amos.graph.intrinsic.v1",
+                        "source_refs": [atom_id],
+                    },
                 )
             )
 
@@ -352,6 +358,7 @@ class GraphService:
                 relation,
                 evidence_refs=raw.get("evidence_refs"),
                 confidence=raw.get("confidence"),
+                derivation_kind="explicit_structural",
             )
 
         return edges
@@ -366,6 +373,7 @@ class GraphService:
         *,
         evidence_refs: Sequence[str] | None = None,
         confidence: float | Mapping[str, Any] | None = None,
+        derivation: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         relation = normalize_relation(relation)
         now = utc_now()
@@ -398,6 +406,13 @@ class GraphService:
             ),
             "scope": dict(scope),
             "confidence": {"level": level, "score": score},
+            "derivation": dict(
+                derivation
+                or {
+                    "kind": "direct_service_edge",
+                    "exact_producer_unknown": True,
+                }
+            ),
             "lifecycle_state": "active",
             "health_status": "healthy",
             "created_at": now,

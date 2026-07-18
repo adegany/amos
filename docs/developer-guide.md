@@ -251,8 +251,25 @@ limit cleanup to one tenant, project, run, or agent slice.
 Client-specific cleanup and learning belongs in client processor packs, not in
 AMOS core. A domain processor receives a bounded evidence window and returns
 side-effect-free maintenance proposals. AMOS applies policy gates, commits
-low-risk derived atoms, journals the mutation, and defers ambiguous or high-risk
-work for review.
+low-risk derived atoms and explicit active-endpoint edges, journals the mutation,
+and defers ambiguous or high-risk work for review. A processor can implement
+`window_request(scope=..., domain=...)` to request a narrower lifecycle, atom
+type, producer profile, graph-neighbor, evidence, event, outcome, and size
+workset. This request can never widen the caller-authorized scope or resource
+ceiling.
+
+Use producer-owned `payload.maintenance_hints` for stable profile, cohort,
+priority, and source-ref metadata. AMOS never treats those hints as canonical
+claims or mutation authority. Prefer the shared cohort, source-coverage,
+evidence-diversity, and derived-proposal helpers over client-specific scans of
+the whole store.
+
+Every edge has a `derivation` object. New structural, facet-derived, and
+processor-reviewed relations name their construction path; migrated legacy
+edges are explicitly marked as classified migration data with unknown exact
+producer. Health diagnostics expose component structure, type/relation mix,
+hub concentration, edge confidence/provenance, unresolved refs, proposal
+backlog quality, and recent processor effectiveness.
 
 ## 9. Model Durable Agent Identity Separately From Processors
 

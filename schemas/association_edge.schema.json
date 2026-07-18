@@ -3,7 +3,7 @@
   "$id": "https://amos.local/schemas/association_edge.schema.json",
   "title": "AMOS AssociationEdge",
   "type": "object",
-  "required": ["edge_id", "source_ref", "target_ref", "relation", "schema_version", "confidence", "scope", "lifecycle_state", "health_status"],
+  "required": ["edge_id", "source_ref", "target_ref", "relation", "schema_version", "confidence", "derivation", "scope", "lifecycle_state", "health_status"],
   "properties": {
     "edge_id": { "type": "string" },
     "source_ref": { "type": "string" },
@@ -13,6 +13,7 @@
     "evidence_refs": { "type": "array", "items": { "type": "string" } },
     "scope": { "$ref": "scope.schema.json" },
     "confidence": { "type": "object" },
+    "derivation": { "type": "object" },
     "lifecycle_state": { "type": "string" },
     "health_status": { "type": "string" }
   },

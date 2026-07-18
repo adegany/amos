@@ -52,6 +52,7 @@ class EvidenceWindow:
     scope: Mapping[str, Any] = field(default_factory=dict)
     domain: str = "generic"
     graph_version: int = 0
+    coverage: Mapping[str, Any] = field(default_factory=dict)
     generated_at: str = field(default_factory=utc_now)
 
     def to_dict(self) -> dict[str, Any]:
@@ -64,7 +65,41 @@ class EvidenceWindow:
             "scope": dict(self.scope),
             "domain": self.domain,
             "graph_version": self.graph_version,
+            "coverage": dict(self.coverage),
             "generated_at": self.generated_at,
+        }
+
+
+@dataclass(frozen=True)
+class MaintenanceWindowRequest:
+    """Optional domain-neutral workset request for a processor.
+
+    The service remains responsible for scope, lifecycle, and size bounds. A
+    processor may ask for a narrower typed workset, but cannot use this object
+    to widen the caller-authorized scope or acquire mutation authority.
+    """
+
+    lifecycle_states: tuple[str, ...] = ("active", "proposed")
+    atom_types: tuple[str, ...] = ()
+    graph_metadata_profiles: tuple[str, ...] = ()
+    max_atoms: int | None = None
+    include_graph_neighbors: bool = False
+    include_evidence: bool = True
+    include_events: bool = True
+    include_retrieval_outcomes: bool = True
+    max_evidence: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "lifecycle_states": list(self.lifecycle_states),
+            "atom_types": list(self.atom_types),
+            "graph_metadata_profiles": list(self.graph_metadata_profiles),
+            "max_atoms": self.max_atoms,
+            "include_graph_neighbors": self.include_graph_neighbors,
+            "include_evidence": self.include_evidence,
+            "include_events": self.include_events,
+            "include_retrieval_outcomes": self.include_retrieval_outcomes,
+            "max_evidence": self.max_evidence,
         }
 
 
@@ -183,6 +218,49 @@ class MaintenanceProcessor(Protocol):
         ...
 
 
+def coerce_window_request(
+    value: MaintenanceWindowRequest | Mapping[str, Any] | None,
+) -> MaintenanceWindowRequest:
+    if value is None:
+        return MaintenanceWindowRequest()
+    if isinstance(value, MaintenanceWindowRequest):
+        return value
+    if not isinstance(value, Mapping):
+        raise ValidationError("maintenance window request must be a mapping")
+    lifecycle_states = tuple(
+        dict.fromkeys(str(item) for item in value.get("lifecycle_states", ()) if str(item))
+    ) or ("active", "proposed")
+    atom_types = tuple(
+        dict.fromkeys(str(item) for item in value.get("atom_types", ()) if str(item))
+    )
+    profiles = tuple(
+        dict.fromkeys(
+            str(item)
+            for item in value.get("graph_metadata_profiles", ())
+            if str(item)
+        )
+    )
+    max_atoms = value.get("max_atoms")
+    max_evidence = value.get("max_evidence")
+    return MaintenanceWindowRequest(
+        lifecycle_states=lifecycle_states,
+        atom_types=atom_types,
+        graph_metadata_profiles=profiles,
+        max_atoms=max(1, int(max_atoms)) if max_atoms not in (None, "") else None,
+        include_graph_neighbors=bool(value.get("include_graph_neighbors", False)),
+        include_evidence=bool(value.get("include_evidence", True)),
+        include_events=bool(value.get("include_events", True)),
+        include_retrieval_outcomes=bool(
+            value.get("include_retrieval_outcomes", True)
+        ),
+        max_evidence=(
+            max(0, int(max_evidence))
+            if max_evidence not in (None, "")
+            else None
+        ),
+    )
+
+
 class ProcessorRegistry:
     """In-process registry for deterministic maintenance processor packs."""
 
@@ -207,21 +285,179 @@ class ProcessorRegistry:
             for processor in self._processors.values()
         ]
 
+    def resolve(
+        self, *, processor_ids: Sequence[str] | None = None
+    ) -> list[MaintenanceProcessor]:
+        """Resolve registered processors before an evidence window is built."""
+
+        if processor_ids:
+            return [
+                processor
+                for processor_id in processor_ids
+                if (processor := self.get(processor_id)) is not None
+            ]
+        return list(self._processors.values())
+
     def select(
         self,
         window: EvidenceWindow,
         *,
         processor_ids: Sequence[str] | None = None,
     ) -> list[MaintenanceProcessor]:
-        if processor_ids:
-            selected = [
-                processor
-                for processor_id in processor_ids
-                if (processor := self.get(processor_id)) is not None
-            ]
-        else:
-            selected = list(self._processors.values())
+        selected = self.resolve(processor_ids=processor_ids)
         return [processor for processor in selected if processor.supports(window)]
+
+
+def maintenance_hints_from_atom(atom: Mapping[str, Any]) -> dict[str, Any]:
+    """Return producer hints that are safe for generic workset selection.
+
+    Hints are advisory metadata, never canonical claims or mutation authority.
+    Unknown values are retained so domain processors can interpret their own
+    profiles without adding domain branches to AMOS.
+    """
+
+    payload = atom.get("payload")
+    if not isinstance(payload, Mapping):
+        return {}
+    hints = payload.get("maintenance_hints")
+    return dict(hints) if isinstance(hints, Mapping) else {}
+
+
+def maintenance_source_refs(atom: Mapping[str, Any]) -> tuple[str, ...]:
+    """Collect explicit source coverage refs without inferring from prose."""
+
+    payload = atom.get("payload")
+    payload = payload if isinstance(payload, Mapping) else {}
+    hints = maintenance_hints_from_atom(atom)
+    refs: list[str] = []
+    for value in (
+        atom.get("evidence_refs"),
+        payload.get("source_refs"),
+        payload.get("maintenance_source_refs"),
+        payload.get("reviewed_refs"),
+        hints.get("source_refs"),
+    ):
+        refs.extend(_structured_refs(value))
+    return tuple(dict.fromkeys(ref for ref in refs if ref))
+
+
+def covered_source_refs(atoms: Sequence[Mapping[str, Any]]) -> set[str]:
+    """Return source refs explicitly covered by active derived memories."""
+
+    covered: set[str] = set()
+    for atom in atoms:
+        if atom.get("deleted") or atom.get("lifecycle_state") != "active":
+            continue
+        payload = atom.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        if not (
+            payload.get("maintenance_proposal_id")
+            or payload.get("created_by_processor")
+            or payload.get("distillation_type")
+        ):
+            continue
+        covered.update(maintenance_source_refs(atom))
+    return covered
+
+
+def group_maintenance_cohorts(
+    atoms: Sequence[Mapping[str, Any]],
+) -> dict[str, tuple[Mapping[str, Any], ...]]:
+    """Group atoms only by explicit producer-supplied stable cohort keys."""
+
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for atom in atoms:
+        payload = atom.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        hints = maintenance_hints_from_atom(atom)
+        retention = payload.get("proposal_retention")
+        retention = retention if isinstance(retention, Mapping) else {}
+        key = str(
+            hints.get("cluster_key")
+            or hints.get("cohort_key")
+            or retention.get("deduplication_key")
+            or ""
+        ).strip()
+        if key:
+            grouped.setdefault(key, []).append(atom)
+    return {
+        key: tuple(sorted(values, key=lambda item: str(item.get("id") or "")))
+        for key, values in sorted(grouped.items())
+    }
+
+
+def evidence_diversity(
+    refs: Sequence[str], evidence: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """Summarize how many independent evidence sources support a proposal."""
+
+    wanted = {str(ref) for ref in refs if str(ref)}
+    records = [item for item in evidence if str(item.get("evidence_id") or "") in wanted]
+    source_refs = {str(item.get("source_ref") or "") for item in records if item.get("source_ref")}
+    source_types = {str(item.get("source_type") or "") for item in records if item.get("source_type")}
+    return {
+        "referenced": len(wanted),
+        "resolved": len(records),
+        "independent_sources": len(source_refs),
+        "source_types": sorted(source_types),
+    }
+
+
+def derived_memory_proposal(
+    *,
+    processor_id: str,
+    processor_version: str,
+    reason_code: str,
+    source_refs: Sequence[str],
+    evidence_refs: Sequence[str],
+    atom_type: str,
+    atom_payload: Mapping[str, Any],
+    scope: Mapping[str, Any],
+    confidence: float,
+    title: str,
+    risk_level: str = "low",
+) -> MaintenanceProposal:
+    """Build an idempotent processor-derived atom proposal."""
+
+    sources = tuple(dict.fromkeys(str(ref) for ref in source_refs if str(ref)))
+    evidence = tuple(dict.fromkeys(str(ref) for ref in evidence_refs if str(ref)))
+    score = round(max(0.0, min(1.0, float(confidence))), 4)
+    atom_id = stable_id(
+        "atom",
+        {
+            "processor_id": processor_id,
+            "reason_code": reason_code,
+            "source_refs": sources,
+            "payload": dict(atom_payload),
+            "scope": dict(scope),
+        },
+    )
+    payload = dict(atom_payload)
+    payload.setdefault("created_by_processor", processor_id)
+    payload.setdefault("maintenance_source_refs", list(sources))
+    return MaintenanceProposal(
+        processor_id=processor_id,
+        processor_version=processor_version,
+        action="add_atom",
+        risk_level=risk_level,
+        confidence=score,
+        reason_code=reason_code,
+        source_refs=sources,
+        evidence_refs=evidence,
+        target_refs=(atom_id,),
+        payload={
+            "atom": {
+                "id": atom_id,
+                "type": str(atom_type),
+                "payload": payload,
+                "evidence_refs": list(evidence),
+                "scope": dict(scope),
+                "confidence": {"level": _confidence_level(score), "score": score},
+                "lifecycle_state": "active",
+            }
+        },
+        title=title,
+    )
 
 
 class GenericMaintenanceProcessor:
@@ -509,6 +745,17 @@ def canonical_relation_proposals_from_atoms(
                             "score": score,
                         },
                         "evidence_refs": list(refs),
+                        "derivation": {
+                            "kind": (
+                                "explicit_structural"
+                                if explicit
+                                else "canonical_structural"
+                            ),
+                            "processor_id": GENERIC_GRAPH_PROCESSOR_ID,
+                            "processor_version": GENERIC_GRAPH_PROCESSOR_VERSION,
+                            "reason_code": reason_code,
+                            "source_refs": [owner_ref],
+                        },
                     },
                     "canonical_owner_ref": owner_ref,
                 },
@@ -676,6 +923,20 @@ def semantic_relation_proposals_from_facets(
                                 "score": confidence,
                             },
                             "evidence_refs": list(evidence_refs),
+                            "derivation": {
+                                "kind": "facet_derived_association",
+                                "processor_id": processor_id,
+                                "processor_version": processor_version,
+                                "reason_code": reason_code,
+                                "source_refs": [
+                                    str(left["atom_ref"]),
+                                    str(right["atom_ref"]),
+                                ],
+                                "facet_refs": [
+                                    str(left["facet_id"]),
+                                    str(right["facet_id"]),
+                                ],
+                            },
                         },
                         "facets": [left, right],
                     },

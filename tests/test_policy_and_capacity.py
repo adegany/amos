@@ -797,6 +797,16 @@ def test_health_memory_reports_quality_diagnostics(amos):
     assert health["quality"]["active_superseded_atoms"]["sample_refs"] == [old["id"]]
     assert health["quality"]["isolated_active_atoms"]["count"] >= 1
     assert isolated["id"] in health["quality"]["isolated_active_atoms"]["sample_refs"]
+    graph_quality = health["quality"]["graph_quality"]
+    assert graph_quality["active_atom_type_distribution"]["semantic"] == 3
+    assert graph_quality["active_relation_distribution"]["rel:supersedes"] == 1
+    assert graph_quality["component_count"] == 2
+    assert graph_quality["largest_component_size"] == 2
+    assert graph_quality["edge_derivation_distribution"]["intrinsic_structural"] == 1
+    assert "hub_concentration_top_five" in graph_quality
+    assert "edge_confidence_histogram" in graph_quality
+    assert "proposal_quality" in health["quality"]
+    assert "maintenance_processor_effectiveness" in health["quality"]
 
 
 def test_health_isolation_separates_active_graph_from_dormant_proposals(amos):

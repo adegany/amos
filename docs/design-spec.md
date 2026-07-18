@@ -3057,9 +3057,9 @@ POST /v1/memory-policy:run
 POST /v1/maintenance-distiller:run
   request payload: scope, domain, optional processor_ids, window limits,
   auto_commit_low_risk, reviewer
-  response payload: evidence window summary, selected processors, proposal
-  records, committed low-risk atom refs, deferred review items, reviewer status,
-  journal event ref
+  response payload: shared and per-processor evidence-window/coverage summaries,
+  selected processors, proposal records, committed low-risk atom or edge refs,
+  deferred review items, reviewer status, journal event ref
   consistency: strong when a tick runs
 
 POST /v1/deletion-requests
@@ -3199,7 +3199,8 @@ AMOS responsibilities:
   disclose omissions, conflicts, degradation, and attention traces
   update utility/salience from retrieval outcomes
   run deterministic maintenance and registered processor packs
-  commit low-risk derived memories through policy gates
+  commit low-risk derived memories and active-endpoint edges through policy gates
+  preserve explicit derivation provenance for every graph edge
 ```
 
 Client-specific cleanup and learning should live in client packages as
@@ -3216,7 +3217,17 @@ processor validates those structures and proposes governed edges. External
 processors remain appropriate for domain-specific aggregation, calibration,
 causal review, or legacy payloads that cannot emit the canonical contract.
 Canonical relation projections inherit evidence and confidence from their
-owning atom unless the relation supplies a narrower provenance set.
+owning atom unless the relation supplies a narrower provenance set. Every edge
+also names its derivation path; legacy rows are migration-classified without
+inventing a historical producer.
+
+Processors may request a narrower `MaintenanceWindowRequest` before execution.
+Lifecycle, atom-type, producer-profile, neighbor, evidence/event/outcome, and
+size fields are workset hints; AMOS still enforces the caller scope and ceilings.
+Coverage reports distinguish visible candidates, selected/truncated records,
+internal and boundary edges, and resolved/missing evidence. Client processors
+should use explicit producer hints and cohort keys rather than infer semantic
+equivalence from prose.
 
 Proposal-queue maintenance is likewise generic when the producer supplies an
 explicit `payload.proposal_retention` contract. AMOS may deterministically

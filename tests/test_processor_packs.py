@@ -25,6 +25,7 @@ from amos import (
     MemoryPolicyWorker,
     MemorySteward,
     MaintenanceProposal,
+    MaintenanceWindowRequest,
     PacketCacheInvalidator,
     SMPWorker,
     SemanticFacet,
@@ -641,6 +642,119 @@ def test_maintenance_evidence_window_prioritizes_hot_atoms_over_recent_archives(
     assert window.atoms[0]["id"] == active["id"]
     assert window.atoms[0]["lifecycle_state"] == "active"
     assert len(window.atoms) == 2
+
+
+def test_processor_specific_workset_is_typed_bounded_and_reports_coverage(amos):
+    class TypedProcessor:
+        processor_id = "test.typed-workset.v1"
+        processor_version = "test.typed-workset.v1"
+
+        def window_request(self, *, scope, domain):
+            assert domain == "typed-domain"
+            return MaintenanceWindowRequest(
+                lifecycle_states=("proposed",),
+                atom_types=("episode",),
+                max_atoms=1,
+                include_evidence=True,
+                include_events=False,
+                include_retrieval_outcomes=False,
+                max_evidence=4,
+            )
+
+        def supports(self, window):
+            return bool(window.atoms)
+
+        def propose(self, window):
+            return []
+
+    scope = {"tenant": "workset"}
+    for index in range(2):
+        captured = amos.capture_event(
+            source_type="test",
+            source_ref=f"workset-source-{index}",
+            payload={"index": index},
+            actor="test",
+            scope={**scope, "run_id": f"run-{index}"},
+            idempotency_key=f"workset-evidence-{index}",
+        )
+        amos.propose_memory_atoms(
+            [
+                {
+                    "id": f"workset_episode_{index}",
+                    "type": "episode",
+                    "payload": {
+                        "task": "typed workset",
+                        "origin": "test",
+                        "maintenance_hints": {"profile": "test.profile"},
+                    },
+                    "evidence_refs": [captured["evidence"]["evidence_id"]],
+                    "scope": {**scope, "run_id": f"run-{index}"},
+                }
+            ],
+            actor="test",
+            scope=scope,
+        )
+    amos.commit_atom(
+        {
+            "id": "workset_active_semantic",
+            "type": "semantic",
+            "payload": {"summary": "Must be excluded by typed workset."},
+            "scope": scope,
+        }
+    )
+    processor = TypedProcessor()
+    amos.register_maintenance_processor(processor)
+
+    result = amos.run_maintenance_distiller(
+        scope=scope,
+        domain="typed-domain",
+        processor_ids=[processor.processor_id],
+        max_atoms=64,
+        max_events=64,
+        max_retrieval_outcomes=64,
+    )
+
+    window = result["processor_windows"][processor.processor_id]
+    assert window["atom_count"] == 1
+    assert window["evidence_count"] == 2
+    assert window["event_count"] == 0
+    assert window["coverage"]["candidate_atom_count"] == 2
+    assert window["coverage"]["truncated_atom_count"] == 1
+    assert window["coverage"]["missing_referenced_evidence"] == []
+
+
+def test_maintenance_window_hierarchically_includes_narrow_evidence(amos):
+    scope = {"tenant": "hierarchical-evidence"}
+    captured = amos.capture_event(
+        source_type="test",
+        source_ref="narrow-evidence-source",
+        payload={"value": 1},
+        actor="test",
+        scope={**scope, "run_id": "narrow-run"},
+        idempotency_key="narrow-evidence",
+    )
+    amos.commit_atom(
+        {
+            "id": "narrow_evidence_atom",
+            "type": "semantic",
+            "payload": {"summary": "Narrow evidence remains visible to broad maintenance."},
+            "evidence_refs": [captured["evidence"]["evidence_id"]],
+            "scope": {**scope, "run_id": "narrow-run"},
+        }
+    )
+
+    window = amos.stewardship._maintenance_evidence_window(
+        scope=scope,
+        domain="generic",
+        max_atoms=8,
+        max_events=0,
+        max_retrieval_outcomes=0,
+        request=MaintenanceWindowRequest(),
+    )
+
+    assert [item["evidence_id"] for item in window.evidence] == [
+        captured["evidence"]["evidence_id"]
+    ]
 
 
 def test_maintenance_evidence_window_includes_narrower_scopes_before_limit(amos):

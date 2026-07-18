@@ -7,11 +7,13 @@ from ._service_support import (
     GENERIC_GRAPH_PROCESSOR_VERSION,
     HIGH_RISK_MAINTENANCE,
     MaintenanceProcessor,
+    MaintenanceWindowRequest,
     Mapping,
     SEMANTIC_RELATION_PROCESSOR_ID,
     SEMANTIC_RELATION_PROCESSOR_VERSION,
     Sequence,
     digest,
+    coerce_window_request,
     load_maintenance_processor,
     maintenance_scope_visible,
     normalize_atom,
@@ -164,37 +166,62 @@ class StewardshipService:
     ) -> dict[str, Any]:
         scope = dict(scope or {})
         processor_ids = list(processor_ids or [])
-        window = self._maintenance_evidence_window(
+        known_processor_ids = {
+            item["processor_id"] for item in self.maintenance_processors.list()
+        }
+        missing_processors = sorted(set(processor_ids) - known_processor_ids)
+        resolved_processors = self.maintenance_processors.resolve(
+            processor_ids=processor_ids
+        )
+        processors = []
+        proposals: list[dict[str, Any]] = []
+        relation_proposals: list[dict[str, Any]] = []
+        processor_windows: dict[str, dict[str, Any]] = {}
+        built_windows: list[EvidenceWindow] = []
+        for processor in resolved_processors:
+            request = self._maintenance_processor_window_request(
+                processor, scope=scope, domain=domain
+            )
+            processor_window = self._maintenance_evidence_window(
+                scope=scope,
+                domain=domain,
+                max_atoms=max_atoms,
+                max_events=max_events,
+                max_retrieval_outcomes=max_retrieval_outcomes,
+                request=request,
+            )
+            built_windows.append(processor_window)
+            processor_windows[processor.processor_id] = {
+                "request": request.to_dict(),
+                **processor_window.to_dict(),
+            }
+            if not processor.supports(processor_window):
+                continue
+            processors.append(processor)
+            proposals.extend(
+                proposal.to_dict() for proposal in processor.propose(processor_window)
+            )
+            extract_facets = getattr(processor, "extract_facets", None)
+            if callable(extract_facets):
+                semantic_facets = extract_facets(processor_window)
+                if semantic_facets:
+                    generated = [
+                        proposal.to_dict()
+                        for proposal in semantic_relation_proposals_from_facets(
+                            semantic_facets,
+                            existing_edges=processor_window.edges,
+                        )
+                    ]
+                    relation_proposals.extend(generated)
+                    proposals.extend(generated)
+        window = built_windows[0] if built_windows else self._maintenance_evidence_window(
             scope=scope,
             domain=domain,
             max_atoms=max_atoms,
             max_events=max_events,
             max_retrieval_outcomes=max_retrieval_outcomes,
+            request=MaintenanceWindowRequest(),
         )
-        processors = self.maintenance_processors.select(
-            window, processor_ids=processor_ids
-        )
-        known_processor_ids = {
-            item["processor_id"] for item in self.maintenance_processors.list()
-        }
-        missing_processors = sorted(set(processor_ids) - known_processor_ids)
-        proposals = []
-        semantic_facets = []
-        for processor in processors:
-            proposals.extend(proposal.to_dict() for proposal in processor.propose(window))
-            extract_facets = getattr(processor, "extract_facets", None)
-            if callable(extract_facets):
-                semantic_facets.extend(extract_facets(window))
-        relation_proposals = []
-        if semantic_facets:
-            relation_proposals = [
-                proposal.to_dict()
-                for proposal in semantic_relation_proposals_from_facets(
-                    semantic_facets,
-                    existing_edges=window.edges,
-                )
-            ]
-            proposals.extend(relation_proposals)
         proposals.sort(
             key=lambda proposal: (
                 proposal["risk_level"] != "low",
@@ -234,6 +261,7 @@ class StewardshipService:
                 "scope": scope,
                 "domain": domain,
                 "window": window.to_dict(),
+                "processor_windows": processor_windows,
                 "processors": processor_records,
                 "missing_processors": missing_processors,
                 "proposals": [],
@@ -290,6 +318,7 @@ class StewardshipService:
                 "scope": scope,
                 "domain": domain,
                 "window": window.to_dict(),
+                "processor_windows": processor_windows,
                 "processors": processor_records,
                 "missing_processors": missing_processors,
                 "proposals": proposals,
@@ -316,6 +345,7 @@ class StewardshipService:
                 "scope": scope,
                 "domain": domain,
                 "window": window.to_dict(),
+                "processor_windows": processor_windows,
                 "processors": processor_records,
                 "missing_processors": missing_processors,
                 "proposals": proposals,
@@ -347,17 +377,46 @@ class StewardshipService:
             )
             if ref
         )
+        proposal_processor = {
+            str(proposal.get("proposal_id")): str(proposal.get("processor_id"))
+            for proposal in proposals
+        }
+        processor_results: dict[str, dict[str, int]] = {}
+        for proposal in proposals:
+            processor_id = str(proposal.get("processor_id") or "unknown")
+            counters = processor_results.setdefault(
+                processor_id,
+                {"proposed": 0, "committed": 0, "already_committed": 0, "deferred": 0, "skipped": 0},
+            )
+            counters["proposed"] += 1
+        for item in committed:
+            processor_id = proposal_processor.get(str(item.get("proposal_id")), "unknown")
+            counters = processor_results.setdefault(
+                processor_id,
+                {"proposed": 0, "committed": 0, "already_committed": 0, "deferred": 0, "skipped": 0},
+            )
+            status = str(item.get("status") or "skipped")
+            counters[status if status in counters else "skipped"] += 1
+        for item in deferred:
+            processor_id = proposal_processor.get(str(item.get("proposal_id")), "unknown")
+            counters = processor_results.setdefault(
+                processor_id,
+                {"proposed": 0, "committed": 0, "already_committed": 0, "deferred": 0, "skipped": 0},
+            )
+            counters["deferred"] += 1
         event_payload = {
             "operation": "run_maintenance_distiller",
             "scope": scope,
             "domain": domain,
             "window": window.to_dict(),
+            "processor_windows": processor_windows,
             "processors": processor_records,
             "missing_processors": missing_processors,
             "proposal_count": len(proposals),
             "committed_count": committed_count,
             "already_committed_count": already_committed_count,
             "deferred_count": len(deferred),
+            "processor_results": processor_results,
             "auto_commit_low_risk": auto_commit_low_risk,
             "reviewer": reviewer_status,
             "deferred_fingerprint": blocked_fingerprint if deferred else None,
@@ -390,6 +449,7 @@ class StewardshipService:
             "scope": scope,
             "domain": domain,
             "window": window.to_dict(),
+            "processor_windows": processor_windows,
             "processors": event_payload["processors"],
             "missing_processors": missing_processors,
             "proposals": proposals,
@@ -825,6 +885,23 @@ class StewardshipService:
         }
 
 
+    def _maintenance_processor_window_request(
+        self,
+        processor: MaintenanceProcessor,
+        *,
+        scope: Mapping[str, Any],
+        domain: str,
+    ) -> MaintenanceWindowRequest:
+        request_factory = getattr(processor, "window_request", None)
+        if not callable(request_factory):
+            return MaintenanceWindowRequest()
+        try:
+            raw_request = request_factory(scope=dict(scope), domain=str(domain))
+        except TypeError:
+            raw_request = request_factory()
+        return coerce_window_request(raw_request)
+
+
     def _maintenance_evidence_window(
         self,
         *,
@@ -833,37 +910,138 @@ class StewardshipService:
         max_atoms: int,
         max_events: int,
         max_retrieval_outcomes: int,
+        request: MaintenanceWindowRequest | None = None,
     ) -> EvidenceWindow:
         # Maintenance scopes are hierarchical: a broad tenant/component pass
         # must see atoms in narrower run, asset, and agent scopes. Filter before
         # applying the window bound so unrelated hot atoms cannot crowd the
         # requested scope out of the evidence window.
+        # Direct service callers retain the complete lifecycle view. Scheduled
+        # processor execution always supplies an explicit bounded request.
+        request = request or MaintenanceWindowRequest(lifecycle_states=())
+        lifecycle_states = set(request.lifecycle_states)
         visible_atoms = [
             atom
             for atom in self.store.list_atoms_filtered(prioritize_hot=True)
             if not atom.get("deleted")
             and maintenance_scope_visible(atom["scope"], scope)
+            and (
+                not lifecycle_states
+                or str(atom.get("lifecycle_state") or "") in lifecycle_states
+            )
         ]
-        atoms = visible_atoms[: max(1, int(max_atoms or 1))]
+        atom_types = set(request.atom_types)
+        graph_profiles = set(request.graph_metadata_profiles)
+        candidates = [
+            atom
+            for atom in visible_atoms
+            if (not atom_types or str(atom.get("type") or "") in atom_types)
+            and (
+                not graph_profiles
+                or self._maintenance_atom_profile(atom) in graph_profiles
+            )
+        ]
+        caller_limit = max(1, int(max_atoms or 1))
+        effective_limit = (
+            min(caller_limit, request.max_atoms)
+            if request.max_atoms is not None
+            else caller_limit
+        )
+        atoms = candidates[:effective_limit]
+        if request.include_graph_neighbors and len(atoms) < effective_limit:
+            selected_refs = {str(atom["id"]) for atom in atoms}
+            all_edges = self.store.list_edges()
+            neighbor_refs = {
+                str(endpoint)
+                for edge in all_edges
+                for endpoint in (edge.get("source_ref"), edge.get("target_ref"))
+                if (
+                    edge.get("source_ref") in selected_refs
+                    or edge.get("target_ref") in selected_refs
+                )
+            }
+            for atom in visible_atoms:
+                atom_ref = str(atom.get("id") or "")
+                if atom_ref in neighbor_refs and atom_ref not in selected_refs:
+                    atoms.append(atom)
+                    selected_refs.add(atom_ref)
+                    if len(atoms) >= effective_limit:
+                        break
         atom_refs = {atom["id"] for atom in atoms}
         edges = [
             edge
             for edge in self.store.list_edges()
             if edge["source_ref"] in atom_refs or edge["target_ref"] in atom_refs
         ]
-        evidence = [
+        visible_evidence = [
             record
             for record in self.store.list_evidence()
-            if scope_visible(record.get("scope", {}), scope)
+            if maintenance_scope_visible(record.get("scope", {}), scope)
         ]
+        referenced_evidence = {
+            str(ref)
+            for item in [*atoms, *edges]
+            for ref in item.get("evidence_refs", [])
+            if str(ref)
+        }
+        evidence_limit = (
+            request.max_evidence
+            if request.max_evidence is not None
+            else max(64, effective_limit * 4)
+        )
+        evidence = []
+        if request.include_evidence and evidence_limit > 0:
+            evidence = sorted(
+                visible_evidence,
+                key=lambda record: (
+                    str(record.get("evidence_id") or "") not in referenced_evidence,
+                    str(record.get("captured_at") or ""),
+                ),
+                reverse=False,
+            )[:evidence_limit]
         event_limit = max(0, int(max_events or 0))
-        events = self.store.list_events(limit=event_limit) if event_limit else []
+        events = (
+            self.store.list_events(limit=event_limit)
+            if request.include_events and event_limit
+            else []
+        )
         list_outcomes = getattr(self.store, "list_retrieval_outcomes", None)
         retrieval_outcomes = (
             list_outcomes(limit=max(0, int(max_retrieval_outcomes or 0)))
-            if list_outcomes
+            if request.include_retrieval_outcomes and list_outcomes
             else []
         )
+        selected_evidence_refs = {
+            str(record.get("evidence_id") or "") for record in evidence
+        }
+        lifecycle_counts: dict[str, int] = {}
+        type_counts: dict[str, int] = {}
+        for atom in candidates:
+            lifecycle = str(atom.get("lifecycle_state") or "unknown")
+            atom_type = str(atom.get("type") or "unknown")
+            lifecycle_counts[lifecycle] = lifecycle_counts.get(lifecycle, 0) + 1
+            type_counts[atom_type] = type_counts.get(atom_type, 0) + 1
+        internal_edges = sum(
+            1
+            for edge in edges
+            if edge.get("source_ref") in atom_refs and edge.get("target_ref") in atom_refs
+        )
+        coverage = {
+            "visible_atom_count": len(visible_atoms),
+            "candidate_atom_count": len(candidates),
+            "selected_atom_count": len(atoms),
+            "truncated_atom_count": max(0, len(candidates) - len(atoms)),
+            "candidate_by_lifecycle": dict(sorted(lifecycle_counts.items())),
+            "candidate_by_type": dict(sorted(type_counts.items())),
+            "internal_edge_count": internal_edges,
+            "boundary_edge_count": max(0, len(edges) - internal_edges),
+            "visible_evidence_count": len(visible_evidence),
+            "referenced_evidence_count": len(referenced_evidence),
+            "selected_evidence_count": len(evidence),
+            "missing_referenced_evidence": sorted(
+                referenced_evidence - selected_evidence_refs
+            )[:64],
+        }
         return EvidenceWindow(
             atoms=tuple(atoms),
             edges=tuple(edges),
@@ -873,6 +1051,20 @@ class StewardshipService:
             scope=scope,
             domain=str(domain or "generic"),
             graph_version=self.store.graph_version(),
+            coverage=coverage,
+        )
+
+
+    def _maintenance_atom_profile(self, atom: Mapping[str, Any]) -> str:
+        payload = atom.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        hints = payload.get("maintenance_hints")
+        hints = hints if isinstance(hints, Mapping) else {}
+        return str(
+            hints.get("profile")
+            or payload.get("memory_review_profile")
+            or payload.get("graph_metadata_profile")
+            or ""
         )
 
 
@@ -973,6 +1165,13 @@ class StewardshipService:
             target_ref,
             relation,
             dict(edge_payload.get("scope") or {}),
+            derivation={
+                **dict(edge_payload.get("derivation") or {}),
+                "processor_id": proposal.get("processor_id"),
+                "processor_version": proposal.get("processor_version"),
+                "reason_code": proposal.get("reason_code"),
+                "maintenance_proposal_id": proposal.get("proposal_id"),
+            },
         )
         edge["evidence_refs"] = [
             str(ref) for ref in edge_payload.get("evidence_refs", [])
