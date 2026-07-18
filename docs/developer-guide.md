@@ -259,10 +259,19 @@ workset. This request can never widen the caller-authorized scope or resource
 ceiling.
 
 Use producer-owned `payload.maintenance_hints` for stable profile, cohort,
-priority, and source-ref metadata. AMOS never treats those hints as canonical
-claims or mutation authority. Prefer the shared cohort, source-coverage,
-evidence-diversity, and derived-proposal helpers over client-specific scans of
-the whole store.
+priority, source-ref, and distillation-lane metadata. Set
+`distillation_lane: domain_processor` when a registered processor owns the
+semantic interpretation of that record, and provide `consolidation_key` (or a
+stable cluster/cohort key) for records that may be distilled together. The
+generic automatic policy excludes domain-processor records, excludes sources
+already covered by any active derived semantic memory, and selects one coherent
+scope/type/profile/cohort group per packet. It never combines globally adjacent
+high-priority atoms from different groups. AMOS never treats these hints as
+canonical claims or mutation authority. Prefer the shared cohort,
+source-coverage, evidence-diversity, and derived-proposal helpers over
+client-specific scans of the whole store. A derived proposal may name active
+semantic atoms it supersedes; AMOS projects the governed supersession relation
+and the ordinary decay policy retires obsolete active versions.
 
 Every edge has a `derivation` object. New structural, facet-derived, and
 processor-reviewed relations name their construction path; migrated legacy

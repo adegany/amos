@@ -784,7 +784,11 @@ health reporting:
 Automatic distillation is non-LLM. It creates a canonical semantic memory with
 source refs, policy metadata, `layer = consolidated_long_term`, and
 `retention_class = distilled`. Source archival is disabled by default unless an
-explicit approval policy enables it.
+explicit approval policy enables it. Candidate selection excludes source atoms
+already covered by active derived semantic memory and records assigned to the
+`domain_processor` distillation lane. Remaining candidates are partitioned by
+an explicit producer cohort when present, otherwise by the conservative
+scope/type/profile/kind fallback; one packet never spans those coherence groups.
 
 The memory policy is observable and tunable through the V1 HTTP API and CLI.
 Manual `run` operations are operator overrides or worker ticks; they are not

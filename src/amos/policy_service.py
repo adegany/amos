@@ -17,6 +17,7 @@ from ._service_support import (
     threading,
     utc_now,
 )
+from .maintenance import covered_source_refs, maintenance_hints_from_atom
 
 
 class PolicyService:
@@ -2047,7 +2048,36 @@ class PolicyService:
                 "min_source_atoms": min_sources,
             }
         max_sources = int(distillation["max_source_atoms"])
-        selected = candidates[:max_sources]
+        cohorts: dict[str, list[dict[str, Any]]] = {}
+        for atom in candidates:
+            cohorts.setdefault(
+                self._policy_distillation_coherence_key(atom), []
+            ).append(atom)
+        eligible_cohorts = {
+            key: atoms for key, atoms in cohorts.items() if len(atoms) >= min_sources
+        }
+        if not eligible_cohorts:
+            return {
+                "status": "skipped",
+                "reason": "no_coherent_candidate_group",
+                "candidate_count": len(candidates),
+                "min_source_atoms": min_sources,
+                "cohort_counts": {
+                    key: len(atoms) for key, atoms in sorted(cohorts.items())
+                },
+            }
+        candidate_rank = {
+            str(atom["id"]): index for index, atom in enumerate(candidates)
+        }
+        coherence_key, coherent_candidates = min(
+            eligible_cohorts.items(),
+            key=lambda item: (
+                min(candidate_rank[str(atom["id"])] for atom in item[1]),
+                -len(item[1]),
+                item[0],
+            ),
+        )
+        selected = coherent_candidates[:max_sources]
         target_refs = [atom["id"] for atom in selected]
         source_digests = [digest(self._atom_projection(atom)) for atom in selected]
         summary = self._policy_distillation_summary(selected)
@@ -2086,6 +2116,8 @@ class PolicyService:
             else distilled.get("status", "completed"),
             "selected_source_count": len(selected),
             "source_refs": target_refs,
+            "coherence_key": coherence_key,
+            "coherent_candidate_count": len(coherent_candidates),
             "distilled": distilled if distilled.get("status") == "distilled" else None,
             "result": distilled,
         }
@@ -2099,21 +2131,11 @@ class PolicyService:
     ) -> list[dict[str, Any]]:
         distillation = dict(policy["distillation"])
         candidate_types = set(distillation["candidate_types"])
-        covered_sources: set[str] = set()
-        for atom in self.store.list_atoms_filtered(
+        active_semantics = self.store.list_atoms_filtered(
             types=["semantic"],
             lifecycle_states=["active"],
-        ):
-            if atom.get("deleted") or atom["type"] != "semantic":
-                continue
-            if atom.get("lifecycle_state") != "active":
-                continue
-            payload = atom.get("payload", {})
-            if payload.get("created_by") != "svc:memory_policy":
-                continue
-            if payload.get("distillation_type") != distillation["distillation_type"]:
-                continue
-            covered_sources.update(str(ref) for ref in payload.get("source_refs", []))
+        )
+        covered_sources = covered_source_refs(active_semantics)
         candidates = []
         for atom in self.store.list_atoms_filtered(
             types=sorted(candidate_types) if candidate_types else None,
@@ -2121,6 +2143,9 @@ class PolicyService:
             included_health=["healthy", "low_utility"],
         ):
             if atom.get("deleted"):
+                continue
+            hints = maintenance_hints_from_atom(atom)
+            if str(hints.get("distillation_lane") or "").strip() == "domain_processor":
                 continue
             if atom["id"] in covered_sources:
                 continue
@@ -2141,6 +2166,43 @@ class PolicyService:
             )
         )
         return candidates
+
+
+    def _policy_distillation_coherence_key(
+        self, atom: Mapping[str, Any]
+    ) -> str:
+        """Return a domain-neutral key that prevents mixed-source packets.
+
+        Explicit producer cohorts take precedence. The conservative fallback
+        keeps scope, atom type, producer profile, and producer-supplied kind
+        together, so unrelated types or processor domains are never combined
+        merely because they rank next to each other.
+        """
+
+        payload = atom.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        hints = maintenance_hints_from_atom(atom)
+        profile = str(
+            hints.get("profile")
+            or payload.get("memory_profile")
+            or payload.get("graph_metadata_profile")
+            or ""
+        ).strip()
+        explicit = str(
+            hints.get("consolidation_key")
+            or hints.get("cluster_key")
+            or hints.get("cohort_key")
+            or ""
+        ).strip()
+        key_material = {
+            "mode": "explicit" if explicit else "fallback",
+            "scope": dict(atom.get("scope") or {}),
+            "atom_type": str(atom.get("type") or ""),
+            "profile": profile,
+            "kind": str(hints.get("kind") or "").strip(),
+            "cohort": explicit,
+        }
+        return stable_id("distill_cohort", key_material)
 
 
     def _policy_distillation_priority(self, atom: Mapping[str, Any]) -> int:

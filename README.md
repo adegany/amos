@@ -142,7 +142,8 @@ in-process SQLite store and serializes access through the service boundary:
   edges without a domain processor. Domain-specific processors remain optional
   adapters for payloads that cannot emit the canonical contract directly.
 - Processor-specific bounded worksets, hierarchical evidence coverage,
-  explicit producer hints/cohorts, edge derivation provenance, and graph,
+  explicit producer hints/cohorts, domain-owned distillation lanes,
+  coherence-bounded automatic packets, edge derivation provenance, and graph,
   proposal-backlog, and per-processor effectiveness diagnostics.
 - Advisory maintenance for deduplication and contradiction marking, with
   high-risk mutation requests gated behind explicit approval.

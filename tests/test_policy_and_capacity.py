@@ -213,6 +213,119 @@ def test_automatic_memory_policy_distills_and_maintains_on_retrieval(amos):
     assert "Replacement renderer output" in replacement["payload"]["summary"]
 
 
+def test_automatic_memory_policy_selects_one_coherent_source_group(amos):
+    scope = {"tenant": "coherent-policy"}
+    amos.configure_memory_policy(
+        schedule={"every_graph_versions": 100, "every_seconds": 0},
+        distillation={"min_source_atoms": 2, "max_source_atoms": 3},
+        maintenance_distiller={"enabled": False},
+    )
+    for index in range(2):
+        amos.commit_atom(
+            {
+                "id": f"coherent_project_{index}",
+                "type": "agentic_trace",
+                "payload": {
+                    "task": "coherent project",
+                    "action": "evaluate project step",
+                    "outcome": "supported",
+                    "lesson": f"project finding {index}",
+                    "maintenance_hints": {
+                        "profile": "example.project.v1",
+                        "kind": "project_outcome",
+                        "consolidation_key": "project-one",
+                        "priority": 6,
+                    },
+                },
+                "scope": scope,
+            }
+        )
+    amos.commit_atom(
+        {
+            "id": "unrelated_relationship_belief",
+            "type": "belief",
+            "payload": {
+                "claim": "An unrelated relationship observation.",
+                "maintenance_hints": {
+                    "profile": "example.relationship.v1",
+                    "consolidation_key": "relationship-one",
+                },
+            },
+            "scope": scope,
+        }
+    )
+
+    result = amos.run_memory_policy(
+        force=True,
+        trigger="coherent_source_test",
+        scope=scope,
+    )["results"]["distillation"]
+
+    assert result["status"] == "completed"
+    assert result["source_refs"] == ["coherent_project_0", "coherent_project_1"]
+    assert "unrelated_relationship_belief" not in result["source_refs"]
+    assert result["coherent_candidate_count"] == 2
+
+
+def test_automatic_memory_policy_respects_domain_lane_and_derived_coverage(amos):
+    scope = {"tenant": "domain-lane-policy"}
+    amos.configure_memory_policy(
+        schedule={"every_graph_versions": 100, "every_seconds": 0},
+        distillation={"min_source_atoms": 2, "max_source_atoms": 4},
+        maintenance_distiller={"enabled": False},
+    )
+    for index in range(2):
+        amos.commit_atom(
+            {
+                "id": f"domain_owned_{index}",
+                "type": "agentic_trace",
+                "payload": {
+                    "task": "domain-owned project",
+                    "action": "domain-owned project step",
+                    "outcome": "active",
+                    "maintenance_hints": {
+                        "profile": "example.domain.v1",
+                        "consolidation_key": "domain-project",
+                        "distillation_lane": "domain_processor",
+                    },
+                },
+                "scope": scope,
+            }
+        )
+    for index in range(2):
+        amos.commit_atom(
+            {
+                "id": f"covered_source_{index}",
+                "type": "belief",
+                "payload": {"claim": f"covered source {index}"},
+                "scope": scope,
+            }
+        )
+    amos.commit_atom(
+        {
+            "id": "existing_domain_consolidation",
+            "type": "semantic",
+            "payload": {
+                "summary": "The covered sources already have an active derived memory.",
+                "created_by_processor": "example.domain.processor.v1",
+                "distillation_type": "example_consolidation",
+                "source_refs": ["covered_source_0", "covered_source_1"],
+            },
+            "scope": scope,
+        }
+    )
+
+    result = amos.run_memory_policy(
+        force=True,
+        trigger="domain_lane_test",
+        scope=scope,
+    )["results"]["distillation"]
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "insufficient_candidates"
+    assert result["candidate_count"] == 0
+
+
 def test_memory_policy_skips_when_another_tick_holds_execution_lock(amos):
     assert amos.policy._memory_policy_lock.acquire(blocking=False)
     try:

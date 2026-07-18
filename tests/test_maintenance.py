@@ -32,6 +32,7 @@ from amos import (
     SelfModelCalibrator,
     SQLiteStore,
     ValidationError,
+    derived_memory_proposal,
     ontology_snapshot,
     semantic_relation_proposals_from_facets,
 )
@@ -41,6 +42,43 @@ from amos.smp import cosine
 from amos.schemas import canonical_json, digest
 
 from .helpers import ExampleTrainingFlightProcessor, item_refs
+
+
+def test_derived_memory_proposal_carries_governed_supersession():
+    proposal = derived_memory_proposal(
+        processor_id="example.consolidator.v1",
+        processor_version="example.consolidator.v1",
+        reason_code="cross_step_consolidation",
+        source_refs=["step_1", "step_2"],
+        evidence_refs=["evidence_2"],
+        atom_type="semantic",
+        atom_payload={"summary": "Only the material delta remains."},
+        scope={"tenant": "example"},
+        confidence=0.8,
+        title="Consolidate project learning",
+        supersedes=["intermediate_learning_1", "intermediate_learning_2"],
+    ).to_dict()
+
+    assert proposal["payload"]["atom"]["supersedes"] == [
+        "intermediate_learning_1",
+        "intermediate_learning_2",
+    ]
+    without_supersession = derived_memory_proposal(
+        processor_id="example.consolidator.v1",
+        processor_version="example.consolidator.v1",
+        reason_code="cross_step_consolidation",
+        source_refs=["step_1", "step_2"],
+        evidence_refs=["evidence_2"],
+        atom_type="semantic",
+        atom_payload={"summary": "Only the material delta remains."},
+        scope={"tenant": "example"},
+        confidence=0.8,
+        title="Consolidate project learning",
+    ).to_dict()
+    assert (
+        proposal["payload"]["atom"]["id"]
+        != without_supersession["payload"]["atom"]["id"]
+    )
 
 
 def test_edge_derivation_migrates_legacy_rows(tmp_path):

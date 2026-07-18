@@ -416,11 +416,13 @@ def derived_memory_proposal(
     confidence: float,
     title: str,
     risk_level: str = "low",
+    supersedes: Sequence[str] = (),
 ) -> MaintenanceProposal:
     """Build an idempotent processor-derived atom proposal."""
 
     sources = tuple(dict.fromkeys(str(ref) for ref in source_refs if str(ref)))
     evidence = tuple(dict.fromkeys(str(ref) for ref in evidence_refs if str(ref)))
+    superseded = tuple(dict.fromkeys(str(ref) for ref in supersedes if str(ref)))
     score = round(max(0.0, min(1.0, float(confidence))), 4)
     atom_id = stable_id(
         "atom",
@@ -428,6 +430,7 @@ def derived_memory_proposal(
             "processor_id": processor_id,
             "reason_code": reason_code,
             "source_refs": sources,
+            "supersedes": superseded,
             "payload": dict(atom_payload),
             "scope": dict(scope),
         },
@@ -454,6 +457,7 @@ def derived_memory_proposal(
                 "scope": dict(scope),
                 "confidence": {"level": _confidence_level(score), "score": score},
                 "lifecycle_state": "active",
+                "supersedes": list(superseded),
             }
         },
         title=title,
