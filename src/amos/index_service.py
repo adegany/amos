@@ -16,6 +16,33 @@ from ._service_support import (
 )
 
 
+_RETRIEVAL_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "by", "for",
+    "from", "has", "have", "in", "into", "is", "it", "of", "on", "or",
+    "that", "the", "their", "this", "to", "was", "were", "will", "with",
+    "true", "false", "none", "null", "active", "proposed", "pending",
+}
+_REFERENCE_TOKEN = re.compile(
+    r"^(?:atom|evt|evd|thread|cycle|repisode|curriculum|endogenous_work|"
+    r"kproject|cogito_project)_[a-z0-9_-]{8,}$"
+)
+
+
+def _content_token(token: str) -> bool:
+    """Keep lexical retrieval focused on semantic content, not wire metadata."""
+
+    token = str(token or "").strip().lower()
+    if len(token) <= 1 or token in _RETRIEVAL_STOPWORDS:
+        return False
+    if _REFERENCE_TOKEN.fullmatch(token):
+        return False
+    if len(token) >= 12 and all(character in "0123456789abcdef" for character in token):
+        return False
+    if re.fullmatch(r"v\d+", token):
+        return False
+    return True
+
+
 class IndexService:
     def __init__(self, store: Any, smp: Any):
         self.store = store
@@ -41,13 +68,7 @@ class IndexService:
         )
 
     def _search_text_for_atom(self, atom: Mapping[str, Any]) -> str:
-        return (
-            str(atom.get("id") or "")
-            + " "
-            + str(atom.get("type") or "")
-            + " "
-            + self._search_text_for_value(atom.get("payload", {}))
-        ).lower()
+        return self._search_text_for_value(atom.get("payload", {})).lower()
 
 
     def _search_text_for_value(self, value: Any) -> str:
@@ -75,7 +96,7 @@ class IndexService:
         tokens = set(raw_tokens)
         for token in raw_tokens:
             tokens.update(part for part in token.split("_") if part)
-        tokens = sorted(tokens)
+        tokens = sorted(token for token in tokens if _content_token(token))
         return {
             "text": text,
             "tokens": tokens,
@@ -367,23 +388,37 @@ class IndexService:
         *,
         cue_tokens: set[str],
         attention_policy: Mapping[str, Any],
+        eligible_atom_ids: set[str] | None = None,
+        limit: int = 512,
     ) -> list[str] | None:
         tokens = set(cue_tokens)
         tokens.update(str(token) for token in attention_policy.get("focus_terms", []) or [])
-        tokens.update(str(token) for token in attention_policy.get("suppress_terms", []) or [])
         normalized = sorted(
             token
             for token in {token.strip().lower() for token in tokens if token.strip()}
-            if len(token) > 1
+            if _content_token(token)
         )
         if not normalized or self.store.atom_text_index_count() == 0:
             return None
-        direct = self.store.candidate_atom_ids_for_tokens(normalized, limit=512)
+        direct = self.store.candidate_atom_ids_for_tokens(
+            normalized,
+            limit=limit,
+            eligible_atom_ids=eligible_atom_ids,
+        )
         if not direct:
-            return None
+            return []
         candidates = set(direct)
-        candidates.update(self.store.neighbor_atom_ids(direct))
-        return sorted(candidates)
+        neighbors = self.store.neighbor_atom_ids(direct)
+        if eligible_atom_ids is not None:
+            neighbors = [ref for ref in neighbors if ref in eligible_atom_ids]
+        candidates.update(neighbors)
+        # A bounded second hop lets a directly relevant memory activate a
+        # short associative chain without turning retrieval into a graph scan.
+        second_hop = self.store.neighbor_atom_ids(neighbors)
+        if eligible_atom_ids is not None:
+            second_hop = [ref for ref in second_hop if ref in eligible_atom_ids]
+        candidates.update(second_hop)
+        return sorted(candidates)[: max(limit * 2, limit)]
 
 
     def _invalidate_packet_cache(

@@ -193,8 +193,12 @@ POST /v1/retrieval-outcomes
 }
 ```
 
-Outcome feedback updates atom access, utility, salience, and health signals. It
-also gives the maintenance worker better evidence for cleanup and ranking.
+Outcome feedback updates atom access, utility, salience, and health signals only
+for atom refs present in the exact packet identified by `packet_id`. Evidence
+refs are reported separately and arbitrary caller-supplied refs cannot train
+atom utility. When a selected item was reached through associative activation,
+the packet's bounded `association_trace` also attributes use or correction to
+those edges for later degree-normalized ranking.
 
 Distinguish memory exposure from memory use. If an atom was retrieved into a
 prompt but did not materially shape the decision, record that as neutral

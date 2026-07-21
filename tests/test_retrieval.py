@@ -113,6 +113,32 @@ def test_retrieve_packet_attention_context_shapes_ranking_and_trace(amos):
     assert packet["request"]["attention_context"]["boost_memory_types"] == ["policy"]
 
 
+def test_suppress_terms_inhibit_but_do_not_expand_candidate_generation(amos):
+    amos.commit_atom(
+        {
+            "id": "candidate_focus_atom",
+            "type": "semantic",
+            "payload": {"summary": "rare mission focus target"},
+        }
+    )
+    amos.commit_atom(
+        {
+            "id": "candidate_suppressed_only_atom",
+            "type": "semantic",
+            "payload": {"summary": "obsolete archive quarantine material"},
+        }
+    )
+
+    packet = amos.retrieve_packet(
+        cues=["rare mission"],
+        attention_context={"suppress_terms": ["archive quarantine"]},
+        run_policy=False,
+    )
+
+    assert item_refs(packet) == {"candidate_focus_atom"}
+    assert packet["degradation"]["candidate_generation"]["lexical_count"] == 1
+
+
 def test_attention_matching_ignores_payload_keys(amos):
     amos.commit_atom(
         {
@@ -639,6 +665,86 @@ def test_retrieval_outcome_telemetry_is_reportable(amos):
     assert updated["last_accessed"]
     assert updated["decay_policy"]["retrieval_telemetry"]["used_count"] == 1
     assert amos.health_memory()["retrieval_outcomes"] == 1
+
+
+def test_retrieval_feedback_only_updates_members_of_the_exact_packet(amos):
+    selected = amos.commit_atom(
+        {
+            "id": "packet_member",
+            "type": "belief",
+            "payload": {"claim": "exact packet feedback target"},
+        }
+    )["atom"]
+    outside = amos.commit_atom(
+        {
+            "id": "outside_packet",
+            "type": "belief",
+            "payload": {"claim": "unrelated exterior record"},
+        }
+    )["atom"]
+    packet = amos.retrieve_packet(cues=["exact packet feedback"], run_policy=False)
+
+    result = amos.record_retrieval_outcome(
+        packet_id=packet["packet_id"],
+        request=packet["request"],
+        outcome={
+            "used_item_refs": [selected["id"], outside["id"], "evd_not_an_atom"],
+            "evidence_refs": ["evd_reported_separately"],
+            "label": "useful",
+        },
+    )
+
+    assert result["feedback"]["updated_atom_refs"] == [selected["id"]]
+    assert result["feedback"]["ignored_non_packet_refs"] == [
+        "evd_not_an_atom",
+        outside["id"],
+    ]
+    assert result["feedback"]["reported_evidence_refs"] == [
+        "evd_reported_separately"
+    ]
+    assert amos.store.get_atom(outside["id"])["utility"] == outside["utility"]
+
+
+def test_two_hop_association_trace_is_bounded_and_trains_used_edges(amos):
+    atoms = [
+        amos.commit_atom(
+            {
+                "id": atom_ref,
+                "type": "semantic",
+                "payload": {"summary": summary},
+            }
+        )["atom"]
+        for atom_ref, summary in (
+            ("association_seed", "zzseedalpha direct retrieval anchor"),
+            ("association_mid", "intermediate graph bridge"),
+            ("association_leaf", "distant associated conclusion"),
+        )
+    ]
+    with amos.store.transaction() as conn:
+        first = amos.graph._edge(
+            atoms[0]["id"], atoms[1]["id"], "rel:derived_from", {}
+        )
+        second = amos.graph._edge(
+            atoms[1]["id"], atoms[2]["id"], "rel:derived_from", {}
+        )
+        amos.store.insert_edge(conn, first)
+        amos.store.insert_edge(conn, second)
+
+    packet = amos.retrieve_packet(
+        cues=["zzseedalpha"], max_items=5, run_policy=False
+    )
+    leaf = next(item for item in packet["items"] if item["atom_ref"] == "association_leaf")
+    assert leaf["score_components"]["edge_activation"] > 0
+    assert [step["depth"] for step in leaf["association_trace"]] == [1, 2]
+
+    outcome = amos.record_retrieval_outcome(
+        packet_id=packet["packet_id"],
+        request=packet["request"],
+        outcome={"used_item_refs": ["association_leaf"], "label": "useful"},
+    )
+    assert outcome["feedback"]["updated_edge_refs"] == sorted(
+        [first["edge_id"], second["edge_id"]]
+    )
 
 
 def test_retrieval_ranking_scoped_preference_beats_generic(amos):

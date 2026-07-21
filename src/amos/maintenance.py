@@ -170,6 +170,7 @@ class SemanticFacet:
     controls: Mapping[str, Any] = field(default_factory=dict)
     metrics: Mapping[str, Any] = field(default_factory=dict)
     time_index: int | float | str | None = None
+    semantic_context_key: str = ""
     scope: Mapping[str, Any] = field(default_factory=dict)
     attributes: Mapping[str, Any] = field(default_factory=dict)
     facet_id: str | None = None
@@ -187,6 +188,9 @@ class SemanticFacet:
             "controls": dict(self.controls),
             "metrics": dict(self.metrics),
             "time_index": self.time_index,
+            "semantic_context_key": _normalize_facet_text(
+                self.semantic_context_key
+            ),
             "scope": dict(self.scope),
             "attributes": dict(self.attributes),
             "schema_version": self.schema_version,
@@ -202,6 +206,7 @@ class SemanticFacet:
                 "controls": body["controls"],
                 "metrics": body["metrics"],
                 "time_index": body["time_index"],
+                "semantic_context_key": body["semantic_context_key"],
             },
         )
         return body
@@ -572,6 +577,12 @@ def coerce_semantic_facet(value: SemanticFacet | Mapping[str, Any]) -> dict[str,
             controls=dict(value.get("controls") or {}),
             metrics=dict(value.get("metrics") or {}),
             time_index=value.get("time_index"),
+            semantic_context_key=str(
+                value.get("semantic_context_key")
+                or value.get("domain_key")
+                or value.get("context_key")
+                or ""
+            ),
             scope=dict(value.get("scope") or {}),
             attributes=dict(value.get("attributes") or {}),
             facet_id=value.get("facet_id"),
@@ -641,6 +652,16 @@ def semantic_facets_from_atoms(
                     controls=dict(raw.get("controls") or {}),
                     metrics=dict(raw.get("metrics") or {}),
                     time_index=raw.get("time_index"),
+                    semantic_context_key=str(
+                        raw.get("semantic_context_key")
+                        or raw.get("domain_key")
+                        or raw.get("context_key")
+                        or (raw.get("attributes") or {}).get(
+                            "semantic_context_key"
+                        )
+                        or (raw.get("attributes") or {}).get("domain_key")
+                        or ""
+                    ),
                     scope=dict(raw.get("scope") or atom.get("scope") or {}),
                     attributes=dict(raw.get("attributes") or {}),
                     facet_id=(str(raw["facet_id"]) if raw.get("facet_id") else None),
@@ -722,8 +743,6 @@ def canonical_relation_proposals_from_atoms(
                 [
                     *[str(ref) for ref in owner.get("evidence_refs", []) if str(ref)],
                     *[str(ref) for ref in evidence_refs if str(ref)],
-                    source,
-                    target,
                 ]
             )
         )
@@ -900,8 +919,6 @@ def semantic_relation_proposals_from_facets(
                     [
                         *[str(ref) for ref in left.get("evidence_refs", [])],
                         *[str(ref) for ref in right.get("evidence_refs", [])],
-                        left["atom_ref"],
-                        right["atom_ref"],
                     ]
                 )
             )
@@ -954,6 +971,20 @@ def _semantic_relation_for_pair(
     left: Mapping[str, Any], right: Mapping[str, Any]
 ) -> tuple[str, str, str, str, str, float] | None:
     if left.get("subject") != right.get("subject"):
+        return None
+    left_context = str(left.get("semantic_context_key") or "")
+    right_context = str(right.get("semantic_context_key") or "")
+    if (left_context or right_context) and left_context != right_context:
+        return None
+    left_role = str((left.get("attributes") or {}).get("semantic_role") or "")
+    right_role = str((right.get("attributes") or {}).get("semantic_role") or "")
+    if (
+        left_role in {"activity", "project_activity"}
+        and right_role in {"activity", "project_activity"}
+    ):
+        # Sequential activity is temporal lineage, not evidence that one result
+        # supports another. Producers should express exact causal/part-of links
+        # explicitly; the generic associator must not invent support here.
         return None
     confidence = round(
         min(float(left.get("confidence", 0.5)), float(right.get("confidence", 0.5))), 4

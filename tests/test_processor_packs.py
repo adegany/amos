@@ -373,6 +373,58 @@ def test_generic_semantic_facets_propose_similarity_for_neutral_matches():
     assert proposal["payload"]["edge"]["relation"] == "rel:similar_to"
 
 
+def test_generic_semantic_facets_do_not_mix_context_domains():
+    proposals = semantic_relation_proposals_from_facets(
+        [
+            SemanticFacet(
+                atom_ref="pen_activity",
+                subject="shared study",
+                intent="practice bounded skill",
+                outcome="observed",
+                semantic_context_key="project:pen-art",
+                scope={"tenant": "cogito"},
+            ),
+            SemanticFacet(
+                atom_ref="trading_activity",
+                subject="shared study",
+                intent="practice bounded skill",
+                outcome="observed",
+                semantic_context_key="project:trading",
+                scope={"tenant": "cogito"},
+            ),
+        ]
+    )
+
+    assert proposals == []
+
+
+def test_generic_semantic_facets_do_not_infer_support_between_activities():
+    proposals = semantic_relation_proposals_from_facets(
+        [
+            SemanticFacet(
+                atom_ref="activity_one",
+                subject="pen art",
+                intent="practice hatching",
+                outcome="improved",
+                outcome_direction="positive",
+                semantic_context_key="project:pen-art",
+                attributes={"semantic_role": "project_activity"},
+            ),
+            SemanticFacet(
+                atom_ref="activity_two",
+                subject="pen art",
+                intent="practice hatching",
+                outcome="improved",
+                outcome_direction="positive",
+                semantic_context_key="project:pen-art",
+                attributes={"semantic_role": "project_activity"},
+            ),
+        ]
+    )
+
+    assert proposals == []
+
+
 def test_generic_semantic_graph_degree_is_bounded():
     proposals = semantic_relation_proposals_from_facets(
         [

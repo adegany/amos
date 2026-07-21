@@ -675,7 +675,10 @@ append a memory_policy_run event
 Canonical graph metadata is producer-normalized, deterministic input rather
 than an AMOS inference from prose. `semantic_facets` declare subject, intent,
 outcome direction, confidence, provenance, and optional time/metric/control
-dimensions. `graph_relations` declare ontology relation ids and endpoints,
+dimensions. A facet may include `semantic_context_key` to prevent a generic
+associator from mixing otherwise similar records from unrelated projects or
+domains; activity-role facets do not imply support merely because they are
+sequential. `graph_relations` declare ontology relation ids and endpoints,
 using `$self` for the owning atom. AMOS validates both structures at ingestion,
 ignores them while the owning atom is proposed, and re-evaluates them on later
 maintenance passes after authorized promotion. Structural relations may be
@@ -766,7 +769,7 @@ maintenance evidence window:
   widening caller scope or limits
   applies hierarchical maintenance scope to atoms and evidence, so whole-store
   or tenant passes include evidence retained at narrower run/project scopes
-  may add bounded graph neighbors after typed candidates
+  may add graph neighbors through at most two bounded hops after typed candidates
   prioritizes directly referenced evidence before other visible evidence
   reports candidate, truncation, lifecycle/type, graph-boundary, and unresolved
   evidence coverage per processor

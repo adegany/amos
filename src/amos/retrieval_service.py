@@ -124,20 +124,69 @@ class RetrievalService:
             lifecycle_states.append("archived")
         cue_text = " ".join(request["cues"]).lower()
         cue_tokens = {token for token in re.findall(r"[a-z0-9_]+", cue_text) if token}
-        candidate_atom_ids = self._indexed_retrieval_candidates(
-            cue_tokens=cue_tokens,
-            attention_policy=attention_policy,
-        )
-        atoms = self.store.list_atoms_filtered(
+        all_atoms = self.store.list_atoms_filtered(
             types=sorted(allowed_types) if allowed_types else None,
             lifecycle_states=lifecycle_states,
-            atom_ids=candidate_atom_ids,
         )
+        eligible_atoms: list[dict[str, Any]] = []
+        for atom in all_atoms:
+            atom_ref = str(atom["id"])
+            if not scope_visible(atom["scope"], request["scope"]):
+                omissions.append({"atom_ref": atom_ref, "reason": "scope_hidden"})
+            elif not access_visible(
+                atom["access_policy"], requester, target_processor
+            ):
+                omissions.append({"atom_ref": atom_ref, "reason": "access_hidden"})
+            elif atom["health_status"] == "contradicted" and not include_conflicts:
+                omissions.append({"atom_ref": atom_ref, "reason": "contradicted"})
+            elif atom["health_status"] in LOW_HEALTH_STATES and not include_low_health:
+                omissions.append(
+                    {
+                        "atom_ref": atom_ref,
+                        "reason": f"health:{atom['health_status']}",
+                    }
+                )
+            else:
+                eligible_atoms.append(atom)
+        eligible_atom_ids = {str(atom["id"]) for atom in eligible_atoms}
+        semantic_query_text = " ".join(
+            [
+                cue_text,
+                *[
+                    str(term)
+                    for term in attention_policy.get("focus_terms", []) or []
+                    if str(term).strip()
+                ],
+            ]
+        ).strip()
+        cue_vector = self.smp.encode(semantic_query_text) if semantic_query_text else []
+        indexed_candidate_ids = self._indexed_retrieval_candidates(
+            cue_tokens=cue_tokens,
+            attention_policy=attention_policy,
+            eligible_atom_ids=eligible_atom_ids,
+        )
+        latent_candidate_ids = self._latent_retrieval_candidates(
+            eligible_atoms,
+            cue_vector=cue_vector,
+            limit=max(64, int(max_items) * 8),
+            minimum_similarity=(
+                0.55 if indexed_candidate_ids else SEMANTIC_MATCH_THRESHOLD
+            ),
+        )
+        if indexed_candidate_ids is None and not latent_candidate_ids:
+            atoms = eligible_atoms
+        else:
+            candidate_atom_ids = set(indexed_candidate_ids or [])
+            candidate_atom_ids.update(latent_candidate_ids)
+            atoms = self.store.list_atoms_filtered(
+                types=sorted(allowed_types) if allowed_types else None,
+                lifecycle_states=lifecycle_states,
+                atom_ids=sorted(candidate_atom_ids.intersection(eligible_atom_ids)),
+            )
         atom_refs = [str(atom["id"]) for atom in atoms]
-        edge_degrees = self._hot_graph_edge_degree_counts(atoms)
-        cue_vector = self.smp.encode(cue_text) if cue_text else []
         superseded_refs = self._active_superseded_refs(atom_refs)
-        edge_activation_scores = self._graph_activation_scores(
+        edge_degrees = self._hot_graph_edge_degree_counts(atoms)
+        edge_activation_scores, association_traces = self._graph_activation_scores(
             atoms,
             cues=request["cues"],
             request_scope=request["scope"],
@@ -194,7 +243,11 @@ class RetrievalService:
             if request["cues"] and not matched:
                 omissions.append({"atom_ref": atom_ref, "reason": "low_relevance"})
                 continue
-            atom = {**atom, "_score_components": components}
+            atom = {
+                **atom,
+                "_score_components": components,
+                "_association_trace": association_traces.get(atom_ref, []),
+            }
             candidates.append((score, atom))
 
         candidates.sort(key=lambda item: item[0], reverse=True)
@@ -264,7 +317,15 @@ class RetrievalService:
                     "graph_version": graph_version,
                 },
                 "reason_codes": sorted({omission["reason"] for omission in omissions}),
-                "vector_index_available": False,
+                "vector_index_available": bool(semantic_query_text),
+                "candidate_generation": {
+                    "eligible_count": len(eligible_atoms),
+                    "lexical_count": len(indexed_candidate_ids or []),
+                    "latent_count": len(latent_candidate_ids),
+                    "union_count": len(atoms),
+                    "lexical_profile": "content_only_idf_weighted",
+                    "latent_profile": "independent_smp_candidate_pool",
+                },
                 "byte_budget": byte_budget,
                 "used_bytes": used_bytes,
             },
@@ -293,6 +354,28 @@ class RetrievalService:
         return packet
 
 
+    def _latent_retrieval_candidates(
+        self,
+        atoms: Sequence[Mapping[str, Any]],
+        *,
+        cue_vector: Sequence[float],
+        limit: int,
+        minimum_similarity: float,
+    ) -> list[str]:
+        """Select an independent semantic pool before lexical capping."""
+
+        if not cue_vector:
+            return []
+        scored: list[tuple[float, str]] = []
+        for atom in atoms:
+            search_index = self._atom_search_index(atom, allow_stale=True)
+            similarity = cosine(cue_vector, search_index.get("vector") or [])
+            if similarity >= float(minimum_similarity):
+                scored.append((similarity, str(atom["id"])))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [atom_ref for _, atom_ref in scored[: max(1, int(limit))]]
+
+
     def record_retrieval_outcome(
         self,
         *,
@@ -313,7 +396,7 @@ class RetrievalService:
                 request=request,
                 outcome=outcome,
             )
-            if feedback["updated_atoms"]:
+            if feedback["updated_atoms"] or feedback["updated_edges"]:
                 event = self.store.append_event(
                     conn,
                     event_type="retrieval_outcome_recorded",
@@ -325,7 +408,10 @@ class RetrievalService:
                         "feedback": feedback,
                         "projected_atoms": feedback["projected_atoms"],
                     },
-                    target_refs=feedback["updated_atom_refs"],
+                    target_refs=[
+                        *feedback["updated_atom_refs"],
+                        *feedback["updated_edge_refs"],
+                    ],
                 )
                 self.store.clear_packet_cache(conn)
                 record["event"] = event
@@ -341,8 +427,23 @@ class RetrievalService:
         request: Mapping[str, Any],
         outcome: Mapping[str, Any],
     ) -> dict[str, Any]:
-        del packet_id, request
-        positive_refs, correction_refs = self._retrieval_outcome_atom_refs(outcome)
+        del request
+        reported_positive, reported_corrections = self._retrieval_outcome_atom_refs(
+            outcome
+        )
+        packet = self.store.get_cached_packet_by_id(packet_id)
+        packet_items = {
+            str(item.get("atom_ref") or item.get("atom_id") or item.get("item_ref")): item
+            for item in (packet or {}).get("items", [])
+            if isinstance(item, Mapping)
+            and (item.get("atom_ref") or item.get("atom_id") or item.get("item_ref"))
+        }
+        packet_refs = set(packet_items)
+        positive_refs = reported_positive.intersection(packet_refs)
+        correction_refs = reported_corrections.intersection(packet_refs)
+        ignored_refs = sorted(
+            reported_positive.union(reported_corrections) - packet_refs
+        )
         label = str(outcome.get("label") or outcome.get("status") or "").lower()
         negative_label = label in {
             "bad",
@@ -357,6 +458,7 @@ class RetrievalService:
         }
         now = utc_now()
         updated_atoms: list[dict[str, Any]] = []
+        updated_edges: list[dict[str, Any]] = []
         projected_atoms: list[dict[str, Any]] = []
         for atom_ref in sorted(positive_refs.union(correction_refs)):
             atom = self.store.get_atom(atom_ref)
@@ -413,12 +515,66 @@ class RetrievalService:
                     "correction_count": correction_count,
                 }
             )
+        edge_feedback: dict[str, dict[str, bool]] = {}
+        for atom_ref in sorted(positive_refs.union(correction_refs)):
+            for step in packet_items.get(atom_ref, {}).get("association_trace", []) or []:
+                if not isinstance(step, Mapping) or not step.get("edge_id"):
+                    continue
+                edge_id = str(step["edge_id"])
+                state = edge_feedback.setdefault(
+                    edge_id, {"used": False, "corrected": False}
+                )
+                state["used"] = state["used"] or atom_ref in positive_refs
+                state["corrected"] = (
+                    state["corrected"]
+                    or atom_ref in correction_refs
+                    or negative_label
+                )
+        for edge_id, edge_state in sorted(edge_feedback.items()):
+            edge = self.store.get_edge(edge_id)
+            if edge is None or edge.get("deleted"):
+                continue
+            changed_edge = dict(edge)
+            derivation = dict(changed_edge.get("derivation") or {})
+            telemetry = derivation.get("retrieval_telemetry", {})
+            telemetry = dict(telemetry) if isinstance(telemetry, Mapping) else {}
+            used_count = int(telemetry.get("used_count", 0) or 0)
+            correction_count = int(telemetry.get("correction_count", 0) or 0)
+            if edge_state["used"] and not negative_label:
+                used_count += 1
+            if edge_state["corrected"]:
+                correction_count += 1
+            telemetry.update(
+                {
+                    "used_count": used_count,
+                    "correction_count": correction_count,
+                    "last_outcome_label": label or None,
+                    "last_outcome_at": now,
+                }
+            )
+            derivation["retrieval_telemetry"] = telemetry
+            changed_edge["derivation"] = derivation
+            changed_edge["updated_at"] = now
+            changed_edge["version"] = int(changed_edge["version"]) + 1
+            self.store.upsert_edge(conn, changed_edge)
+            updated_edges.append(
+                {
+                    "edge_id": edge_id,
+                    "used_count": used_count,
+                    "correction_count": correction_count,
+                }
+            )
         return {
             "updated_atom_refs": [item["atom_ref"] for item in updated_atoms],
             "updated_atoms": updated_atoms,
             "projected_atoms": projected_atoms,
             "positive_refs": sorted(positive_refs),
             "correction_refs": sorted(correction_refs),
+            "updated_edge_refs": [item["edge_id"] for item in updated_edges],
+            "updated_edges": updated_edges,
+            "ignored_non_packet_refs": ignored_refs,
+            "reported_evidence_refs": self._retrieval_outcome_evidence_refs(outcome),
+            "feedback_contract": "packet_items_only",
         }
 
 
@@ -455,6 +611,23 @@ class RetrievalService:
             add_refs(corrections, outcome.get(key))
         add_refs(corrections, outcome.get("corrected_atom_ref"))
         return positive, corrections
+
+
+    def _retrieval_outcome_evidence_refs(
+        self, outcome: Mapping[str, Any]
+    ) -> list[str]:
+        refs: set[str] = set()
+
+        def add(value: Any) -> None:
+            if isinstance(value, str) and value:
+                refs.add(value)
+            elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                for item in value:
+                    add(item)
+
+        for key in ("used_evidence_refs", "cited_evidence_refs", "evidence_refs"):
+            add(outcome.get(key))
+        return sorted(refs)
 
 
     def _attention_policy(
@@ -712,7 +885,7 @@ class RetrievalService:
         cue_tokens: set[str],
         attention_policy: Mapping[str, Any] | None,
         superseded_refs: Mapping[str, Sequence[str]] | None = None,
-    ) -> dict[str, float]:
+    ) -> tuple[dict[str, float], dict[str, list[dict[str, Any]]]]:
         eligible_refs: set[str] = set()
         seed_strengths: dict[str, float] = {}
         for atom in atoms:
@@ -747,10 +920,11 @@ class RetrievalService:
             if seed > 0:
                 seed_strengths[atom_ref] = seed
         if not seed_strengths:
-            return {}
+            return {}, {}
 
         atoms_by_ref = {str(atom.get("id") or ""): atom for atom in atoms}
-        activation: dict[str, float] = {}
+        edges = []
+        degree: dict[str, int] = {}
         for edge in self.store.list_edges_for_refs(sorted(eligible_refs)):
             source = str(edge.get("source_ref") or "")
             target = str(edge.get("target_ref") or "")
@@ -758,20 +932,61 @@ class RetrievalService:
                 continue
             if not self._hot_graph_edge_visible(edge, atoms_by_ref):
                 continue
+            edges.append(edge)
+            degree[source] = degree.get(source, 0) + 1
+            degree[target] = degree.get(target, 0) + 1
+
+        adjacency: dict[str, list[tuple[str, float, Mapping[str, Any]]]] = {}
+        for edge in edges:
+            source = str(edge["source_ref"])
+            target = str(edge["target_ref"])
             relation_weight = self._edge_relation_activation_weight(
                 str(edge.get("relation") or "")
             )
-            if source in seed_strengths:
-                activation[target] = max(
-                    activation.get(target, 0.0),
-                    min(1.0, seed_strengths[source] * relation_weight),
-                )
-            if target in seed_strengths:
-                activation[source] = max(
-                    activation.get(source, 0.0),
-                    min(1.0, seed_strengths[target] * relation_weight * 0.8),
-                )
-        return activation
+            telemetry = (edge.get("derivation") or {}).get("retrieval_telemetry", {})
+            telemetry = telemetry if isinstance(telemetry, Mapping) else {}
+            used = int(telemetry.get("used_count", 0) or 0)
+            corrected = int(telemetry.get("correction_count", 0) or 0)
+            learned_weight = max(0.35, min(1.25, 1.0 + 0.03 * used - 0.08 * corrected))
+            forward = relation_weight * learned_weight / max(1.0, degree[source] ** 0.5)
+            reverse = relation_weight * learned_weight * 0.8 / max(1.0, degree[target] ** 0.5)
+            adjacency.setdefault(source, []).append((target, forward, edge))
+            adjacency.setdefault(target, []).append((source, reverse, edge))
+
+        activation: dict[str, float] = {}
+        traces: dict[str, list[dict[str, Any]]] = {}
+        frontier: list[tuple[str, float, list[dict[str, Any]]]] = [
+            (seed_ref, strength, [])
+            for seed_ref, strength in seed_strengths.items()
+        ]
+        for depth in (1, 2):
+            next_frontier: list[tuple[str, float, list[dict[str, Any]]]] = []
+            depth_decay = 1.0 if depth == 1 else 0.55
+            for source_ref, source_strength, source_trace in frontier:
+                for target_ref, edge_weight, edge in adjacency.get(source_ref, []):
+                    if any(
+                        step.get("edge_id") == edge.get("edge_id")
+                        for step in source_trace
+                    ):
+                        continue
+                    strength = min(1.0, source_strength * edge_weight * depth_decay)
+                    if strength <= activation.get(target_ref, 0.0):
+                        continue
+                    step = {
+                        "edge_id": str(edge.get("edge_id") or ""),
+                        "relation": str(edge.get("relation") or ""),
+                        "source_ref": source_ref,
+                        "target_ref": target_ref,
+                        "depth": depth,
+                    }
+                    trace = [*source_trace, step]
+                    activation[target_ref] = strength
+                    traces[target_ref] = trace
+                    next_frontier.append((target_ref, strength, trace))
+            frontier = next_frontier
+            if not frontier:
+                break
+        return activation, traces
 
 
     def _rank_atom(
@@ -912,6 +1127,7 @@ class RetrievalService:
             "activation_score": round(score, 4),
             "score": round(score, 4),
             "score_components": dict(atom.get("_score_components", {})),
+            "association_trace": list(atom.get("_association_trace", [])),
             "salience": atom["salience"],
             "utility": atom["utility"],
             "rendered_content": self._render_atom(atom),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import uuid
 import json
+import math
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
@@ -843,7 +844,11 @@ class SQLiteStore:
         return [(str(row["atom_id"]), str(row["token"])) for row in rows]
 
     def candidate_atom_ids_for_tokens(
-        self, tokens: list[str], *, limit: int | None = None
+        self,
+        tokens: list[str],
+        *,
+        limit: int | None = None,
+        eligible_atom_ids: set[str] | None = None,
     ) -> list[str]:
         normalized = sorted(
             {
@@ -856,18 +861,32 @@ class SQLiteStore:
             return []
         placeholders = ",".join("?" for _ in normalized)
         query = f"""
-            SELECT atom_id, COUNT(*) AS matches
+            SELECT atom_id, token
             FROM amos_atom_text_index
             WHERE token IN ({placeholders})
-            GROUP BY atom_id
-            ORDER BY matches DESC, atom_id ASC
         """
         params: list[Any] = list(normalized)
-        if limit is not None:
-            query += " LIMIT ?"
-            params.append(max(0, int(limit)))
+        if eligible_atom_ids is not None:
+            eligible = sorted({str(ref) for ref in eligible_atom_ids if str(ref)})
+            if not eligible:
+                return []
+            query += f" AND atom_id IN ({','.join('?' for _ in eligible)})"
+            params.extend(eligible)
         rows = self.conn.execute(query, tuple(params)).fetchall()
-        return [str(row["atom_id"]) for row in rows]
+        if not rows:
+            return []
+        document_count = max(1, self.atom_text_document_count())
+        frequencies = self.token_document_frequencies()
+        scores: dict[str, float] = {}
+        for row in rows:
+            atom_id = str(row["atom_id"])
+            token = str(row["token"])
+            inverse_frequency = math.log(
+                (document_count + 1.0) / (frequencies.get(token, document_count) + 1.0)
+            ) + 1.0
+            scores[atom_id] = scores.get(atom_id, 0.0) + inverse_frequency
+        ranked = sorted(scores, key=lambda atom_id: (-scores[atom_id], atom_id))
+        return ranked if limit is None else ranked[: max(0, int(limit))]
 
     def neighbor_atom_ids(self, refs: list[str]) -> list[str]:
         neighbors: set[str] = set()
@@ -1218,6 +1237,13 @@ class SQLiteStore:
             LIMIT 1
             """,
             (digest(request), int(graph_version)),
+        ).fetchone()
+        return None if row is None else self._json(row["response_json"])
+
+    def get_cached_packet_by_id(self, packet_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT response_json FROM amos_packet_cache WHERE packet_id = ?",
+            (str(packet_id),),
         ).fetchone()
         return None if row is None else self._json(row["response_json"])
 

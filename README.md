@@ -104,8 +104,9 @@ in-process SQLite store and serializes access through the service boundary:
   checksum chain.
 - Typed memory atoms, evidence records, associative edges, tombstones, packet cache,
   and retrieval outcomes.
-- Rebuildable SQLite token candidate index used to prefilter cue/attention
-  retrieval before deterministic in-Python ranking.
+- Rebuildable, content-only SQLite token candidate index with document-frequency
+  weighting, complemented by an independent bounded latent candidate pool before
+  deterministic in-Python ranking.
 - Graph-versioned SMP vector model with dependency-free TF-IDF lexical hashing,
   hashed character 3/4-grams for morphology and typo tolerance, and a
   maintenance-built LSA token projection stored as disposable derived state.
@@ -119,8 +120,9 @@ in-process SQLite store and serializes access through the service boundary:
 - Attention-aware packet ranking with explicit focus, type-boost,
   counterevidence, and suppression score components plus packet-level
   `attention_trace` diagnostics.
-- Retrieval-outcome feedback that journals packet-use telemetry and updates
-  referenced atom utility, salience, access time, and low-utility health.
+- Retrieval-outcome feedback that journals packet-use telemetry and updates only
+  atoms actually present in the identified packet, plus the association edges
+  that brought used or corrected items into that packet.
 - Self-awareness and agentic-recall views for self models, capabilities,
   limitations, runtime state, self-assessments, traces, outcomes, corrections,
   and blocked actions.
@@ -211,8 +213,10 @@ The returned packet includes `attention_trace` and item-level
 `attention_suppression_penalty`. Retrieval without cues intentionally browses
 visible memory by scope and attention context; cue and attention matching use
 payload values rather than JSON field names to avoid schema-key false positives.
-When cues or attention terms are present, v1-local uses a SQLite token index to
-prefilter candidate atoms and then expands to graph neighbors before ranking.
+When cues or focus terms are present, v1-local unions document-frequency-weighted
+lexical candidates with an independent bounded latent pool, then expands through
+at most two graph hops before ranking. Suppression terms inhibit ranking only;
+they never broaden the candidate pool.
 
 Run the Amos Mirror Agent integration demo:
 

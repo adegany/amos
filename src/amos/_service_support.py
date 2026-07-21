@@ -151,7 +151,7 @@ DEFAULT_MEMORY_POLICY = {
     },
 }
 SEARCH_INDEX_REF = "amos.v1.search"
-SEARCH_INDEX_SCHEMA = "amos.v1.search.payload_values.v2"
+SEARCH_INDEX_SCHEMA = "amos.v1.search.payload_values.v3"
 ATTENTION_POLICY_ID = "amos.v1.attention.default"
 RETRIEVAL_RECENCY_HORIZON_SECONDS = 30 * 24 * 60 * 60
 RETRIEVAL_WEIGHTS = {
