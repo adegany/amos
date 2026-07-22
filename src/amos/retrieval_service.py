@@ -12,6 +12,7 @@ from ._service_support import (
     SCHEMA_VERSION,
     SEMANTIC_MATCH_THRESHOLD,
     Sequence,
+    ValidationError,
     access_visible,
     canonical_json,
     confidence_score,
@@ -52,6 +53,157 @@ class RetrievalService:
         self._capacity_pressure_mode = capacity._capacity_pressure_mode
         self._seconds_since = temporal._seconds_since
         self.run_memory_policy = policy_runner
+
+    def retrieve_atom(
+        self,
+        atom_id: str,
+        *,
+        scope: Mapping[str, Any] | None = None,
+        requester: str = "system",
+        target_processor: str = "reasoner",
+        include_conflicts: bool = False,
+        include_archived: bool = False,
+        include_low_health: bool = False,
+        include_superseded: bool = False,
+        run_policy: bool = True,
+    ) -> dict[str, Any]:
+        """Resolve one known atom reference without semantic ranking.
+
+        Exact retrieval bypasses lexical, latent, graph-activation, and pressure
+        ranking, but it retains the same scope, access, lifecycle, health,
+        supersession, evidence-visibility, packet-cache, and feedback boundaries
+        as associative packet retrieval.
+        """
+
+        atom_id = str(atom_id or "").strip()
+        if not atom_id:
+            raise ValidationError("atom_id is required")
+        self._mark_foreground_activity(requester)
+        if run_policy:
+            self.run_memory_policy(trigger="retrieve_atom", scope=scope or {})
+        request = {
+            "atom_id": atom_id,
+            "scope": dict(scope or {}),
+            "requester": requester,
+            "target_processor": target_processor,
+            "retrieval_mode": "exact",
+            "include_conflicts": bool(include_conflicts),
+            "include_archived": bool(include_archived),
+            "include_low_health": bool(include_low_health),
+            "include_superseded": bool(include_superseded),
+            "run_policy": bool(run_policy),
+        }
+        graph_version = self.store.graph_version()
+        cached = self.store.get_cached_packet(
+            request=request, graph_version=graph_version
+        )
+        if cached is not None:
+            return cached
+
+        atom = self.store.get_atom(atom_id)
+        omissions: list[dict[str, Any]] = []
+        superseded_refs: dict[str, Sequence[str]] = {}
+        if atom is None:
+            omissions.append({"atom_ref": atom_id, "reason": "not_found"})
+        elif atom.get("deleted"):
+            omissions.append({"atom_ref": atom_id, "reason": "deleted"})
+        elif not scope_visible(atom["scope"], request["scope"]):
+            omissions.append({"atom_ref": atom_id, "reason": "scope_hidden"})
+        elif not access_visible(
+            atom["access_policy"], requester, target_processor
+        ):
+            omissions.append({"atom_ref": atom_id, "reason": "access_hidden"})
+        elif (
+            str(atom.get("lifecycle_state") or "active") == "archived"
+            and not include_archived
+        ):
+            omissions.append({"atom_ref": atom_id, "reason": "archived"})
+        elif atom["health_status"] == "contradicted" and not include_conflicts:
+            omissions.append({"atom_ref": atom_id, "reason": "contradicted"})
+        elif atom["health_status"] in LOW_HEALTH_STATES and not include_low_health:
+            omissions.append(
+                {"atom_ref": atom_id, "reason": f"health:{atom['health_status']}"}
+            )
+        else:
+            superseded_refs = self._active_superseded_refs([atom_id])
+            if atom_id in superseded_refs and not include_superseded:
+                omissions.append(
+                    {
+                        "atom_ref": atom_id,
+                        "reason": "superseded",
+                        "superseded_by": list(superseded_refs[atom_id])[:5],
+                    }
+                )
+
+        items: list[dict[str, Any]] = []
+        if atom is not None and not omissions:
+            exact_atom = {
+                **atom,
+                "_score_components": {
+                    "exact_reference_match": 1.0,
+                    "semantic_ranking_used": 0.0,
+                },
+                "_association_trace": [],
+            }
+            item, evidence_omissions = self._packet_item(
+                exact_atom,
+                1.0,
+                requester=requester,
+                target_processor=target_processor,
+            )
+            item["rank"] = 1
+            items.append(item)
+            omissions.extend(evidence_omissions)
+
+        conflicts: list[dict[str, Any]] = []
+        if include_conflicts and items:
+            for edge in self.store.list_edges_for_refs([atom_id]):
+                if edge["relation"] in CONFLICT_RELATIONS:
+                    conflicts.append(edge)
+        packet_id = stable_id(
+            "pkt",
+            {"request": request, "graph_version": graph_version, "items": items},
+        )
+        packet = {
+            "packet_id": packet_id,
+            "schema_version": SCHEMA_VERSION,
+            "request": request,
+            "graph_version": graph_version,
+            "generated_at": utc_now(),
+            "target_processor": target_processor,
+            "retrieval_mode": "exact",
+            "scope": dict(scope or {}),
+            "pressure_mode": self._capacity_pressure_mode(),
+            "status": "found" if items else "not_found",
+            "found": bool(items),
+            "item": items[0] if items else None,
+            "items": items,
+            "omissions": omissions,
+            "conflicts": conflicts,
+            "degradation": {
+                "mode": "exact-reference-local",
+                "semantic_ranking_used": False,
+                "pressure_reduced_recall": False,
+                "reason_codes": sorted(
+                    {str(omission["reason"]) for omission in omissions}
+                ),
+            },
+            "provenance": {
+                "store": getattr(self.store, "backend_name", "unknown"),
+                "journal_head": self.store.last_event_hash(),
+                "resolver_profile_id": "amos.v1.exact-reference",
+            },
+            "cache_policy": {"cacheable": True, "keyed_by_graph_version": True},
+        }
+        with self.store.transaction() as conn:
+            self.store.cache_packet(
+                conn,
+                packet_id=packet_id,
+                request=request,
+                response=packet,
+                graph_version=graph_version,
+            )
+        return packet
 
     def retrieve_packet(
         self,

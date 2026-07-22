@@ -345,6 +345,33 @@ class Amos:
             run_policy=run_policy,
         )
 
+    def retrieve_atom(
+        self,
+        atom_id: str,
+        *,
+        scope: Mapping[str, Any] | None = None,
+        requester: str = "system",
+        target_processor: str = "reasoner",
+        include_conflicts: bool = False,
+        include_archived: bool = False,
+        include_low_health: bool = False,
+        include_superseded: bool = False,
+        run_policy: bool = True,
+    ) -> dict[str, Any]:
+        """Resolve a known atom ID without invoking associative ranking."""
+
+        return self.retrieval.retrieve_atom(
+            atom_id,
+            scope=scope,
+            requester=requester,
+            target_processor=target_processor,
+            include_conflicts=include_conflicts,
+            include_archived=include_archived,
+            include_low_health=include_low_health,
+            include_superseded=include_superseded,
+            run_policy=run_policy,
+        )
+
     def record_retrieval_outcome(
         self,
         *,

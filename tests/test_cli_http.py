@@ -101,6 +101,18 @@ def test_http_v1_endpoints_smoke(tmp_path):
         assert updated["status"] == "updated"
         assert updated["atom"]["payload"]["semantic_facets"][0]["subject"] == "http endpoint"
         assert server.amos.health_memory()["atoms"] == 1
+        exact = http_json(
+            f"{base}/v1/atoms:get",
+            {
+                "atom_id": "http_atom",
+                "requester": "http-test",
+                "target_processor": "reasoner",
+                "run_policy": False,
+            },
+        )
+        assert exact["status"] == "found"
+        assert exact["retrieval_mode"] == "exact"
+        assert exact["item"]["atom_ref"] == "http_atom"
         packet = http_json(
             f"{base}/v1/packets:retrieve",
             {"cues": ["HTTP endpoint"]},

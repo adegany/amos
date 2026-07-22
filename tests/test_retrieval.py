@@ -62,6 +62,127 @@ def test_retrieve_packet_uses_graph_version_packet_cache(amos, monkeypatch):
     assert "cache_hit_atom" in item_refs(second)
 
 
+def test_retrieve_atom_resolves_exact_id_without_associative_ranking(
+    amos, monkeypatch
+):
+    atom = amos.commit_atom(
+        {
+            "id": "opaque_ref_7c5d2f4a",
+            "type": "goal",
+            "payload": {"objective": "Exercise exact atom retrieval."},
+            "scope": {"tenant": "exact-test"},
+        }
+    )["atom"]
+
+    def fail_associative_path(*_args, **_kwargs):
+        raise AssertionError("exact retrieval must not invoke associative ranking")
+
+    monkeypatch.setattr(amos.store, "list_atoms_filtered", fail_associative_path)
+    monkeypatch.setattr(amos.smp, "encode", fail_associative_path)
+    packet = amos.retrieve_atom(
+        atom["id"],
+        scope={"tenant": "exact-test"},
+        requester="agent-a",
+        target_processor="reasoner",
+        run_policy=False,
+    )
+
+    assert packet["status"] == "found"
+    assert packet["found"] is True
+    assert packet["retrieval_mode"] == "exact"
+    assert packet["item"]["atom_ref"] == atom["id"]
+    assert packet["items"] == [packet["item"]]
+    assert packet["item"]["score_components"] == {
+        "exact_reference_match": 1.0,
+        "semantic_ranking_used": 0.0,
+    }
+    assert packet["item"]["association_trace"] == []
+    assert packet["degradation"]["semantic_ranking_used"] is False
+
+    # Feedback legitimately rebuilds the atom's derived search index after
+    # updating salience/utility; only the exact read itself bypasses ranking.
+    monkeypatch.undo()
+    outcome = amos.record_retrieval_outcome(
+        packet_id=packet["packet_id"],
+        request=packet["request"],
+        outcome={"used_atom_refs": [atom["id"]], "status": "used"},
+    )
+    assert outcome["feedback"]["positive_refs"] == [atom["id"]]
+
+
+def test_retrieve_atom_enforces_scope_access_and_lifecycle_filters(amos):
+    archived = amos.commit_atom(
+        {
+            "id": "exact_archived_atom",
+            "type": "episode",
+            "payload": {"summary": "Retained historical provenance."},
+            "scope": {"tenant": "exact-test"},
+            "lifecycle_state": "archived",
+            "health_status": "stale",
+            "access_policy": {
+                "visibility": ["processor:historian"],
+                "mutable_by": ["owner"],
+            },
+        }
+    )["atom"]
+
+    hidden_scope = amos.retrieve_atom(
+        archived["id"],
+        scope={"tenant": "other"},
+        target_processor="historian",
+        run_policy=False,
+    )
+    assert hidden_scope["found"] is False
+    assert hidden_scope["omissions"] == [
+        {"atom_ref": archived["id"], "reason": "scope_hidden"}
+    ]
+
+    hidden_access = amos.retrieve_atom(
+        archived["id"],
+        scope={"tenant": "exact-test"},
+        target_processor="reasoner",
+        run_policy=False,
+    )
+    assert hidden_access["found"] is False
+    assert hidden_access["omissions"][0]["reason"] == "access_hidden"
+
+    archived_default = amos.retrieve_atom(
+        archived["id"],
+        scope={"tenant": "exact-test"},
+        target_processor="historian",
+        run_policy=False,
+    )
+    assert archived_default["found"] is False
+    assert archived_default["omissions"][0]["reason"] == "archived"
+
+    stale_default = amos.retrieve_atom(
+        archived["id"],
+        scope={"tenant": "exact-test"},
+        target_processor="historian",
+        include_archived=True,
+        run_policy=False,
+    )
+    assert stale_default["found"] is False
+    assert stale_default["omissions"][0]["reason"] == "health:stale"
+
+    included = amos.retrieve_atom(
+        archived["id"],
+        scope={"tenant": "exact-test"},
+        target_processor="historian",
+        include_archived=True,
+        include_low_health=True,
+        run_policy=False,
+    )
+    assert included["found"] is True
+    assert included["item"]["atom_ref"] == archived["id"]
+
+    missing = amos.retrieve_atom("missing_exact_atom", run_policy=False)
+    assert missing["found"] is False
+    assert missing["omissions"] == [
+        {"atom_ref": "missing_exact_atom", "reason": "not_found"}
+    ]
+
+
 def test_retrieve_packet_attention_context_shapes_ranking_and_trace(amos):
     amos.commit_atom(
         {

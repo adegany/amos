@@ -625,12 +625,20 @@ POST /v1/packets:retrieve
   returns a packet from the current graph view
   queues a background policy tick when run_policy is true
 
+POST /v1/atoms:get
+  resolves one already-known atom_id without lexical, semantic, or associative
+  ranking
+  preserves scope, access, lifecycle, health, supersession, and evidence
+  visibility checks
+  queues a background policy tick when run_policy is true
+
 POST /v1/memory-policy:run
   runs the policy synchronously as an explicit operator/admin action
 ```
 
 The in-process service API still exposes `run_memory_policy()` and
-`retrieve_packet(run_policy=True)` for tests, CLI use, and embedded deployments
+`retrieve_atom(run_policy=True)` / `retrieve_packet(run_policy=True)` for tests,
+CLI use, and embedded deployments
 that intentionally want a synchronous tick. The shared-service contract is that
 connected agents do not own lifecycle maintenance themselves.
 

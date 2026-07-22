@@ -2912,6 +2912,7 @@ POST /v1/atoms:propose
 POST /v1/atoms:commit
 POST /v1/atoms:archive
 POST /v1/atoms:merge
+POST /v1/atoms:get
 POST /v1/packets:retrieve
 POST /v1/retrieval-outcomes
 POST /v1/maintenance:request
@@ -3012,12 +3013,24 @@ POST /v1/atoms:merge
   response payload: merged atom ref, archived source refs, journal event refs
   consistency: strong when approved
 
+POST /v1/atoms:get
+  request payload: atom_id, optional scope, requester, target_processor, and
+  lifecycle inclusion flags
+  response payload: exact-reference packet with found/item/omissions fields
+  consistency: monotonic by default; cacheable by atom_id, visibility options,
+  and graph_version
+  semantics: use only when the caller already holds an atom ID; scope, access,
+  lifecycle, health, supersession, and evidence visibility still apply, but
+  lexical, semantic, graph-activation, and pressure ranking do not
+
 POST /v1/packets:retrieve
   request payload: MemoryPacketRequest
   response payload: MemoryPacket; HTTP service mode includes a policy_schedule
   acknowledgement when retrieval queues background policy work
   consistency: monotonic by default; strong if min_graph_version is provided and reachable;
   cacheable by request digest and graph_version when no policy mutation is required
+  semantics: associative recall for cues or task context; it is not the lookup
+  path for an already-known atom ID
 
 POST /v1/retrieval-outcomes
   request payload: packet_id, original retrieval request, outcome labels,

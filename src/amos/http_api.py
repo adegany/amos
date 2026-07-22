@@ -199,6 +199,20 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 )
             if path == "/v1/atoms:merge":
                 return self._write_json(amos.merge_atoms(**body))
+            if path == "/v1/atoms:get":
+                request = dict(body)
+                atom_id = request.pop("atom_id")
+                policy_schedule = None
+                if bool(request.get("run_policy", True)):
+                    policy_schedule = server.memory_policy_worker.request_tick(
+                        trigger="retrieve_atom",
+                        scope=request.get("scope") or {},
+                    )
+                    request["run_policy"] = False
+                packet = amos.retrieve_atom(atom_id, **request)
+                if policy_schedule is not None:
+                    packet["policy_schedule"] = policy_schedule
+                return self._write_json(packet)
             if path == "/v1/packets:retrieve":
                 request = dict(body)
                 policy_schedule = None

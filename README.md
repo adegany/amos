@@ -243,8 +243,10 @@ PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 serve --host 127.0.0.1 
 
 The HTTP service starts a background memory-policy worker. `GET
 /v1/health/memory` reports health and worker status without running maintenance
-inline, while `POST /v1/packets:retrieve` queues a policy tick and returns the
-packet immediately. Explicit `POST /v1/memory-policy:run` and the CLI
+inline, while `POST /v1/atoms:get` resolves a known atom ID without semantic or
+associative ranking and `POST /v1/packets:retrieve` performs associative recall.
+Both retrieval paths queue a policy tick and return immediately. Explicit
+`POST /v1/memory-policy:run` and the CLI
 `memory-policy --run` command remain synchronous operator paths.
 
 The stdlib HTTP adapter is the first single-process deployment profile: it owns
