@@ -866,6 +866,63 @@ def test_two_hop_association_trace_is_bounded_and_trains_used_edges(amos):
     assert outcome["feedback"]["updated_edge_refs"] == sorted(
         [first["edge_id"], second["edge_id"]]
     )
+    assert outcome["event"]["payload"]["projected_edges"] == [
+        amos.store.get_edge(edge_id)
+        for edge_id in sorted([first["edge_id"], second["edge_id"]])
+    ]
+
+
+def test_replay_recovers_legacy_retrieval_feedback_without_edge_projection(
+    amos, monkeypatch
+):
+    source = amos.commit_atom(
+        {
+            "id": "legacy_feedback_source",
+            "type": "semantic",
+            "payload": {"summary": "zzlegacyfeedback retrieval anchor"},
+        }
+    )["atom"]
+    target_result = amos.commit_atom(
+        {
+            "id": "legacy_feedback_target",
+            "type": "semantic",
+            "payload": {
+                "summary": "associated conclusion",
+                "graph_relations": [
+                    {
+                        "source_ref": "$self",
+                        "target_ref": source["id"],
+                        "relation": "rel:derived_from",
+                    }
+                ],
+            },
+        }
+    )
+    edge = target_result["edges"][0]
+    packet = amos.retrieve_packet(
+        cues=["zzlegacyfeedback"], max_items=5, run_policy=False
+    )
+    target = next(
+        item for item in packet["items"] if item["atom_ref"] == "legacy_feedback_target"
+    )
+    assert target["association_trace"][0]["edge_id"] == edge["edge_id"]
+
+    append_event = amos.store.append_event
+
+    def append_legacy_event(conn, **kwargs):
+        payload = dict(kwargs["payload"])
+        payload.pop("projected_edges", None)
+        return append_event(conn, **{**kwargs, "payload": payload})
+
+    monkeypatch.setattr(amos.store, "append_event", append_legacy_event)
+    outcome = amos.record_retrieval_outcome(
+        packet_id=packet["packet_id"],
+        request=packet["request"],
+        outcome={"used_item_refs": [target["atom_ref"]], "label": "useful"},
+    )
+
+    assert "projected_edges" not in outcome["event"]["payload"]
+    assert amos.verify_replay()["status"] == "ok"
 
 
 def test_retrieval_ranking_scoped_preference_beats_generic(amos):

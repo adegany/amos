@@ -128,6 +128,53 @@ class DiagnosticsService:
                 )
             return projected
 
+        def replay_legacy_retrieval_edge_feedback(
+            payload: dict[str, Any],
+        ) -> None:
+            """Replay feedback events written before full edges were journaled."""
+
+            if payload.get("projected_edges"):
+                return
+            feedback = payload.get("feedback") or {}
+            summaries = feedback.get("updated_edges") or []
+            if not summaries:
+                return
+            projected_atoms = payload.get("projected_atoms") or []
+            timestamp = None
+            label = None
+            for atom in projected_atoms:
+                telemetry = (atom.get("decay_policy") or {}).get(
+                    "retrieval_telemetry"
+                ) or {}
+                timestamp = telemetry.get("last_outcome_at") or atom.get("updated_at")
+                label = telemetry.get("last_outcome_label")
+                if timestamp:
+                    break
+            for summary in summaries:
+                edge_id = str(summary.get("edge_id") or "")
+                prior = edges.get(edge_id)
+                if not edge_id or prior is None:
+                    continue
+                changed = dict(prior)
+                derivation = dict(changed.get("derivation") or {})
+                telemetry = dict(derivation.get("retrieval_telemetry") or {})
+                telemetry.update(
+                    {
+                        "used_count": int(summary.get("used_count", 0) or 0),
+                        "correction_count": int(
+                            summary.get("correction_count", 0) or 0
+                        ),
+                        "last_outcome_label": label,
+                        "last_outcome_at": timestamp,
+                    }
+                )
+                derivation["retrieval_telemetry"] = telemetry
+                changed["derivation"] = derivation
+                if timestamp:
+                    changed["updated_at"] = timestamp
+                changed["version"] = int(changed.get("version", 0) or 0) + 1
+                edges[edge_id] = replay_edge_projection(changed)
+
         for event in self.store.list_events():
             payload = event["payload"]
             event_type = event["event_type"]
@@ -186,6 +233,8 @@ class DiagnosticsService:
                         edges.pop(edge["edge_id"], None)
                     else:
                         edges[edge["edge_id"]] = replay_edge_projection(edge)
+                if event_type == "retrieval_outcome_recorded":
+                    replay_legacy_retrieval_edge_feedback(payload)
                 for tombstone in payload.get("tombstones", []):
                     tombstones[tombstone["target_ref"]] = tombstone
         return {

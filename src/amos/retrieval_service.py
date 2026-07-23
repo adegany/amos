@@ -559,6 +559,7 @@ class RetrievalService:
                         "outcome_id": record["outcome_id"],
                         "feedback": feedback,
                         "projected_atoms": feedback["projected_atoms"],
+                        "projected_edges": feedback["projected_edges"],
                     },
                     target_refs=[
                         *feedback["updated_atom_refs"],
@@ -612,6 +613,7 @@ class RetrievalService:
         updated_atoms: list[dict[str, Any]] = []
         updated_edges: list[dict[str, Any]] = []
         projected_atoms: list[dict[str, Any]] = []
+        projected_edges: list[dict[str, Any]] = []
         for atom_ref in sorted(positive_refs.union(correction_refs)):
             atom = self.store.get_atom(atom_ref)
             if atom is None or atom.get("deleted"):
@@ -709,6 +711,7 @@ class RetrievalService:
             changed_edge["updated_at"] = now
             changed_edge["version"] = int(changed_edge["version"]) + 1
             self.store.upsert_edge(conn, changed_edge)
+            projected_edges.append(changed_edge)
             updated_edges.append(
                 {
                     "edge_id": edge_id,
@@ -720,6 +723,7 @@ class RetrievalService:
             "updated_atom_refs": [item["atom_ref"] for item in updated_atoms],
             "updated_atoms": updated_atoms,
             "projected_atoms": projected_atoms,
+            "projected_edges": projected_edges,
             "positive_refs": sorted(positive_refs),
             "correction_refs": sorted(correction_refs),
             "updated_edge_refs": [item["edge_id"] for item in updated_edges],
