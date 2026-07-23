@@ -24,6 +24,7 @@ from .index_service import IndexService
 from .mutations_service import MutationService
 from .policy_service import PolicyService
 from .retrieval_service import RetrievalService
+from .reasoning_service import ReasoningFrameService
 from .stewardship_service import StewardshipService
 from .temporal_service import TemporalService
 from .views_service import ViewService
@@ -82,6 +83,16 @@ class Amos:
             self.graph,
             self.capacity,
             self.temporal,
+            self.policy.run_memory_policy,
+        )
+        self.reasoning = ReasoningFrameService(
+            self.store,
+            self.smp,
+            self.access,
+            self.indexes,
+            self.graph,
+            self.retrieval,
+            self.capacity,
             self.policy.run_memory_policy,
         )
         self.views = ViewService(
@@ -369,6 +380,60 @@ class Amos:
             include_archived=include_archived,
             include_low_health=include_low_health,
             include_superseded=include_superseded,
+            run_policy=run_policy,
+        )
+
+    def compile_memory_frame(
+        self,
+        *,
+        need: str,
+        purpose: str,
+        depth: str = "working_frame",
+        task_context: Mapping[str, Any] | None = None,
+        scope: Mapping[str, Any] | None = None,
+        requester: str = "system",
+        target_processor: str = "reasoner",
+        token_or_byte_budget: int | Mapping[str, int] | None = None,
+        run_policy: bool = True,
+    ) -> dict[str, Any]:
+        return self.reasoning.compile_memory_frame(
+            need=need,
+            purpose=purpose,
+            depth=depth,
+            task_context=task_context,
+            scope=scope,
+            requester=requester,
+            target_processor=target_processor,
+            token_or_byte_budget=token_or_byte_budget,
+            run_policy=run_policy,
+        )
+
+    def load_memory_page(
+        self,
+        *,
+        frame_id: str,
+        revision: Mapping[str, Any],
+        page: Mapping[str, Any],
+        need: str | None = None,
+        purpose: str | None = None,
+        depth: str = "focused",
+        scope: Mapping[str, Any] | None = None,
+        requester: str = "system",
+        target_processor: str = "reasoner",
+        token_or_byte_budget: int | Mapping[str, int] | None = None,
+        run_policy: bool = True,
+    ) -> dict[str, Any]:
+        return self.reasoning.load_memory_page(
+            frame_id=frame_id,
+            revision=revision,
+            page=page,
+            need=need,
+            purpose=purpose,
+            depth=depth,
+            scope=scope,
+            requester=requester,
+            target_processor=target_processor,
+            token_or_byte_budget=token_or_byte_budget,
             run_policy=run_policy,
         )
 

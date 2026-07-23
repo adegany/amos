@@ -5,6 +5,7 @@ from .errors import (
     AmosError,
     CASConflict,
     IdempotencyConflict,
+    StaleFrameError,
     ValidationError,
 )
 from .ontology import ontology_snapshot
@@ -72,6 +73,7 @@ __all__ = [
     "SemanticMaintenanceProcessor",
     "SelfModelCalibrator",
     "SQLiteStore",
+    "StaleFrameError",
     "ValidationError",
     "load_maintenance_processor",
     "coerce_window_request",

@@ -45,7 +45,10 @@ class GraphService:
 
 
     def _hot_graph_edge_degree_counts(
-        self, atoms: Sequence[Mapping[str, Any]]
+        self,
+        atoms: Sequence[Mapping[str, Any]],
+        *,
+        edge_scan_limit: int | None = None,
     ) -> dict[str, int]:
         atoms_by_ref = {
             str(atom.get("id") or ""): atom
@@ -56,7 +59,12 @@ class GraphService:
         if not refs:
             return {}
         counts: dict[str, int] = {}
-        for edge in self.store.list_edges_for_refs(refs):
+        scoped_edges = (
+            self.store.list_edges_for_refs(refs)
+            if edge_scan_limit is None
+            else self.store.list_edges_for_refs(refs, limit=edge_scan_limit)
+        )
+        for edge in scoped_edges:
             if not self._hot_graph_edge_visible(edge, atoms_by_ref):
                 continue
             source = str(edge.get("source_ref") or "")

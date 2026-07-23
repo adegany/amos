@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/memory_page_request.schema.json",
+  "title": "AMOS MemoryPageRequest",
+  "type": "object",
+  "required": ["frame_id", "revision", "page"],
+  "properties": {
+    "frame_id": { "type": "string", "minLength": 1 },
+    "revision": { "$ref": "memory_frame.schema.json#/$defs/revision" },
+    "page": { "$ref": "memory_frame.schema.json#/$defs/pageDescriptor" },
+    "need": { "type": ["string", "null"], "minLength": 1 },
+    "purpose": { "type": ["string", "null"], "minLength": 1 },
+    "depth": { "enum": ["focused", "supporting", "working_frame", "orientation", "evidence"] },
+    "scope": { "$ref": "scope.schema.json" },
+    "requester": { "type": "string", "minLength": 1 },
+    "target_processor": { "type": "string", "minLength": 1 },
+    "token_or_byte_budget": {
+      "oneOf": [
+        { "type": "integer", "minimum": 1 },
+        {
+          "type": "object",
+          "properties": {
+            "tokens": { "type": "integer", "minimum": 1 },
+            "bytes": { "type": "integer", "minimum": 1 }
+          },
+          "oneOf": [
+            { "required": ["tokens"] },
+            { "required": ["bytes"] }
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "run_policy": { "type": "boolean" }
+  },
+  "additionalProperties": false
+}

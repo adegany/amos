@@ -9,7 +9,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, cast
 
-from .errors import AmosError
+from .errors import AmosError, StaleFrameError, ValidationError
 from .service import Amos
 from .workers import BackgroundMemoryPolicyWorker
 
@@ -55,6 +55,7 @@ class AmosHTTPServer(ThreadingHTTPServer):
 def make_handler() -> type[BaseHTTPRequestHandler]:
     class AmosHandler(BaseHTTPRequestHandler):
         server_version = "AmosHTTP/1.0"
+        protocol_version = "HTTP/1.1"
 
         def do_GET(self) -> None:
             self._handle("GET")
@@ -81,6 +82,19 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         )
                         return
                     self._dispatch(server, method, body)
+            except StaleFrameError as exc:
+                self._write_json(
+                    {
+                        "status": "error",
+                        "error": str(exc),
+                        "code": "stale_revision",
+                        "error_code": "stale_frame",
+                        "expected_revision": exc.expected_revision,
+                        "current_revision": exc.current_revision,
+                        "retryable": False,
+                    },
+                    status=HTTPStatus.CONFLICT,
+                )
             except AmosError as exc:
                 self._write_json(
                     {"status": "error", "error": str(exc)},
@@ -226,6 +240,26 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 if policy_schedule is not None:
                     packet["policy_schedule"] = policy_schedule
                 return self._write_json(packet)
+            if path == "/v1/reasoning-frames:compile":
+                request = self._reasoning_request(body, page=False)
+                if bool(request.get("run_policy", True)):
+                    server.memory_policy_worker.request_tick(
+                        trigger="compile_memory_frame",
+                        scope=request.get("scope") or {},
+                    )
+                    request["run_policy"] = False
+                frame = amos.compile_memory_frame(**request)
+                return self._write_json(frame)
+            if path == "/v1/reasoning-pages:load":
+                request = self._reasoning_request(body, page=True)
+                if bool(request.get("run_policy", True)):
+                    server.memory_policy_worker.request_tick(
+                        trigger="load_memory_page",
+                        scope=request.get("scope") or {},
+                    )
+                    request["run_policy"] = False
+                page = amos.load_memory_page(**request)
+                return self._write_json(page)
             if path == "/v1/retrieval-outcomes":
                 return self._write_json(amos.record_retrieval_outcome(**body))
             if path == "/v1/maintenance:request":
@@ -258,6 +292,79 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 return self._write_json(amos.run_maintenance_distiller(**body))
             raise NotImplementedError
 
+        def _reasoning_request(
+            self, body: dict[str, Any], *, page: bool
+        ) -> dict[str, Any]:
+            common = {
+                "need",
+                "purpose",
+                "depth",
+                "scope",
+                "requester",
+                "target_processor",
+                "token_or_byte_budget",
+                "run_policy",
+            }
+            allowed = common | (
+                {"frame_id", "revision", "page"} if page else {"task_context"}
+            )
+            required = (
+                {"frame_id", "revision", "page"} if page else {"need", "purpose"}
+            )
+            unknown = sorted(set(body) - allowed)
+            missing = sorted(required - set(body))
+            if unknown:
+                raise ValidationError(
+                    "unknown reasoning request field(s): " + ", ".join(unknown)
+                )
+            if missing:
+                raise ValidationError(
+                    "missing reasoning request field(s): " + ", ".join(missing)
+                )
+            request = dict(body)
+            object_fields = {"scope"}
+            if page:
+                object_fields.update({"revision", "page"})
+            else:
+                object_fields.add("task_context")
+            for field in sorted(object_fields):
+                if (
+                    field in request
+                    and request[field] is not None
+                    and not isinstance(request[field], dict)
+                ):
+                    raise ValidationError(f"{field} must be an object")
+            text_fields = {"requester", "target_processor", "depth"}
+            if page:
+                text_fields.add("frame_id")
+            else:
+                text_fields.update({"need", "purpose"})
+            for field in sorted(text_fields):
+                if field in request and (
+                    not isinstance(request[field], str)
+                    or not request[field].strip()
+                ):
+                    raise ValidationError(f"{field} must be a non-empty string")
+            if page:
+                for field in ("need", "purpose"):
+                    if field in request and request[field] is not None and (
+                        not isinstance(request[field], str)
+                        or not request[field].strip()
+                    ):
+                        raise ValidationError(
+                            f"{field} must be null or a non-empty string"
+                        )
+            if "run_policy" in request and not isinstance(request["run_policy"], bool):
+                raise ValidationError("run_policy must be a boolean")
+            budget = request.get("token_or_byte_budget")
+            if budget is not None and (
+                isinstance(budget, bool) or not isinstance(budget, (int, dict))
+            ):
+                raise ValidationError(
+                    "token_or_byte_budget must be an integer or object"
+                )
+            return request
+
         def _read_json(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0") or "0")
             raw = self.rfile.read(length)
@@ -275,6 +382,14 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
+            request_id = self.headers.get("X-Request-ID")
+            if (
+                request_id
+                and len(request_id) <= 256
+                and "\r" not in request_id
+                and "\n" not in request_id
+            ):
+                self.send_header("X-Request-ID", request_id)
             self.end_headers()
             try:
                 self.wfile.write(raw)

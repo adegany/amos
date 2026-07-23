@@ -328,6 +328,22 @@ class SQLiteStore:
     def last_event_hash(self) -> str:
         return self._get_meta(self.conn, "last_event_hash") or "genesis"
 
+    def memory_revision(self) -> dict[str, Any]:
+        """Return the current canonical-memory revision in one SQLite read."""
+
+        rows = self.conn.execute(
+            """
+            SELECT key, value
+            FROM amos_meta
+            WHERE key IN ('graph_version', 'last_event_hash')
+            """
+        ).fetchall()
+        values = {str(row["key"]): str(row["value"]) for row in rows}
+        return {
+            "graph_version": int(values.get("graph_version", "0") or 0),
+            "journal_head": values.get("last_event_hash", "genesis") or "genesis",
+        }
+
     def get_meta(self, key: str) -> str | None:
         return self._get_meta(self.conn, key)
 
@@ -888,9 +904,16 @@ class SQLiteStore:
         ranked = sorted(scores, key=lambda atom_id: (-scores[atom_id], atom_id))
         return ranked if limit is None else ranked[: max(0, int(limit))]
 
-    def neighbor_atom_ids(self, refs: list[str]) -> list[str]:
+    def neighbor_atom_ids(
+        self, refs: list[str], *, edge_limit: int | None = None
+    ) -> list[str]:
         neighbors: set[str] = set()
-        for edge in self.list_edges_for_refs(refs):
+        edges = (
+            self.list_edges_for_refs(refs)
+            if edge_limit is None
+            else self.list_edges_for_refs(refs, limit=edge_limit)
+        )
+        for edge in edges:
             source = str(edge.get("source_ref") or "")
             target = str(edge.get("target_ref") or "")
             if source:
@@ -1049,19 +1072,40 @@ class SQLiteStore:
                 counts[str(row["target_ref"])] = counts.get(str(row["target_ref"]), 0) + 1
         return counts
 
-    def list_edges_for_refs(self, refs: list[str]) -> list[dict[str, Any]]:
+    def list_edges_for_refs(
+        self,
+        refs: list[str],
+        *,
+        relations: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
         refs = sorted({str(ref) for ref in refs if str(ref)})
         if not refs:
             return []
         placeholders = ",".join("?" for _ in refs)
-        rows = self.conn.execute(
-            f"""
+        query = f"""
             SELECT * FROM amos_edges
             WHERE deleted = 0
               AND (source_ref IN ({placeholders}) OR target_ref IN ({placeholders}))
-            """,
-            tuple(refs + refs),
-        ).fetchall()
+        """
+        params: list[Any] = [*refs, *refs]
+        if relations is not None:
+            normalized_relations = sorted(
+                {str(relation) for relation in relations if str(relation)}
+            )
+            if not normalized_relations:
+                return []
+            query += (
+                " AND relation IN ("
+                + ",".join("?" for _ in normalized_relations)
+                + ")"
+            )
+            params.extend(normalized_relations)
+        query += " ORDER BY edge_id ASC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        rows = self.conn.execute(query, tuple(params)).fetchall()
         return [self._row_dict(row) for row in rows]
 
     def mark_edges_deleted_for_ref(

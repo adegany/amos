@@ -390,6 +390,7 @@ class IndexService:
         attention_policy: Mapping[str, Any],
         eligible_atom_ids: set[str] | None = None,
         limit: int = 512,
+        neighbor_edge_limit: int | None = None,
     ) -> list[str] | None:
         tokens = set(cue_tokens)
         tokens.update(str(token) for token in attention_policy.get("focus_terms", []) or [])
@@ -408,13 +409,17 @@ class IndexService:
         if not direct:
             return []
         candidates = set(direct)
-        neighbors = self.store.neighbor_atom_ids(direct)
+        neighbors = self.store.neighbor_atom_ids(
+            direct, edge_limit=neighbor_edge_limit
+        )
         if eligible_atom_ids is not None:
             neighbors = [ref for ref in neighbors if ref in eligible_atom_ids]
         candidates.update(neighbors)
         # A bounded second hop lets a directly relevant memory activate a
         # short associative chain without turning retrieval into a graph scan.
-        second_hop = self.store.neighbor_atom_ids(neighbors)
+        second_hop = self.store.neighbor_atom_ids(
+            neighbors, edge_limit=neighbor_edge_limit
+        )
         if eligible_atom_ids is not None:
             second_hop = [ref for ref in second_hop if ref in eligible_atom_ids]
         candidates.update(second_hop)

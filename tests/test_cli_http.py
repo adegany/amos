@@ -166,6 +166,153 @@ def test_http_sqlite_lock_returns_retryable_json(tmp_path):
         thread.join(timeout=2)
 
 
+def test_http_reasoning_frame_page_contract_and_stale_revision(tmp_path):
+    db_path = str(tmp_path / "http_reasoning.sqlite3")
+    try:
+        server = AmosHTTPServer(("127.0.0.1", 0), db_path)
+    except PermissionError as exc:
+        pytest.skip(f"loopback sockets unavailable in this sandbox: {exc}")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def post(path, payload, request_id="reasoning-http-test"):
+        request = urllib.request.Request(
+            f"{base}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Request-ID": request_id,
+            },
+            method="POST",
+        )
+        response = urllib.request.urlopen(request, timeout=5)
+        with response:
+            return (
+                json.loads(response.read().decode("utf-8")),
+                response.headers,
+                response.version,
+            )
+
+    try:
+        old = http_json(
+            f"{base}/v1/atoms:commit",
+            {
+                "atom": {
+                    "id": "http_reasoning_old",
+                    "type": "belief",
+                    "payload": {"claim": "HTTP reasoning history " + "old " * 300},
+                }
+            },
+        )["atom"]
+        new = http_json(
+            f"{base}/v1/atoms:commit",
+            {
+                "atom": {
+                    "id": "http_reasoning_new",
+                    "type": "belief",
+                    "payload": {
+                        "claim": "HTTP reasoning history active " + "new " * 300
+                    },
+                    "supersedes": [old["id"]],
+                }
+            },
+        )["atom"]
+        frame, headers, version = post(
+            "/v1/reasoning-frames:compile",
+            {
+                "need": "HTTP reasoning history active",
+                "purpose": "exercise coherent frame transport",
+                "token_or_byte_budget": {"tokens": 800},
+                "run_policy": False,
+            },
+            request_id="frame-req-1",
+        )
+        assert version == 11
+        assert headers["X-Request-ID"] == "frame-req-1"
+        assert frame["status"] == "compiled"
+        descriptor = next(
+            page
+            for page in frame["page_index"]
+            if new["id"] in page["focus_atom_refs"]
+        )
+        page, headers, _version = post(
+            "/v1/reasoning-pages:load",
+            {
+                "frame_id": frame["frame_id"],
+                "revision": frame["revision"],
+                "page": descriptor,
+                "depth": "focused",
+                "run_policy": False,
+            },
+            request_id="page-req-1",
+        )
+        assert headers["X-Request-ID"] == "page-req-1"
+        assert page["status"] == "loaded"
+
+        invalid_requests = [
+            ({"purpose": "missing need", "run_policy": False}, "missing"),
+            (
+                {
+                    "need": "valid",
+                    "purpose": "valid",
+                    "unknown_field": True,
+                    "run_policy": False,
+                },
+                "unknown",
+            ),
+            (
+                {
+                    "need": ["wrong type"],
+                    "purpose": "valid",
+                    "run_policy": False,
+                },
+                "non-empty string",
+            ),
+        ]
+        for payload, expected in invalid_requests:
+            with pytest.raises(urllib.error.HTTPError) as excinfo:
+                post("/v1/reasoning-frames:compile", payload)
+            assert excinfo.value.code == 400
+            error_payload = json.loads(excinfo.value.read().decode("utf-8"))
+            assert error_payload["status"] == "error"
+            assert expected in error_payload["error"]
+
+        http_json(
+            f"{base}/v1/atoms:commit",
+            {
+                "atom": {
+                    "id": "http_reasoning_revision_change",
+                    "type": "belief",
+                    "payload": {"claim": "Revision changed."},
+                }
+            },
+        )
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            post(
+                "/v1/reasoning-pages:load",
+                {
+                    "frame_id": frame["frame_id"],
+                    "revision": frame["revision"],
+                    "page": descriptor,
+                    "run_policy": False,
+                },
+                request_id="stale-req-1",
+            )
+        assert excinfo.value.code == 409
+        assert excinfo.value.headers["X-Request-ID"] == "stale-req-1"
+        stale = json.loads(excinfo.value.read().decode("utf-8"))
+        assert stale["code"] == "stale_revision"
+        assert stale["error_code"] == "stale_frame"
+        assert stale["expected_revision"] == frame["revision"]
+        assert stale["current_revision"] != frame["revision"]
+        assert stale["retryable"] is False
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def http_json(url, payload=None):
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(

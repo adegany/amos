@@ -1,6 +1,6 @@
 ![Amos banner](amos-banner.png)
 
-# Amos
+# AMOS
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
@@ -12,7 +12,7 @@
 provenance, self-models, and deterministic maintenance instead of prompt-only
 memory.**
 
-**Amos** stands for **Agent Memory Operating System**.
+**AMOS** stands for **Agent Memory Operating System**.
 
 Amos is a model-neutral, layered, associative, self-maintaining memory substrate for agentic AI systems. It treats agent memory as an operating-system-like service: capture evidence, maintain typed memory, preserve provenance, perform cleanup, promote and demote memories across tiers, and render task-specific memory packets for reasoners, planners, executors, critics, and future processors.
 
@@ -93,8 +93,8 @@ This repository now includes a dependency-free AMOS v1-local implementation
 alongside the design spec.
 
 The public `Amos` class is a compatibility facade over explicit mutation,
-retrieval, self-view, stewardship, policy, capacity, indexing, graph, and
-diagnostic components. Domain components depend on the store and named
+retrieval, reasoning-frame, self-view, stewardship, policy, capacity, indexing,
+graph, and diagnostic components. Domain components depend on the store and named
 collaborators; they do not call back into the facade.
 
 The first usable deployment profile is an AMOS HTTP service that owns one
@@ -117,6 +117,9 @@ in-process SQLite store and serializes access through the service boundary:
 - Memory packets with scope isolation, access filtering, omissions, conflicts,
   provenance, and degradation metadata; normal retrieval omits superseded atoms
   unless the caller explicitly requests superseded history.
+- Revision-bound reasoning frames and demand-loaded pages that budget coherent
+  decision chains, commitment histories, episodes, conflicts, and governing
+  constraints as units instead of independent atom slots.
 - Attention-aware packet ranking with explicit focus, type-boost,
   counterevidence, and suppression score components plus packet-level
   `attention_trace` diagnostics.
@@ -248,6 +251,39 @@ associative ranking and `POST /v1/packets:retrieve` performs associative recall.
 Both retrieval paths queue a policy tick and return immediately. Explicit
 `POST /v1/memory-policy:run` and the CLI
 `memory-policy --run` command remain synchronous operator paths.
+
+Historical reasoning integrations can call `POST
+/v1/reasoning-frames:compile`, then load a descriptor returned in `page_index`
+through `POST /v1/reasoning-pages:load`. Frames and pages expose a complete
+serialized `token_estimate`, preserve trusted scope and access filtering, and
+bind page descriptors to the exact `graph_version` and journal head. A changed
+revision returns HTTP 409 with `code: "stale_revision"`; the caller recompiles
+instead of combining memory states. Existing packet and exact-atom endpoints
+remain compatible. Application mode selection and rollback stay in the Cogito
+runtime, not in AMOS.
+
+Reasoning-response budget fields use AMOS canonical JSON: compact separators,
+sorted keys, UTF-8 bytes, and JSON escapes for non-ASCII characters. This makes
+`budget.used_bytes` and `token_estimate` independently reproducible even when a
+caller's repository-wide canonical serializer retains literal Unicode.
+The response binds the full trusted request by digest instead of echoing its
+free text and redundant runtime context. Its orientation echo is limited to
+the identifiers and task fields useful for frame inspection.
+
+Frame budgets also derive bounded candidate and graph-traversal work. Reaching
+that allowance is reported as explicit truncation, with visible boundary
+references retained in loadable page descriptors; it is not a fixed atom-count
+output limit. Frame admission uses the same preservation-aware projection
+ladder as page loading before falling back to descriptor-only context. A
+compressed resident keeps its descriptor so the runtime can page in omitted
+detail, and independently coherent descriptors remain eligible while budget
+allows.
+
+The trusted runtime may additionally provide `human_id`, `project_id`, and
+`project_thread_id` (or `conversation_id`) in frame `task_context`. AMOS uses
+only those validated fields for semantic isolation: untagged/global memory
+remains eligible, while atoms explicitly tagged in their scope or payload for a
+different human, project, or thread are excluded from frames and pages.
 
 The stdlib HTTP adapter is the first single-process deployment profile: it owns
 one SQLite store and serializes service calls for correctness. Reader/writer

@@ -138,6 +138,98 @@ active replacement. Use `include_superseded: true` only when the caller needs
 history or audit context; those atoms remain down-ranked so current memories
 stay preferred.
 
+## 4a. Compile And Page Coherent Reasoning Memory
+
+Use a reasoning frame when the task depends on history, governing decisions,
+commitments, conflicts, or how the current state arose:
+
+```http
+POST /v1/reasoning-frames:compile
+X-Request-ID: reasoning-cycle-42
+```
+
+```json
+{
+  "need": "continue the Cogito memory integration",
+  "purpose": "apply prior decisions and active constraints",
+  "depth": "working_frame",
+  "task_context": {
+    "human_id": "human-42",
+    "project_id": "cogito",
+    "project_thread_id": "thread-17",
+    "phase": "implementation"
+  },
+  "scope": {"tenant": "local"},
+  "requester": "agent:cogito",
+  "target_processor": "reasoner",
+  "token_or_byte_budget": {"tokens": 1600}
+}
+```
+
+The response contains complete coherent units plus descriptors for omitted
+deeper units in `page_index`. Its top-level `token_estimate` covers the complete
+serialized response. Budget serialization is compact key-sorted JSON encoded as
+UTF-8 with non-ASCII characters represented by JSON escapes. Callers must use
+those semantics, rather than a repository-local Unicode serializer, when
+reproducing `budget.used_bytes`. Do not add an atom-count limit: AMOS admits a
+full unit when it fits, otherwise tries essential, reference-summary, and
+reference-only projections before leaving the unit out. Every projection
+preserves conclusions, constraints, commitments, conflicts, ordering, and
+source references. A compressed resident remains in `page_index` so omitted
+detail can be loaded; only a complete resident with no deeper continuation
+omits its descriptor. The response `request` contains a digest and compact
+routing/budget metadata rather than another copy of the full need, purpose,
+scope, and task context.
+
+AMOS derives candidate and graph-traversal work from the same byte budget so a
+high-degree or very long connected graph cannot make compilation unbounded.
+When that internal allowance is reached, inspect `truncated`, `unknowns`, and
+`compilation_trace.relationship_truncation_reasons`. Page descriptors retain
+visible boundary references beyond the resident unit; loading the descriptor at
+`supporting` depth retrieves those continuation atoms. This is explicit partial
+knowledge, not silent clipping or a fixed atom-count API.
+
+Keep the frame and its descriptors in trusted runtime state. If the reasoner
+needs deeper detail, resolve its requested page ID locally and send the retained
+descriptor:
+
+```http
+POST /v1/reasoning-pages:load
+X-Request-ID: reasoning-cycle-42-page-1
+```
+
+```json
+{
+  "frame_id": "frame_...",
+  "revision": {"graph_version": 31, "journal_head": "..."},
+  "page": {"descriptor_version": "amos.reasoning.page.v1", "...": "..."},
+  "need": "the decision rationale",
+  "purpose": "verify the active conclusion",
+  "depth": "supporting",
+  "scope": {"project": "cogito"},
+  "requester": "agent:cogito",
+  "target_processor": "reasoner",
+  "token_or_byte_budget": {"tokens": 1200}
+}
+```
+
+Never let model output supply or alter `scope`, requester identity, revision, or
+the descriptor. The semantic identifier fields in `task_context` are likewise
+runtime-owned: do not copy them from model-authored arguments or prose. AMOS
+excludes atoms whose envelope scope or payload explicitly names a different
+human, project, or thread, while retaining untagged/global memories. It binds
+the normalized semantic scope into the descriptor digest and applies semantic,
+scope, and access checks again while loading. An exact revision mismatch is a JSON `409` with
+`code: "stale_revision"`, both revisions, and `retryable: false`; discard the
+active frame and compile a new one. Do not silently append a page from a changed
+graph.
+
+Packet retrieval remains available for existing callers. Choosing between that
+legacy integration and demand-paged reasoning, maintaining the cycle-wide
+working-memory budget, replacing summaries with loaded detail, and rolling back
+application behavior are Cogito responsibilities. AMOS exposes both transport
+paths but does not switch application modes.
+
 ## 5. Use Attention Deliberately
 
 Good attention contexts are compact and operational:

@@ -632,6 +632,16 @@ POST /v1/atoms:get
   visibility checks
   queues a background policy tick when run_policy is true
 
+POST /v1/reasoning-frames:compile
+  accepts need, purpose, depth, task_context, trusted scope and a token/byte budget
+  compiles complete relational units rather than a fixed count of ranked atoms
+  exposes page descriptors for omitted units and compressed residents with deeper detail
+
+POST /v1/reasoning-pages:load
+  accepts one descriptor from the active frame plus its exact revision
+  returns focused or supporting detail while preserving conclusions,
+  constraints, commitments, temporal sequence, conflicts and source references
+
 POST /v1/memory-policy:run
   runs the policy synchronously as an explicit operator/admin action
 ```
@@ -641,6 +651,71 @@ The in-process service API still exposes `run_memory_policy()` and
 CLI use, and embedded deployments
 that intentionally want a synchronous tick. The shared-service contract is that
 connected agents do not own lifecycle maintenance themselves.
+
+### Revision-bound reasoning memory
+
+Reasoning frames and pages are generated views over canonical atoms and edges;
+they are not new atom types and are not durable state. A frame revision is the
+pair `graph_version` plus `journal_head`. Page descriptors contain the frame ID,
+that revision, coherent source/relationship references and a deterministic
+descriptor digest. Page loading requires an exact revision match. If canonical
+memory changed, HTTP returns `409 Conflict` with `code: "stale_revision"`,
+`expected_revision`, `current_revision`, and `retryable: false`. The client must
+recompile the frame and must never merge the stale page with the earlier view.
+
+`scope` is trusted transport input supplied by the runtime, never by model tool
+arguments. Both seed discovery and required relational closure apply scope and
+access visibility before an endpoint can enter a unit or descriptor. The model
+may identify a page ID, need, purpose and depth; the runtime resolves that ID to
+the complete descriptor retained from the active frame.
+
+The runtime may supply top-level `task_context.human_id`, `project_id`, and
+`project_thread_id` or `conversation_id` as additional trusted semantic scope.
+These identifier fields must be non-empty strings; thread aliases must agree,
+and they must not conflict with explicit request scope. Untagged records and
+records tagged `global` remain eligible. Any atom explicitly tagged in its
+envelope scope or payload with a different human, project, or thread is excluded
+as a seed and from mandatory/supporting closure. The normalized semantic scope
+is digest-bound into each page descriptor and applied again during page load.
+Free-form task text and model page requests never create or widen this scope.
+
+The frame budget covers the entire serialized response: structural sections,
+resident units, bounded page descriptors, omissions and provenance. The full
+trusted request determines the frame ID and a response-visible request digest;
+the response does not spend the frame budget echoing the request's free text or
+duplicated runtime context. Orientation echoes only bounded semantic/task
+fields. Units remain coherent while admission proceeds from complete form, to
+essential projection, reference summary, and reference-only form. Every
+compressed form retains active conclusions, governing constraints and
+commitments, causal/temporal sequence, conflicts, supersession and source
+references before peripheral detail is removed, and keeps a descriptor for the
+omitted detail. An omitted unit receives a descriptor only if that descriptor
+also fits. `token_estimate` and `budget.used_bytes` describe the complete JSON
+response rather than only item bodies. They are computed over compact,
+key-sorted JSON encoded as UTF-8 with non-ASCII characters represented by JSON
+escapes; integrations must reproduce that explicit budget encoding instead of
+assuming their local canonical-JSON Unicode policy.
+
+Candidate discovery and relationship traversal also derive internal work
+allowances from the requested byte budget. These are resource-safety bounds,
+not caller-visible atom slots and not a second output quota. If candidate or
+mandatory/supporting traversal reaches its allowance, the frame sets
+`truncated`, records an explicit unknown and trace reason, and digest-binds
+visible boundary atom/edge references into the affected page descriptor so the
+continuation can be loaded. A larger context budget proportionally raises the
+allowance; the API intentionally has no `max_items` control for reasoning
+frames. Page compression proceeds from essential projection, to compact
+reference summaries, to reference-only form while retaining active-conclusion,
+constraint, commitment, conflict, supersession, temporal-sequence, and source
+references.
+
+The packet endpoints remain the v1 compatibility path for associative recall,
+and `/v1/atoms:get` remains the exact-ID path. AMOS does not select a Cogito
+memory mode and does not own application rollback; Cogito chooses its supported
+mode, retains the active working-memory set, enforces total-cycle budgets, and
+can return to its legacy packet integration independently. `X-Request-ID` is
+echoed on JSON responses for cross-service tracing without logging request
+bodies.
 
 Policy scope is interpreted differently for retrieval and service-owned cleanup.
 An empty retrieval scope sees only global/unscoped memory. An empty service-owned

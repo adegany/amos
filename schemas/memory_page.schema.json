@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/memory_page.schema.json",
+  "title": "AMOS ReasoningMemoryPage",
+  "type": "object",
+  "required": [
+    "status", "page_id", "frame_id", "schema_version", "revision",
+    "generated_at", "page_type", "title", "summary", "depth", "units",
+    "sequence", "active_conclusion_refs", "constraint_refs", "conflict_refs",
+    "related_pages", "source_atom_refs", "omissions", "truncated", "token_estimate", "budget",
+    "provenance"
+  ],
+  "properties": {
+    "status": { "const": "loaded" },
+    "page_id": { "type": "string" },
+    "frame_id": { "type": "string" },
+    "schema_version": { "const": "amos.v1" },
+    "revision": { "$ref": "memory_frame.schema.json#/$defs/revision" },
+    "generated_at": { "type": "string" },
+    "page_type": { "type": "string" },
+    "title": { "type": "string" },
+    "summary": { "type": "string" },
+    "depth": { "enum": ["focused", "supporting"] },
+    "need": { "type": ["string", "null"] },
+    "purpose": { "type": ["string", "null"] },
+    "units": { "type": "array", "items": { "$ref": "memory_frame.schema.json#/$defs/coherentUnit" } },
+    "sequence": { "type": "array", "items": { "type": "object" } },
+    "active_conclusion_refs": { "type": "array", "items": { "type": "string" } },
+    "constraint_refs": { "type": "array", "items": { "type": "string" } },
+    "conflict_refs": { "type": "array", "items": { "type": "string" } },
+    "related_pages": { "type": "array", "items": { "type": "string" } },
+    "source_atom_refs": { "type": "array", "items": { "type": "string" } },
+    "omissions": { "type": "array", "items": { "type": "object" } },
+    "truncated": { "type": "boolean" },
+    "token_estimate": { "type": "integer", "minimum": 0 },
+    "budget": { "type": "object" },
+    "provenance": { "type": "object" }
+  },
+  "additionalProperties": true
+}

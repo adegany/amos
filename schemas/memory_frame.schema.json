@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/memory_frame.schema.json",
+  "title": "AMOS ReasoningMemoryFrame",
+  "type": "object",
+  "required": [
+    "status", "frame_id", "schema_version", "revision", "generated_at",
+    "request", "orientation", "units", "sections", "unknowns", "page_index",
+    "source_atom_refs", "omissions", "truncated", "token_estimate", "budget",
+    "compilation_trace", "provenance"
+  ],
+  "properties": {
+    "status": { "const": "compiled" },
+    "frame_id": { "type": "string" },
+    "schema_version": { "const": "amos.v1" },
+    "revision": { "$ref": "#/$defs/revision" },
+    "generated_at": { "type": "string" },
+    "request": { "type": "object" },
+    "orientation": { "type": "object" },
+    "units": { "type": "array", "items": { "$ref": "#/$defs/coherentUnit" } },
+    "sections": { "type": "object" },
+    "current_state": { "type": "array", "items": { "type": "string" } },
+    "decisions": { "type": "array", "items": { "type": "string" } },
+    "constraints": { "type": "array", "items": { "type": "string" } },
+    "commitments": { "type": "array", "items": { "type": "string" } },
+    "relevant_episodes": { "type": "array", "items": { "type": "string" } },
+    "conflicts": { "type": "array", "items": { "type": "string" } },
+    "unknowns": { "type": "array", "items": { "type": "object" } },
+    "page_index": { "type": "array", "items": { "$ref": "#/$defs/pageDescriptor" } },
+    "source_atom_refs": { "type": "array", "items": { "type": "string" } },
+    "omissions": { "type": "array", "items": { "type": "object" } },
+    "truncated": { "type": "boolean" },
+    "token_estimate": { "type": "integer", "minimum": 0 },
+    "budget": { "type": "object" },
+    "compilation_trace": { "type": "object" },
+    "pressure_mode": { "type": "string" },
+    "provenance": { "type": "object" }
+  },
+  "$defs": {
+    "revision": {
+      "type": "object",
+      "required": ["graph_version", "journal_head"],
+      "properties": {
+        "graph_version": { "type": "integer", "minimum": 0 },
+        "journal_head": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "coherentUnit": {
+      "type": "object",
+      "required": [
+        "unit_id", "unit_type", "title", "summary", "relevance_score",
+        "active_conclusion_refs", "constraint_refs", "commitment_refs",
+        "conflict_refs", "source_atom_refs", "relationship_refs", "items",
+        "relationships", "sequence", "inclusion_reasons", "compression", "truncated"
+      ],
+      "properties": {
+        "unit_id": { "type": "string" },
+        "unit_type": { "type": "string" },
+        "title": { "type": "string" },
+        "summary": { "type": "string" },
+        "relevance_score": { "type": "number" },
+        "active_conclusion_refs": { "type": "array", "items": { "type": "string" } },
+        "constraint_refs": { "type": "array", "items": { "type": "string" } },
+        "commitment_refs": { "type": "array", "items": { "type": "string" } },
+        "conflict_refs": { "type": "array", "items": { "type": "string" } },
+        "source_atom_refs": { "type": "array", "items": { "type": "string" } },
+        "relationship_refs": { "type": "array", "items": { "type": "string" } },
+        "items": { "type": "array", "items": { "type": "object" } },
+        "relationships": { "type": "array", "items": { "type": "object" } },
+        "sequence": { "type": "array", "items": { "type": "object" } },
+        "inclusion_reasons": { "type": "object" },
+        "page_id": { "type": ["string", "null"] },
+        "compression": { "type": "object" },
+        "truncated": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "pageDescriptor": {
+      "type": "object",
+      "required": [
+        "descriptor_version", "frame_id", "revision", "semantic_scope", "unit_ref", "page_type",
+        "title", "summary", "relevance", "relevance_score", "time_range",
+        "focus_atom_refs", "source_atom_refs", "relationship_refs",
+        "supported_depths", "related_pages", "descriptor_digest", "page_id"
+      ],
+      "properties": {
+        "descriptor_version": { "const": "amos.reasoning.page.v1" },
+        "frame_id": { "type": "string" },
+        "revision": { "$ref": "#/$defs/revision" },
+        "semantic_scope": {
+          "type": "object",
+          "properties": {
+            "human_id": { "type": "string", "minLength": 1 },
+            "project_id": { "type": "string", "minLength": 1 },
+            "project_thread_id": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        },
+        "unit_ref": { "type": "string" },
+        "page_type": { "type": "string" },
+        "title": { "type": "string" },
+        "summary": { "type": "string" },
+        "relevance": { "type": "string" },
+        "relevance_score": { "type": "number" },
+        "time_range": { "type": "object" },
+        "focus_atom_refs": { "type": "array", "items": { "type": "string" } },
+        "source_atom_refs": { "type": "array", "items": { "type": "string" } },
+        "relationship_refs": { "type": "array", "items": { "type": "string" } },
+        "supported_depths": { "type": "array", "items": { "enum": ["focused", "supporting"] } },
+        "related_pages": { "type": "array", "items": { "type": "string" } },
+        "descriptor_digest": { "type": "string" },
+        "page_id": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}

@@ -1037,6 +1037,7 @@ class RetrievalService:
         cue_tokens: set[str],
         attention_policy: Mapping[str, Any] | None,
         superseded_refs: Mapping[str, Sequence[str]] | None = None,
+        edge_scan_limit: int | None = None,
     ) -> tuple[dict[str, float], dict[str, list[dict[str, Any]]]]:
         eligible_refs: set[str] = set()
         seed_strengths: dict[str, float] = {}
@@ -1077,7 +1078,14 @@ class RetrievalService:
         atoms_by_ref = {str(atom.get("id") or ""): atom for atom in atoms}
         edges = []
         degree: dict[str, int] = {}
-        for edge in self.store.list_edges_for_refs(sorted(eligible_refs)):
+        scoped_edges = (
+            self.store.list_edges_for_refs(sorted(eligible_refs))
+            if edge_scan_limit is None
+            else self.store.list_edges_for_refs(
+                sorted(eligible_refs), limit=edge_scan_limit
+            )
+        )
+        for edge in scoped_edges:
             source = str(edge.get("source_ref") or "")
             target = str(edge.get("target_ref") or "")
             if source not in eligible_refs or target not in eligible_refs:
