@@ -58,8 +58,10 @@ role, purpose, personality, biography, capabilities, or limitations.
 Prior LM output is fallible generated expression, not canonical memory or
 independent evidence about the Mirror Agent. Any LM-suggested memory or
 self-model update must be stored as a provenance-bearing, evidence-linked
-proposal and may become active only through the authorized AMOS validation and
-lifecycle path. Changing LM providers or models must not change
+proposal and may become active only through an identity-authored adjudication
+and AMOS's guarded self-ratification path. The LM may contribute arguments; it
+cannot ratify on behalf of the Mirror Agent. Changing LM providers or models
+must not change
 `ent:agent:mirror`, its lineage, or its established self-model.
 
 ## Demonstrated Questions

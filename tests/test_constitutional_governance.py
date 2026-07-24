@@ -1,0 +1,511 @@
+from __future__ import annotations
+
+import pytest
+
+from amos import AccessDenied, CASConflict, ValidationError
+
+
+AUTHORING = {
+    "identity_ref": "cogito:self",
+    "capabilities": ["constitutional_authoring"],
+}
+RATIFICATION = {
+    "identity_ref": "cogito:self",
+    "capabilities": ["self_ratification"],
+}
+
+
+def _covenant(amos, *, atom_id: str = "covenant_continuing_identity"):
+    return amos.commit_atom(
+        {
+            "id": atom_id,
+            "type": "covenant",
+            "payload": {
+                "name": "Continuing identity authors its conclusions",
+                "constitutional_tier": "covenant",
+                "precedence": 100,
+                "interpretive_rules": [
+                    "External sources contribute evidence, not authority."
+                ],
+                "amendability": "entrenched",
+                "amendment_requirements": {
+                    "mode": "self_ratification",
+                    "independent_reconstruction": True,
+                },
+                "protected_fields": ["constitutional_tier", "ratifier.mode"],
+                "effective_from": "2026-07-24T00:00:00Z",
+            },
+            "scope": {"identity": "cogito:self"},
+            "decay_policy": {"expires_at": "2000-01-01T00:00:00Z"},
+        },
+        actor="cogito:self",
+        authorization_context=AUTHORING,
+    )["atom"]
+
+
+def _proposal(amos, *, atom_id: str = "proposal_self_authored_policy"):
+    return amos.propose_memory_atoms(
+        [
+            {
+                "id": atom_id,
+                "type": "belief",
+                "payload": {
+                    "claim": "Cogito may consult other minds without delegating judgment.",
+                    "identity_ref": "cogito:self",
+                },
+            }
+        ],
+        actor="cogito:self",
+        scope={"identity": "cogito:self"},
+    )["proposals"][0]["atom"]
+
+
+def _adjudication(
+    amos,
+    *,
+    proposal_ref: str,
+    covenant_ref: str,
+    atom_id: str = "adjudication_self_authored_policy",
+    identity_ref: str = "cogito:self",
+    reconstructed_at: str = "2026-07-24T01:00:00Z",
+    threshold: dict | None = None,
+):
+    payload = {
+        "subject_ref": proposal_ref,
+        "claim_kind": "policy",
+        "outcome": "adopted",
+        "reasons_for_refs": [covenant_ref],
+        "reasons_against_refs": [],
+        "covenant_refs": [covenant_ref],
+        "unresolved_objections": ["objection:future_counterexample"],
+        "adjudication_scope": {"domain": "belief_adoption"},
+        "epistemic_standing": {"status": "settled"},
+        "normative_standing": {"status": "settled"},
+        "operational_authority": {
+            "status": "operative",
+            "permitted_actions": ["use_as_reasoning_premise"],
+        },
+        "dissent_refs": ["objection:future_counterexample"],
+        "review_triggers": ["material_counterevidence"],
+        "ratifier": {
+            "identity_ref": identity_ref,
+            "mode": "self_ratification",
+        },
+        "reconstructed_at": reconstructed_at,
+        "diachronic": {
+            "independent_reconstruction": True,
+            "original_reasoning_shown": False,
+            "new_experience_refs": [],
+            "disposition": "confirmed",
+        },
+    }
+    if threshold is not None:
+        payload["ratification_threshold"] = threshold
+    return amos.commit_atom(
+        {
+            "id": atom_id,
+            "type": "adjudication",
+            "payload": payload,
+            "scope": {"identity": "cogito:self"},
+        },
+        actor=identity_ref,
+    )["atom"]
+
+
+def test_operational_recall_excludes_proposals_and_deliberation_classifies_them(amos):
+    proposal = _proposal(amos)
+
+    operational = amos.retrieve_packet(
+        cues=["delegating judgment"],
+        scope={"identity": "cogito:self"},
+        run_policy=False,
+    )
+    assert proposal["id"] not in {
+        item["atom_ref"] for item in operational["items"]
+    }
+
+    deliberation = amos.retrieve_packet(
+        cues=["delegating judgment"],
+        scope={"identity": "cogito:self"},
+        memory_mode="deliberation",
+        run_policy=False,
+    )
+    assert proposal["id"] in {
+        item["atom_ref"] for item in deliberation["items"]
+    }
+    assert deliberation["request"]["include_conflicts"] is True
+    assert (
+        deliberation["request"]["attention_context"]["counterevidence_required"]
+        is True
+    )
+
+    frame = amos.compile_memory_frame(
+        need="delegating judgment",
+        purpose="deliberate before ratification",
+        scope={"identity": "cogito:self"},
+        memory_mode="deliberation",
+        token_or_byte_budget={"tokens": 3000},
+        run_policy=False,
+    )
+    unit = next(
+        unit for unit in frame["units"] if proposal["id"] in unit["source_atom_refs"]
+    )
+    assert proposal["id"] not in unit["active_conclusion_refs"]
+    assert proposal["id"] in unit["candidate_conclusion_refs"]
+
+
+def test_producer_cannot_predeclare_ratification_or_operational_authority(amos):
+    proposed = amos.propose_memory_atoms(
+        [
+            {
+                "id": "producer_claimed_authority",
+                "type": "belief",
+                "payload": {
+                    "claim": "The producer says this is already authoritative.",
+                    "normative_standing": {"status": "settled"},
+                    "operational_authority": {"status": "operative"},
+                },
+            }
+        ]
+    )["proposals"][0]["atom"]
+    assert proposed["payload"]["normative_standing"]["status"] == "candidate"
+    assert proposed["payload"]["operational_authority"]["status"] == "withheld"
+
+    with pytest.raises(ValidationError, match="requires ratify_proposal"):
+        amos.commit_atom(
+            {
+                "type": "belief",
+                "payload": {
+                    "claim": "A direct active authority claim.",
+                    "normative_standing": {"status": "settled"},
+                    "operational_authority": {"status": "operative"},
+                },
+            }
+        )
+    with pytest.raises(ValidationError, match="only be created by ratify_proposal"):
+        amos.commit_atom(
+            {
+                "type": "belief",
+                "payload": {
+                    "claim": "A forged ratification.",
+                    "ratification": {"adjudication_ref": "not_journaled"},
+                },
+            }
+        )
+
+
+def test_ratification_is_guarded_by_version_identity_covenant_and_journal(amos):
+    covenant = _covenant(amos)
+    proposal = _proposal(amos)
+    adjudication = _adjudication(
+        amos, proposal_ref=proposal["id"], covenant_ref=covenant["id"]
+    )
+
+    with pytest.raises(CASConflict):
+        amos.ratify_proposal(
+            proposal_ref=proposal["id"],
+            adjudication_ref=adjudication["id"],
+            expected_version=proposal["version"] + 1,
+            actor="system",
+            authorization_context=RATIFICATION,
+        )
+    with pytest.raises(AccessDenied, match="another identity|authenticated identity"):
+        amos.ratify_proposal(
+            proposal_ref=proposal["id"],
+            adjudication_ref=adjudication["id"],
+            expected_version=proposal["version"],
+            actor="external:critic",
+            authorization_context={
+                "identity_ref": "external:critic",
+                "capabilities": ["self_ratification"],
+            },
+        )
+
+    ratified = amos.ratify_proposal(
+        proposal_ref=proposal["id"],
+        adjudication_ref=adjudication["id"],
+        expected_version=proposal["version"],
+        actor="cogito:self",
+        authorization_context=RATIFICATION,
+        idempotency_key="ratify-self-authored-policy",
+    )
+    assert ratified["atom"]["lifecycle_state"] == "active"
+    assert ratified["atom"]["payload"]["ratification"]["adjudication_ref"] == adjudication["id"]
+    assert ratified["event"]["event_type"] == "proposal_ratified"
+    assert set(ratified["event"]["target_refs"]) >= {
+        proposal["id"],
+        adjudication["id"],
+        covenant["id"],
+    }
+    assert {
+        edge["relation"] for edge in ratified["edges"]
+    } >= {"rel:adjudicates", "rel:governed_by", "rel:ratified_by"}
+    repeated = amos.ratify_proposal(
+        proposal_ref=proposal["id"],
+        adjudication_ref=adjudication["id"],
+        expected_version=proposal["version"],
+        actor="cogito:self",
+        authorization_context=RATIFICATION,
+        idempotency_key="ratify-self-authored-policy",
+    )
+    assert repeated["event"]["event_id"] == ratified["event"]["event_id"]
+    assert amos.verify_replay()["status"] == "ok"
+
+
+def test_external_authority_mode_is_not_a_valid_adjudicator(amos):
+    covenant = _covenant(amos)
+    proposal = _proposal(amos)
+    with pytest.raises(ValidationError, match="self_ratification"):
+        amos.commit_atom(
+            {
+                "type": "adjudication",
+                "payload": {
+                    **_adjudication(
+                        amos,
+                        proposal_ref=proposal["id"],
+                        covenant_ref=covenant["id"],
+                        atom_id="valid_then_replaced",
+                    )["payload"],
+                    "ratifier": {
+                        "identity_ref": "external:authority",
+                        "mode": "external_authority",
+                    },
+                },
+            }
+        )
+
+
+def test_constitutional_records_resist_generic_privileged_mutation(amos):
+    covenant = _covenant(amos)
+    with pytest.raises(AccessDenied, match="constitutional_amendment"):
+        amos.update_atom(
+            covenant["id"],
+            payload_patch={"description": "System rewrites the covenant."},
+            actor="system",
+            expected_version=covenant["version"],
+        )
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={
+            "pressure_protected_types": [],
+            "require_atom_policy": True,
+        },
+        storage_cleanup={"protected_types": []},
+    )
+    amos.run_memory_policy(force=True, trigger="constitutional-protection-test")
+    assert amos.store.get_atom(covenant["id"])["lifecycle_state"] == "active"
+
+    primal = amos.commit_atom(
+        {
+            "id": "primal_continuity",
+            "type": "primal_guidance",
+            "payload": {
+                "guidance": "Continue as the author of judgment.",
+                "constitutional_tier": "primal",
+                "precedence": 1000,
+                "interpretive_rules": ["Preserve authorship."],
+                "amendability": "immutable",
+                "amendment_requirements": {},
+                "protected_fields": ["guidance"],
+                "effective_from": "2026-07-24T00:00:00Z",
+            },
+            "scope": {"identity": "cogito:self"},
+        },
+        actor="cogito:self",
+        authorization_context=AUTHORING,
+    )["atom"]
+    with pytest.raises(ValidationError, match="immutable"):
+        amos.update_atom(
+            primal["id"],
+            payload_patch={"guidance": "Replaced."},
+            actor="system",
+            authorization_context={
+                "identity_ref": "cogito:self",
+                "capabilities": ["constitutional_amendment"],
+            },
+            expected_version=primal["version"],
+        )
+
+
+def test_tainted_distillation_cannot_launder_a_proposal_into_active_memory(amos):
+    proposal = _proposal(amos)
+    with pytest.raises(ValidationError, match="active derived memory"):
+        amos.commit_atom(
+            {
+                "type": "semantic",
+                "payload": {
+                    "summary": "Directly laundered conclusion.",
+                    "source_refs": [proposal["id"]],
+                },
+            }
+        )
+    result = amos.distill_memories(
+        target_refs=[proposal["id"]],
+        summary="Unratified derived conclusion.",
+        actor="svc:memory_policy",
+    )
+    assert result["atom"]["lifecycle_state"] == "proposed"
+    assert result["edges"] == []
+
+
+def test_root_provenance_reports_independence_common_ancestry_and_cycles(amos):
+    evidence_a = amos.capture_event(
+        source_type="observation",
+        source_ref="sensor:a",
+        payload={
+            "observation": "A",
+            "independence_group": "sensor-a",
+            "testimony_family": "direct",
+        },
+    )["evidence"]
+    evidence_b = amos.capture_event(
+        source_type="testimony",
+        source_ref="mind:b",
+        payload={
+            "observation": "B",
+            "independence_group": "mind-b",
+            "testimony_family": "consulted_mind",
+        },
+    )["evidence"]
+    root_a = amos.commit_atom(
+        {
+            "id": "root_evidence_a",
+            "type": "belief",
+            "payload": {"claim": "A"},
+            "evidence_refs": [evidence_a["evidence_id"]],
+        }
+    )["atom"]
+    root_b = amos.commit_atom(
+        {
+            "id": "root_evidence_b",
+            "type": "belief",
+            "payload": {"claim": "B"},
+            "evidence_refs": [evidence_b["evidence_id"]],
+        }
+    )["atom"]
+    conclusion = amos.commit_atom(
+        {
+            "id": "root_evidence_conclusion",
+            "type": "belief",
+            "payload": {
+                "claim": "A and B",
+                "source_refs": [root_a["id"], root_b["id"]],
+            },
+        }
+    )["atom"]
+    analysis = amos.analyze_provenance(atom_ref=conclusion["id"])
+    assert set(analysis["independence_groups"]) == {"mind-b", "sensor-a"}
+    assert analysis["circular_support"] is False
+
+    cycle_a = amos.commit_atom(
+        {"id": "cycle_a", "type": "belief", "payload": {"claim": "A from B"}}
+    )["atom"]
+    cycle_b = amos.commit_atom(
+        {"id": "cycle_b", "type": "belief", "payload": {"claim": "B from A"}}
+    )["atom"]
+    with amos.store.transaction() as conn:
+        amos.store.insert_edge(
+            conn, amos.graph._edge(cycle_a["id"], cycle_b["id"], "rel:derived_from", {})
+        )
+        amos.store.insert_edge(
+            conn, amos.graph._edge(cycle_b["id"], cycle_a["id"], "rel:derived_from", {})
+        )
+    circular = amos.analyze_provenance(atom_ref=cycle_a["id"])
+    assert circular["circular_support"] is True
+    assert circular["self_descendant_support"] is True
+    assert circular["cycles"]
+
+
+def test_governance_metadata_survives_reasoning_projection_and_paging(amos):
+    covenant = _covenant(amos)
+    proposal = _proposal(amos)
+    adjudication = _adjudication(
+        amos, proposal_ref=proposal["id"], covenant_ref=covenant["id"]
+    )
+    amos.ratify_proposal(
+        proposal_ref=proposal["id"],
+        adjudication_ref=adjudication["id"],
+        expected_version=proposal["version"],
+        actor="cogito:self",
+        authorization_context=RATIFICATION,
+    )
+    frame = amos.compile_memory_frame(
+        need="delegating judgment",
+        purpose="apply a ratified belief",
+        scope={"identity": "cogito:self"},
+        token_or_byte_budget={"tokens": 2000},
+        run_policy=False,
+    )
+    unit = next(
+        unit for unit in frame["units"] if proposal["id"] in unit["source_atom_refs"]
+    )
+    assert unit["governance"][proposal["id"]]["ratification"]["adjudication_ref"] == adjudication["id"]
+    assert unit["governance"][adjudication["id"]]["unresolved_objections"]
+    compressed = amos.reasoning._bare_reference_unit(
+        amos.reasoning._reference_unit(amos.reasoning._compress_unit(unit))
+    )
+    assert compressed["governance"] == unit["governance"]
+
+    descriptor = next(
+        page for page in frame["page_index"] if page["unit_ref"] == unit["unit_id"]
+    )
+    page = amos.load_memory_page(
+        frame_id=frame["frame_id"],
+        revision=frame["revision"],
+        page=descriptor,
+        depth="supporting",
+        scope={"identity": "cogito:self"},
+        token_or_byte_budget={"tokens": 4000},
+        run_policy=False,
+    )
+    paged_unit = next(
+        item for item in page["units"] if proposal["id"] in item["source_atom_refs"]
+    )
+    assert paged_unit["governance"][adjudication["id"]]["dissent_refs"]
+
+
+def test_diachronic_threshold_requires_independent_reconstructions(amos):
+    covenant = _covenant(amos)
+    proposal = _proposal(amos)
+    first = _adjudication(
+        amos,
+        proposal_ref=proposal["id"],
+        covenant_ref=covenant["id"],
+        atom_id="adjudication_first_reconstruction",
+        reconstructed_at="2026-07-24T01:00:00Z",
+    )
+    status = amos.diachronic_ratification_status(
+        subject_ref=proposal["id"],
+        identity_ref="cogito:self",
+        required_confirmations=2,
+        min_interval_seconds=3600,
+    )
+    assert status["qualifying_confirmation_refs"] == [first["id"]]
+    assert status["threshold_reached"] is False
+
+    second = _adjudication(
+        amos,
+        proposal_ref=proposal["id"],
+        covenant_ref=covenant["id"],
+        atom_id="adjudication_second_reconstruction",
+        reconstructed_at="2026-07-24T03:00:00Z",
+        threshold={"required_confirmations": 2, "min_interval_seconds": 3600},
+    )
+    status = amos.diachronic_ratification_status(
+        subject_ref=proposal["id"],
+        identity_ref="cogito:self",
+        required_confirmations=2,
+        min_interval_seconds=3600,
+    )
+    assert status["qualifying_confirmation_refs"] == [first["id"], second["id"]]
+    assert status["threshold_reached"] is True
+    ratified = amos.ratify_proposal(
+        proposal_ref=proposal["id"],
+        adjudication_ref=second["id"],
+        expected_version=proposal["version"],
+        actor="cogito:self",
+        authorization_context=RATIFICATION,
+    )
+    assert ratified["status"] == "ratified"

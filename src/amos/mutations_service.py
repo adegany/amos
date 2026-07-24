@@ -6,12 +6,15 @@ from ._service_support import (
     Mapping,
     Sequence,
     ValidationError,
+    _structured_ref_list,
     digest,
     normalize_atom,
     normalize_evidence,
     stable_id,
     utc_now,
 )
+from .governance_service import GovernanceService
+from .schemas import CONSTITUTIONAL_ATOM_TYPES, GOVERNANCE_PAYLOAD_FIELDS
 
 
 class MutationService:
@@ -27,6 +30,59 @@ class MutationService:
         self._memory_identity_digest = graph._memory_identity_digest
         self._atom_projection = graph._atom_projection
         self._edge = graph._edge
+
+    def _assert_direct_commit_governance_safe(
+        self, atom: Mapping[str, Any]
+    ) -> None:
+        payload = atom.get("payload") or {}
+        if "ratification" in payload:
+            raise ValidationError(
+                "ratification metadata can only be created by ratify_proposal"
+            )
+        if atom.get("type") in {
+            *CONSTITUTIONAL_ATOM_TYPES,
+            "adjudication",
+        }:
+            return
+        if atom.get("lifecycle_state") != "active":
+            return
+        source_refs = {
+            str(ref)
+            for field in ("source_refs", "maintenance_source_refs")
+            for ref in _structured_ref_list(payload.get(field))
+            if str(ref)
+        }
+        for source_ref in source_refs:
+            source = self.store.get_atom(source_ref)
+            if source is None:
+                continue
+            source_payload = source.get("payload") or {}
+            if (
+                source.get("lifecycle_state") != "active"
+                or source.get("health_status") == "contradicted"
+                or any(
+                    str((source_payload.get(field) or {}).get("status") or "")
+                    in {"candidate", "contested", "none", "rejected", "withheld"}
+                    for field in (
+                        "epistemic_standing",
+                        "normative_standing",
+                        "operational_authority",
+                    )
+                )
+            ):
+                raise ValidationError(
+                    "active derived memory cannot use proposed, contested, or "
+                    f"unratified source atom: {source_ref}"
+                )
+        if any(
+            str((payload.get(field) or {}).get("status") or "")
+            in {"operative", "settled"}
+            for field in ("normative_standing", "operational_authority")
+        ):
+            raise ValidationError(
+                "active normative standing or operational authority requires "
+                "ratify_proposal"
+            )
 
     def capture_event(
         self,
@@ -89,6 +145,12 @@ class MutationService:
         self._mark_foreground_activity(actor)
         request_payload = {"operation": "commit_atom", "atom": dict(atom)}
         normalized = self._prepare_committed_atom(atom)
+        self._assert_direct_commit_governance_safe(normalized)
+        GovernanceService.assert_constitutional_capability(
+            str(normalized["type"]),
+            authorization_context,
+            operation="create",
+        )
         with self.store.transaction() as conn:
             prior = self._idempotency_hit(conn, actor, idempotency_key, request_payload)
             if prior is not None:
@@ -146,6 +208,23 @@ class MutationService:
         proposals = []
         for candidate in candidates:
             atom = dict(candidate)
+            payload = dict(atom.get("payload") or {})
+            payload["epistemic_standing"] = {
+                "status": "candidate",
+                "basis": "unratified_proposal",
+            }
+            payload["normative_standing"] = {
+                "status": "candidate",
+                "basis": "unratified_proposal",
+            }
+            payload["operational_authority"] = (
+                {
+                    "status": "withheld",
+                    "permitted_actions": [],
+                    "basis": "unratified_proposal",
+                }
+            )
+            atom["payload"] = payload
             if scope is not None:
                 atom.setdefault("scope", dict(scope))
             atom["lifecycle_state"] = "proposed"
@@ -163,9 +242,15 @@ class MutationService:
         atoms: Sequence[Mapping[str, Any]],
         *,
         actor: str = "system",
+        authorization_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         self._mark_foreground_activity(actor)
         prepared = [self._prepare_committed_atom(atom) for atom in atoms]
+        for atom in prepared:
+            self._assert_direct_commit_governance_safe(atom)
+            GovernanceService.assert_constitutional_capability(
+                str(atom["type"]), authorization_context, operation="create"
+            )
         seen_ids: set[str] = set()
         for atom in prepared:
             if atom["id"] in seen_ids:
@@ -197,6 +282,7 @@ class MutationService:
                     payload=op_payload,
                     target_refs=[normalized["id"]],
                     evidence_refs=normalized["evidence_refs"],
+                    authorization_context=authorization_context,
                 )
                 self.store.insert_atom(conn, normalized)
                 for edge in projected_edges:
@@ -247,6 +333,39 @@ class MutationService:
             self._assert_mutation_allowed(
                 current, actor=actor, authorization_context=authorization_context
             )
+            GovernanceService.assert_constitutional_capability(
+                str(current["type"]),
+                authorization_context,
+                operation="amend",
+            )
+            requested_set_fields = dict(set_fields or {})
+            if (
+                current.get("lifecycle_state") == "proposed"
+                and requested_set_fields.get("lifecycle_state") == "active"
+            ):
+                raise ValidationError(
+                    "proposed atoms can only become active through ratify_proposal"
+                )
+            payload_changes = set(dict(payload_patch or {}))
+            replacement_payload = requested_set_fields.get("payload")
+            if isinstance(replacement_payload, Mapping):
+                current_payload = dict(current.get("payload") or {})
+                payload_changes.update(
+                    key
+                    for key in set(current_payload) | set(replacement_payload)
+                    if current_payload.get(key) != replacement_payload.get(key)
+                )
+            GovernanceService.assert_constitutional_amendment_policy(
+                current,
+                authorization_context,
+                changed_payload_fields=payload_changes,
+            )
+            protected_changes = sorted(payload_changes.intersection(GOVERNANCE_PAYLOAD_FIELDS))
+            if protected_changes:
+                raise ValidationError(
+                    "governance standing can only change through a guarded "
+                    "governance transition: " + ", ".join(protected_changes)
+                )
             if expected_version is not None and current["version"] != expected_version:
                 raise CASConflict(
                     f"expected {atom_id} version {expected_version}, "
@@ -383,6 +502,16 @@ class MutationService:
             self._assert_mutation_allowed(
                 current, actor=actor, authorization_context=authorization_context
             )
+            GovernanceService.assert_constitutional_capability(
+                str(current["type"]),
+                authorization_context,
+                operation="amend",
+            )
+            GovernanceService.assert_constitutional_amendment_policy(
+                current,
+                authorization_context,
+                changed_payload_fields={"$delete"},
+            )
             if expected_version is not None and current["version"] != expected_version:
                 raise CASConflict(
                     f"expected {atom_id} version {expected_version}, "
@@ -506,6 +635,21 @@ class MutationService:
                         "approved_by": approved_by,
                     },
                 )
+                if (
+                    atom.get("type") in {
+                        *CONSTITUTIONAL_ATOM_TYPES,
+                        "adjudication",
+                    }
+                    or atom.get("lifecycle_state") != "active"
+                    or (atom.get("payload") or {})
+                    .get("normative_standing", {})
+                    .get("status")
+                    in {"candidate", "contested", "withheld"}
+                ):
+                    raise ValidationError(
+                        "constitutional, adjudication, proposed, or contested "
+                        "atoms cannot be merged through the generic merge path"
+                    )
                 sources.append(atom)
             now = utc_now()
             merged = normalize_atom(
@@ -618,7 +762,36 @@ class MutationService:
                 atom = self.store.get_atom(ref)
                 if atom is None or atom.get("deleted"):
                     raise ValidationError(f"unknown source atom: {ref}")
+                if atom.get("type") in {
+                    *CONSTITUTIONAL_ATOM_TYPES,
+                    "adjudication",
+                }:
+                    raise ValidationError(
+                        "constitutional and adjudication atoms cannot be distilled"
+                    )
                 source_atoms.append(atom)
+            tainted_sources = [
+                atom
+                for atom in source_atoms
+                if atom.get("lifecycle_state") != "active"
+                or atom.get("health_status") == "contradicted"
+                or any(
+                    str(
+                        ((atom.get("payload") or {}).get(field) or {}).get("status")
+                        or ""
+                    )
+                    in {"candidate", "contested", "none", "rejected", "withheld"}
+                    for field in (
+                        "epistemic_standing",
+                        "normative_standing",
+                        "operational_authority",
+                    )
+                )
+            ]
+            if tainted_sources and archive_sources:
+                raise ValidationError(
+                    "tainted sources cannot be archived through distillation"
+                )
             now = utc_now()
             source_digests = [digest(self._atom_projection(atom)) for atom in source_atoms]
             distilled = normalize_atom(
@@ -630,6 +803,25 @@ class MutationService:
                         "source_refs": list(target_refs),
                         "source_digests": source_digests,
                         "created_by": actor,
+                        **(
+                            {
+                                "epistemic_standing": {
+                                    "status": "candidate",
+                                    "basis": "tainted_source",
+                                },
+                                "normative_standing": {
+                                    "status": "candidate",
+                                    "basis": "tainted_source",
+                                },
+                                "operational_authority": {
+                                    "status": "withheld",
+                                    "permitted_actions": [],
+                                    "basis": "tainted_source",
+                                },
+                            }
+                            if tainted_sources
+                            else {}
+                        ),
                     },
                     "scope": dict(scope or {}),
                     "layer": "consolidated_long_term",
@@ -638,6 +830,9 @@ class MutationService:
                     "salience": 0.8,
                     "utility": 0.85,
                     "confidence": {"level": "medium-high", "score": 0.75},
+                    "lifecycle_state": (
+                        "proposed" if tainted_sources else "active"
+                    ),
                 }
             )
             distilled["id"] = stable_id(
@@ -658,15 +853,19 @@ class MutationService:
             distilled = normalize_atom(
                 self._attach_search_index(distilled), require_id=True
             )
-            edges = [
-                self._edge(
-                    distilled["id"],
-                    source["id"],
-                    "rel:derived_from",
-                    dict(scope or {}),
-                )
-                for source in source_atoms
-            ]
+            edges = (
+                [
+                    self._edge(
+                        distilled["id"],
+                        source["id"],
+                        "rel:derived_from",
+                        dict(scope or {}),
+                    )
+                    for source in source_atoms
+                ]
+                if distilled["lifecycle_state"] == "active"
+                else []
+            )
             event = self.store.append_event(
                 conn,
                 event_type="memories_distilled",

@@ -5,8 +5,9 @@
   "type": "object",
   "required": [
     "status", "page_id", "frame_id", "schema_version", "revision",
-    "generated_at", "page_type", "title", "summary", "depth", "units",
-    "sequence", "active_conclusion_refs", "constraint_refs", "conflict_refs",
+    "generated_at", "page_type", "title", "summary", "depth", "memory_mode", "units",
+    "sequence", "active_conclusion_refs",
+    "constraint_refs", "conflict_refs",
     "related_pages", "source_atom_refs", "omissions", "truncated", "token_estimate", "budget",
     "provenance"
   ],
@@ -23,6 +24,9 @@
     "depth": { "enum": ["focused", "supporting"] },
     "need": { "type": ["string", "null"] },
     "purpose": { "type": ["string", "null"] },
+    "memory_mode": {
+      "enum": ["operational_recall", "deliberation", "historical_review"]
+    },
     "units": { "type": "array", "items": { "$ref": "memory_frame.schema.json#/$defs/coherentUnit" } },
     "sequence": { "type": "array", "items": { "type": "object" } },
     "active_conclusion_refs": { "type": "array", "items": { "type": "string" } },

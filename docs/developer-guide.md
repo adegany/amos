@@ -100,6 +100,50 @@ POST /v1/atoms:commit
 This keeps later explanations auditable. Atoms should cite `evidence_refs` when
 the caller has evidence IDs available.
 
+## 3a. Adopt Proposals Through Self-Ratification
+
+Do not turn an external answer, another LLM's judgment, or an operator approval
+into the authority for an identity's belief or policy. Store those contributions
+as evidence or reasons. The continuing identity authors the conclusion.
+
+Create active `covenant` and, where applicable, `primal_guidance` atoms through
+the `constitutional_authoring` capability. Store a candidate with
+`/v1/atoms:propose`, then commit an `adjudication` whose payload records the
+proposal, reasons for and against, constitutional references, objections,
+dissent, review triggers, three-axis standing, and reconstruction metadata.
+The ratifier must be
+`{"identity_ref": "...", "mode": "self_ratification"}`.
+
+Finally call:
+
+```http
+POST /v1/proposals:ratify
+```
+
+```json
+{
+  "proposal_ref": "atom_candidate",
+  "adjudication_ref": "atom_adjudication",
+  "expected_version": 1,
+  "actor": "agent:cogito",
+  "authorization_context": {
+    "identity_ref": "agent:cogito",
+    "capabilities": ["self_ratification"]
+  },
+  "idempotency_key": "cogito:ratify:atom_candidate:v1"
+}
+```
+
+AMOS validates self-authorship, scope, standing and compare-and-swap, projects
+`rel:ratified_by`, `rel:adjudicates`, and `rel:governed_by`, and journals both
+records. A normal update cannot substitute for this endpoint.
+
+Constitutional amendments are separate from ratification. Amendable records
+require `constitutional_amendment`; entrenched records also require
+`constitutional_entrenched_amendment`, and protected fields require
+`constitutional_protected_field_amendment`. Immutable primal guidance cannot be
+rewritten or deleted.
+
 ## 4. Retrieve Packets For The Current Role
 
 Agents should not fetch one generic memory blob and paste it into every prompt.
@@ -113,6 +157,7 @@ POST /v1/packets:retrieve
 {
   "requester": "agent:pilot",
   "target_processor": "planner",
+  "memory_mode": "operational_recall",
   "scope": {"project": "qandl", "mission": "performance_search"},
   "cues": ["chunk 7", "exploration floor", "candidate diversity"],
   "profile": "planner",
@@ -138,6 +183,11 @@ active replacement. Use `include_superseded: true` only when the caller needs
 history or audit context; those atoms remain down-ranked so current memories
 stay preferred.
 
+Use `deliberation` when the reasoner must consider proposals; AMOS then forces
+conflict inclusion and counterevidence. Use `historical_review` for archived,
+superseded, rejected, and proposed history. Never use either as an operational
+premise set without applying the returned conclusion-standing classifications.
+
 ## 4a. Compile And Page Coherent Reasoning Memory
 
 Use a reasoning frame when the task depends on history, governing decisions,
@@ -162,6 +212,7 @@ X-Request-ID: reasoning-cycle-42
   "scope": {"tenant": "local"},
   "requester": "agent:cogito",
   "target_processor": "reasoner",
+  "memory_mode": "operational_recall",
   "token_or_byte_budget": {"tokens": 1600}
 }
 ```
@@ -174,7 +225,8 @@ those semantics, rather than a repository-local Unicode serializer, when
 reproducing `budget.used_bytes`. Do not add an atom-count limit: AMOS admits a
 full unit when it fits, otherwise tries essential, reference-summary, and
 reference-only projections before leaving the unit out. Every projection
-preserves conclusions, constraints, commitments, conflicts, ordering, and
+preserves active, candidate, contested and rejected/superseded conclusions,
+constitutional governance metadata, constraints, commitments, conflicts, ordering, and
 source references. A compressed resident remains in `page_index` so omitted
 detail can be loaded; only a complete resident with no deeper continuation
 omits its descriptor. The response `request` contains a digest and compact

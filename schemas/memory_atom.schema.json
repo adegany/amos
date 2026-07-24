@@ -12,15 +12,18 @@
       "type": "string",
       "enum": [
         "action_outcome",
+        "adjudication",
         "agentic_trace",
         "belief",
         "capability",
         "commitment",
+        "covenant",
         "episode",
         "goal",
         "limitation",
         "policy",
         "preference",
+        "primal_guidance",
         "procedure",
         "runtime_state",
         "self_assessment",
@@ -102,5 +105,37 @@
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "adjudication" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "constitutional_governance.schema.json#/$defs/Adjudication"
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "covenant" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "constitutional_governance.schema.json#/$defs/Covenant"
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "primal_guidance" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "constitutional_governance.schema.json#/$defs/PrimalGuidance"
+          }
+        }
+      }
+    }
+  ]
 }

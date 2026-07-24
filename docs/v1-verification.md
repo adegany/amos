@@ -16,9 +16,10 @@ Status terms:
 
 | Area | Implementation | Primary tests |
 | --- | --- | --- |
-| Public API composition | `src/amos/service.py` thin `Amos` facade | `tests/test_architecture.py`, plus the entire suite through the stable facade |
+| Public API composition | `src/amos/service.py` stable `Amos` API entry point | `tests/test_architecture.py`, plus the entire suite through the stable entry point |
+| Constitutional self-ratification | `src/amos/governance_service.py`, `src/amos/schemas.py`, `schemas/constitutional_governance.schema.json` | `tests/test_constitutional_governance.py` |
 | Mutations and lifecycle | `src/amos/mutations_service.py`, `src/amos/access_service.py`, `src/amos/graph_service.py` | `tests/test_schema_and_mutations.py` |
-| Retrieval, attention, and ranking | `src/amos/retrieval_service.py`, `src/amos/index_service.py` | `tests/test_retrieval.py` |
+| Retrieval, attention, ranking, and lifecycle modes | `src/amos/retrieval_service.py`, `src/amos/index_service.py` | `tests/test_retrieval.py`, `tests/test_constitutional_governance.py` |
 | Coherent reasoning frames and demand pages | `src/amos/reasoning_service.py` | `tests/test_reasoning_frames.py`, `tests/test_mirror_agent_demo.py` |
 | Self-model and shared views | `src/amos/views_service.py` | `tests/test_self_models.py` |
 | Stewardship and SMP | `src/amos/stewardship_service.py`, `src/amos/maintenance.py`, `src/amos/smp.py` | `tests/test_maintenance.py` |
@@ -46,11 +47,12 @@ Status terms:
 | Self-awareness and agentic recall | Implemented | Runtime capability suppression, commitments, calibration, responsibility attribution, counterevidence, and self-narrative expiry are tested. |
 | Shared memory | Implemented | Common graph-version views plus identity-specific overlays and evidence omissions are tested. |
 | Authorization | Implemented | Scope, visibility, mutation roles, trust levels, capabilities, and evidence visibility are independently exercised. |
+| Constitutional authorship | Implemented | External sources can remain evidence, but only an identity-matched `self_ratification` capability can adopt a proposal; generic mutation and privileged maintenance cannot substitute for that transition. |
 | Deletion | Partial | Atom/edge suppression, hot index/cache cleanup, tombstones, replay exclusion, and residual-retention disclosure are tested. External evidence archives, snapshots, key management, and backups are not owned by v1-local. |
 | Capacity | Partial | One SQLite-file byte budget produces one pressure mode and packet degradation. Per-tier and external-store budgets are planned. |
 | SMP and processor packs | Implemented | Deterministic proposal envelopes, review gates, low-risk auto-commit policy, and external processor loading are tested. |
 | Memory policy | Implemented | Background and forced deterministic maintenance, decay, cleanup, distillation, index refresh, cache invalidation, and journal summaries are tested. |
-| Performance | Evidence only | `benchmarks/benchmark_amos.py` reproducibly measures canonical writes, exact lookup, cold/warm packet retrieval, coherent frames, demand-page loads, governed semantic/graph maintenance, final-state replay, and the complete SQLite DB/WAL/SHM footprint; CI enforces no scale or latency threshold. |
+| Performance | Evidence plus bounded smoke thresholds | `benchmarks/benchmark_amos.py` reproducibly measures canonical writes, exact lookup, cold/warm operational retrieval, deliberative candidate recall, root-provenance analysis, coherent frames, demand-page loads, governed semantic/graph maintenance, final-state replay, and the complete SQLite DB/WAL/SHM footprint. The small CI workload requires deliberation and provenance p95 below one second; production scale thresholds remain deployment-specific. |
 | Observability | Implemented with declared constants | Health, capacity, index freshness, retrieval outcomes, and deletion residuals are reportable. Projection lag is fixed at zero for the transactional single-process profile. |
 | Procedure policy | Implemented | Procedures are advisory; autonomous execution is denied by default. |
 | LLM reviewer default | Implemented | Disabled and non-authoritative by default. |

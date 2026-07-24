@@ -585,7 +585,7 @@ def test_canonical_graph_relations_are_gated_and_reprocessable(amos):
     assert revived["version"] > archived_edge["version"]
 
 
-def test_proposed_canonical_facets_remain_dormant_until_promotion(amos):
+def test_proposed_canonical_facets_remain_dormant_until_ratification(amos):
     scope = {"tenant": "canonical-proposal"}
     active = amos.commit_atom(
         {
@@ -633,10 +633,70 @@ def test_proposed_canonical_facets_remain_dormant_until_promotion(amos):
         for edge in amos.store.list_edges()
     )
 
-    amos.update_atom(
-        proposed["id"],
-        set_fields={"lifecycle_state": "active"},
+    covenant = amos.commit_atom(
+        {
+            "id": "canonical_proposal_covenant",
+            "type": "covenant",
+            "payload": {
+                "name": "Only self-ratified proposals become active",
+                "constitutional_tier": "covenant",
+                "precedence": 100,
+                "interpretive_rules": ["Preserve proposal isolation."],
+                "amendability": "entrenched",
+                "amendment_requirements": {"mode": "self_ratification"},
+                "protected_fields": ["constitutional_tier"],
+                "effective_from": "2026-07-24T00:00:00Z",
+            },
+            "scope": scope,
+        },
+        actor="canonical-proposal:self",
+        authorization_context={
+            "identity_ref": "canonical-proposal:self",
+            "capabilities": ["constitutional_authoring"],
+        },
+    )["atom"]
+    adjudication = amos.commit_atom(
+        {
+            "id": "canonical_proposal_adjudication",
+            "type": "adjudication",
+            "payload": {
+                "subject_ref": proposed["id"],
+                "claim_kind": "semantic",
+                "outcome": "adopted",
+                "reasons_for_refs": [active["id"]],
+                "reasons_against_refs": [],
+                "covenant_refs": [covenant["id"]],
+                "unresolved_objections": [],
+                "adjudication_scope": {"domain": "canonical_graph"},
+                "epistemic_standing": {"status": "settled"},
+                "normative_standing": {"status": "settled"},
+                "operational_authority": {"status": "operative"},
+                "dissent_refs": [],
+                "review_triggers": ["contradictory_graph_evidence"],
+                "ratifier": {
+                    "identity_ref": "canonical-proposal:self",
+                    "mode": "self_ratification",
+                },
+                "reconstructed_at": "2026-07-24T01:00:00Z",
+                "diachronic": {
+                    "independent_reconstruction": True,
+                    "original_reasoning_shown": False,
+                    "new_experience_refs": [active["id"]],
+                    "disposition": "confirmed",
+                },
+            },
+            "scope": scope,
+        }
+    )["atom"]
+    amos.ratify_proposal(
+        proposal_ref=proposed["id"],
+        adjudication_ref=adjudication["id"],
         expected_version=proposed["version"],
+        actor="canonical-proposal:self",
+        authorization_context={
+            "identity_ref": "canonical-proposal:self",
+            "capabilities": ["self_ratification"],
+        },
     )
     amos.run_maintenance_distiller(
         scope=scope,

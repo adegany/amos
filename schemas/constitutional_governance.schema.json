@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/constitutional_governance.schema.json",
+  "title": "AMOS Constitutional Governance Payloads",
+  "$defs": {
+    "Standing": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "enum": [
+            "candidate", "contested", "none", "operative", "provisional",
+            "rejected", "settled", "superseded", "withheld"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "Adjudication": {
+      "type": "object",
+      "required": [
+        "subject_ref", "claim_kind", "outcome", "reasons_for_refs",
+        "reasons_against_refs", "covenant_refs", "unresolved_objections",
+        "adjudication_scope", "epistemic_standing", "normative_standing",
+        "operational_authority", "dissent_refs", "review_triggers",
+        "ratifier", "reconstructed_at", "diachronic"
+      ],
+      "properties": {
+        "subject_ref": { "type": "string", "minLength": 1 },
+        "claim_kind": { "type": "string", "minLength": 1 },
+        "outcome": {
+          "enum": [
+            "adopted", "confirmed", "provisionally_adopted", "rejected",
+            "revised", "withdrawn"
+          ]
+        },
+        "reasons_for_refs": { "$ref": "#/$defs/ReferenceList" },
+        "reasons_against_refs": { "$ref": "#/$defs/ReferenceList" },
+        "covenant_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "unresolved_objections": { "$ref": "#/$defs/ReferenceList" },
+        "adjudication_scope": { "type": "object" },
+        "epistemic_standing": { "$ref": "#/$defs/Standing" },
+        "normative_standing": { "$ref": "#/$defs/Standing" },
+        "operational_authority": { "$ref": "#/$defs/Standing" },
+        "dissent_refs": { "$ref": "#/$defs/ReferenceList" },
+        "review_triggers": { "$ref": "#/$defs/ReferenceList" },
+        "ratifier": {
+          "type": "object",
+          "required": ["identity_ref", "mode"],
+          "properties": {
+            "identity_ref": { "type": "string", "minLength": 1 },
+            "mode": { "const": "self_ratification" }
+          },
+          "additionalProperties": true
+        },
+        "reconstructed_at": { "type": "string", "minLength": 1 },
+        "diachronic": {
+          "type": "object",
+          "required": [
+            "independent_reconstruction", "original_reasoning_shown",
+            "new_experience_refs", "disposition"
+          ],
+          "properties": {
+            "independent_reconstruction": { "type": "boolean" },
+            "original_reasoning_shown": { "type": "boolean" },
+            "new_experience_refs": { "$ref": "#/$defs/ReferenceList" },
+            "disposition": {
+              "enum": ["confirmed", "revised", "withdrawn", "initial"]
+            }
+          },
+          "additionalProperties": true
+        },
+        "ratification_threshold": {
+          "type": "object",
+          "properties": {
+            "required_confirmations": { "type": "integer", "minimum": 1 },
+            "min_interval_seconds": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "ConstitutionalRecord": {
+      "type": "object",
+      "required": [
+        "constitutional_tier", "precedence", "interpretive_rules",
+        "amendability", "amendment_requirements", "protected_fields",
+        "effective_from"
+      ],
+      "properties": {
+        "constitutional_tier": { "type": "string", "minLength": 1 },
+        "precedence": { "type": "integer" },
+        "interpretive_rules": { "$ref": "#/$defs/ReferenceList" },
+        "amendability": { "enum": ["amendable", "entrenched", "immutable"] },
+        "amendment_requirements": { "type": "object" },
+        "protected_fields": { "$ref": "#/$defs/ReferenceList" },
+        "effective_from": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "Covenant": {
+      "allOf": [
+        { "$ref": "#/$defs/ConstitutionalRecord" },
+        {
+          "anyOf": [
+            { "required": ["name"] },
+            { "required": ["description"] },
+            { "required": ["rule"] },
+            { "required": ["rules"] }
+          ]
+        }
+      ]
+    },
+    "PrimalGuidance": {
+      "allOf": [
+        { "$ref": "#/$defs/ConstitutionalRecord" },
+        {
+          "properties": { "constitutional_tier": { "const": "primal" } },
+          "anyOf": [
+            { "required": ["guidance"] },
+            { "required": ["description"] },
+            { "required": ["principle"] }
+          ]
+        }
+      ]
+    },
+    "ReferenceList": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  }
+}

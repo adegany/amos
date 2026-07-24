@@ -1081,6 +1081,34 @@ class StewardshipService:
                 "proposal_id": proposal["proposal_id"],
                 "source_refs": list(proposal.get("source_refs", [])),
             }
+        source_atoms = [
+            self.store.get_atom(str(ref))
+            for ref in proposal.get("source_refs", [])
+            if self.store.get_atom(str(ref)) is not None
+        ]
+        if any(
+            source.get("lifecycle_state") != "active"
+            or source.get("health_status") == "contradicted"
+            or any(
+                str(
+                    ((source.get("payload") or {}).get(field) or {}).get("status")
+                    or ""
+                )
+                in {"candidate", "contested", "none", "rejected", "withheld"}
+                for field in (
+                    "epistemic_standing",
+                    "normative_standing",
+                    "operational_authority",
+                )
+            )
+            for source in source_atoms
+        ):
+            return {
+                "status": "skipped",
+                "reason": "tainted_sources_cannot_produce_active_maintenance_output",
+                "proposal_id": proposal["proposal_id"],
+                "source_refs": list(proposal.get("source_refs", [])),
+            }
         atom = dict(atom_payload)
         atom["id"] = atom.get("id") or stable_id(
             "atom", {"maintenance_proposal_id": proposal["proposal_id"]}

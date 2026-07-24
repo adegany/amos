@@ -64,6 +64,7 @@ def _parser() -> argparse.ArgumentParser:
     commit.add_argument("--payload", help="atom payload JSON or @file")
     commit.add_argument("--scope", default="{}")
     commit.add_argument("--actor", default="cli")
+    commit.add_argument("--authorization-context", default="{}")
     commit.add_argument("--idempotency-key")
     commit.set_defaults(func=_commit_atom)
 
@@ -72,11 +73,46 @@ def _parser() -> argparse.ArgumentParser:
     retrieve.add_argument("--scope", default="{}")
     retrieve.add_argument("--requester", default="cli")
     retrieve.add_argument("--target-processor", default="reasoner")
+    retrieve.add_argument(
+        "--memory-mode",
+        choices=["operational_recall", "deliberation", "historical_review"],
+        default="operational_recall",
+    )
     retrieve.add_argument("--max-items", type=int, default=8)
     retrieve.add_argument("--include-conflicts", action="store_true")
     retrieve.add_argument("--include-archived", action="store_true")
     retrieve.add_argument("--attention-context", default="{}")
     retrieve.set_defaults(func=_retrieve)
+
+    ratify = sub.add_parser(
+        "ratify-proposal",
+        help="adopt a proposal through constitutional self-ratification",
+    )
+    ratify.add_argument("--proposal-ref", required=True)
+    ratify.add_argument("--adjudication-ref", required=True)
+    ratify.add_argument("--expected-version", type=int, required=True)
+    ratify.add_argument("--actor", required=True)
+    ratify.add_argument("--authorization-context", required=True)
+    ratify.add_argument("--idempotency-key")
+    ratify.set_defaults(func=_ratify_proposal)
+
+    provenance = sub.add_parser(
+        "provenance-analysis",
+        help="analyze root evidence independence and circular support",
+    )
+    provenance.add_argument("--atom-ref", required=True)
+    provenance.add_argument("--max-depth", type=int, default=64)
+    provenance.set_defaults(func=_provenance_analysis)
+
+    diachronic = sub.add_parser(
+        "diachronic-status",
+        help="evaluate independent self-ratification confirmations over time",
+    )
+    diachronic.add_argument("--subject-ref", required=True)
+    diachronic.add_argument("--identity-ref", required=True)
+    diachronic.add_argument("--required-confirmations", type=int, default=2)
+    diachronic.add_argument("--min-interval-seconds", type=int, default=0)
+    diachronic.set_defaults(func=_diachronic_status)
 
     self_view = sub.add_parser("self-awareness", help="render a self-awareness view")
     self_view.add_argument("--agent-id", required=True)
@@ -223,6 +259,7 @@ def _commit_atom(amos: Amos, args: argparse.Namespace) -> dict[str, Any]:
         atom,
         actor=args.actor,
         idempotency_key=args.idempotency_key,
+        authorization_context=parse_json_arg(args.authorization_context),
     )
 
 
@@ -232,10 +269,38 @@ def _retrieve(amos: Amos, args: argparse.Namespace) -> dict[str, Any]:
         scope=parse_json_arg(args.scope),
         requester=args.requester,
         target_processor=args.target_processor,
+        memory_mode=args.memory_mode,
         max_items=args.max_items,
         include_conflicts=args.include_conflicts,
         include_archived=args.include_archived,
         attention_context=parse_json_arg(args.attention_context),
+    )
+
+
+def _ratify_proposal(amos: Amos, args: argparse.Namespace) -> dict[str, Any]:
+    return amos.ratify_proposal(
+        proposal_ref=args.proposal_ref,
+        adjudication_ref=args.adjudication_ref,
+        expected_version=args.expected_version,
+        actor=args.actor,
+        authorization_context=parse_json_arg(args.authorization_context),
+        idempotency_key=args.idempotency_key,
+    )
+
+
+def _provenance_analysis(amos: Amos, args: argparse.Namespace) -> dict[str, Any]:
+    return amos.analyze_provenance(
+        atom_ref=args.atom_ref,
+        max_depth=args.max_depth,
+    )
+
+
+def _diachronic_status(amos: Amos, args: argparse.Namespace) -> dict[str, Any]:
+    return amos.diachronic_ratification_status(
+        subject_ref=args.subject_ref,
+        identity_ref=args.identity_ref,
+        required_confirmations=args.required_confirmations,
+        min_interval_seconds=args.min_interval_seconds,
     )
 
 

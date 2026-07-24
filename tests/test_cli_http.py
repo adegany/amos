@@ -60,6 +60,81 @@ def test_cli_smoke_init_commit_retrieve(tmp_path, capsys):
     assert "CLI recall works" in out
 
 
+def test_cli_constitutional_governance_commands(tmp_path, capsys):
+    from .test_constitutional_governance import (
+        RATIFICATION,
+        _adjudication,
+        _covenant,
+        _proposal,
+    )
+
+    db_path = tmp_path / "cli_governance.sqlite3"
+    amos = Amos(db_path)
+    try:
+        covenant = _covenant(amos)
+        proposal = _proposal(amos)
+        adjudication = _adjudication(
+            amos,
+            proposal_ref=proposal["id"],
+            covenant_ref=covenant["id"],
+        )
+    finally:
+        amos.close()
+
+    assert (
+        cli_main(
+            [
+                "--db",
+                str(db_path),
+                "ratify-proposal",
+                "--proposal-ref",
+                proposal["id"],
+                "--adjudication-ref",
+                adjudication["id"],
+                "--expected-version",
+                str(proposal["version"]),
+                "--actor",
+                "cogito:self",
+                "--authorization-context",
+                json.dumps(RATIFICATION),
+            ]
+        )
+        == 0
+    )
+    assert (
+        cli_main(
+            [
+                "--db",
+                str(db_path),
+                "provenance-analysis",
+                "--atom-ref",
+                proposal["id"],
+            ]
+        )
+        == 0
+    )
+    assert (
+        cli_main(
+            [
+                "--db",
+                str(db_path),
+                "diachronic-status",
+                "--subject-ref",
+                proposal["id"],
+                "--identity-ref",
+                "cogito:self",
+                "--required-confirmations",
+                "1",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert '"status": "ratified"' in output
+    assert '"status": "analyzed"' in output
+    assert '"threshold_reached": true' in output
+
+
 def test_http_v1_endpoints_smoke(tmp_path):
     db_path = str(tmp_path / "http.sqlite3")
     try:
@@ -123,6 +198,61 @@ def test_http_v1_endpoints_smoke(tmp_path):
         verify = http_json(f"{base}/v1/verify")
         assert verify["journal"]["status"] == "ok"
         assert verify["replay"]["status"] == "ok"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_constitutional_governance_endpoints(tmp_path):
+    from .test_constitutional_governance import (
+        RATIFICATION,
+        _adjudication,
+        _covenant,
+        _proposal,
+    )
+
+    db_path = str(tmp_path / "http_governance.sqlite3")
+    try:
+        server = AmosHTTPServer(("127.0.0.1", 0), db_path)
+    except PermissionError as exc:
+        pytest.skip(f"loopback sockets unavailable in this sandbox: {exc}")
+    covenant = _covenant(server.amos)
+    proposal = _proposal(server.amos)
+    adjudication = _adjudication(
+        server.amos,
+        proposal_ref=proposal["id"],
+        covenant_ref=covenant["id"],
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        ratified = http_json(
+            f"{base}/v1/proposals:ratify",
+            {
+                "proposal_ref": proposal["id"],
+                "adjudication_ref": adjudication["id"],
+                "expected_version": proposal["version"],
+                "actor": "cogito:self",
+                "authorization_context": RATIFICATION,
+            },
+        )
+        assert ratified["status"] == "ratified"
+        provenance = http_json(
+            f"{base}/v1/provenance:analyze",
+            {"atom_ref": proposal["id"]},
+        )
+        assert provenance["status"] == "analyzed"
+        diachronic = http_json(
+            f"{base}/v1/ratifications:diachronic-status",
+            {
+                "subject_ref": proposal["id"],
+                "identity_ref": "cogito:self",
+                "required_confirmations": 1,
+            },
+        )
+        assert diachronic["threshold_reached"] is True
     finally:
         server.shutdown()
         server.server_close()

@@ -18,6 +18,15 @@ from ._service_support import (
     utc_now,
 )
 from .maintenance import covered_source_refs, maintenance_hints_from_atom
+from .schemas import CONSTITUTIONAL_ATOM_TYPES
+
+
+GOVERNANCE_MAINTENANCE_PROTECTED_TYPES = {
+    *CONSTITUTIONAL_ATOM_TYPES,
+    "adjudication",
+    "commitment",
+    "self_model",
+}
 
 
 class PolicyService:
@@ -476,6 +485,7 @@ class PolicyService:
                 )
                 if str(item)
             }
+            | GOVERNANCE_MAINTENANCE_PROTECTED_TYPES
         )
         decay["capacity_assessment_targets"] = sorted(
             {
@@ -533,6 +543,7 @@ class PolicyService:
         )
         cleanup["protected_types"] = sorted(
             {str(item) for item in cleanup.get("protected_types", [])}
+            | GOVERNANCE_MAINTENANCE_PROTECTED_TYPES
         )
         sqlite_compaction = dict(cleanup.get("sqlite_compaction") or {})
         checkpoint_mode = str(sqlite_compaction.get("checkpoint_mode") or "TRUNCATE").upper()
@@ -1564,6 +1575,8 @@ class PolicyService:
         duplicate_actions = self._proposed_duplicate_archive_actions(atoms)
         for atom in atoms:
             if not maintenance_scope_visible(atom["scope"], scope):
+                continue
+            if str(atom.get("type") or "") in GOVERNANCE_MAINTENANCE_PROTECTED_TYPES:
                 continue
             atom_policy = (
                 dict(atom.get("decay_policy") or {})

@@ -5,7 +5,8 @@ This benchmark intentionally uses only the Python standard library and the
 in-process AMOS service API. It measures the v1-local SQLite baseline rather
 than HTTP or network overhead. The workload covers canonical writes, exact and
 associative retrieval, coherent reasoning frames, demand-loaded pages, governed
-semantic/graph maintenance, and final-state replay verification.
+semantic/graph maintenance, deliberative candidate recall, root-provenance
+analysis, and final-state replay verification.
 """
 
 from __future__ import annotations
@@ -183,6 +184,26 @@ def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
             commit_latencies.append(_duration_ms(op_started))
         commit_total_ms = _duration_ms(started)
 
+        governance_candidate_count = min(8, max(2, args.atoms // 12))
+        candidate_atoms = amos.propose_memory_atoms(
+            [
+                {
+                    "id": f"bench_candidate_{index:04d}",
+                    "type": "belief",
+                    "payload": {
+                        "claim": (
+                            "Benchmark constitutional candidate "
+                            f"{index} for independent deliberation."
+                        ),
+                        "identity_ref": "bench:self",
+                    },
+                }
+                for index in range(governance_candidate_count)
+            ],
+            actor="bench:self",
+            scope={"tenant": "bench", "asset": "UPRO"},
+        )
+
         retrieve_cold_latencies: list[float] = []
         retrieve_warm_latencies: list[float] = []
         item_counts: list[int] = []
@@ -210,6 +231,37 @@ def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
             op_started = time.perf_counter()
             amos.retrieve_packet(**request)
             retrieve_warm_latencies.append(_duration_ms(op_started))
+
+        deliberation_latencies: list[float] = []
+        deliberation_item_counts: list[int] = []
+        for index in range(args.retrievals):
+            op_started = time.perf_counter()
+            packet = amos.retrieve_packet(
+                cues=[f"constitutional candidate {index % governance_candidate_count}"],
+                scope={"tenant": "bench", "asset": "UPRO"},
+                requester="benchmark",
+                target_processor="reasoner",
+                memory_mode="deliberation",
+                max_items=args.max_items,
+                run_policy=False,
+            )
+            deliberation_latencies.append(_duration_ms(op_started))
+            deliberation_item_counts.append(len(packet.get("items", [])))
+
+        provenance_latencies: list[float] = []
+        provenance_root_counts: list[int] = []
+        provenance_targets = [
+            f"bench_lesson_{index:06d}"
+            for index in range(args.atoms)
+            if index % 4 == 2
+        ] or [_atom_id(0)]
+        for index in range(args.retrievals):
+            op_started = time.perf_counter()
+            analysis = amos.analyze_provenance(
+                atom_ref=provenance_targets[index % len(provenance_targets)]
+            )
+            provenance_latencies.append(_duration_ms(op_started))
+            provenance_root_counts.append(len(analysis.get("root_evidence", [])))
 
         exact_latencies: list[float] = []
         exact_found = 0
@@ -317,8 +369,10 @@ def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
         retrieve_warm_summary = _latency_summary(retrieve_warm_latencies)
         frame_summary = _latency_summary(frame_latencies)
         page_summary = _latency_summary(page_latencies)
+        deliberation_summary = _latency_summary(deliberation_latencies)
+        provenance_summary = _latency_summary(provenance_latencies)
         result = {
-            "schema_version": 2,
+            "schema_version": 3,
             "benchmark": "amos_v1_local_sqlite",
             "parameters": {
                 "atoms": args.atoms,
@@ -350,6 +404,15 @@ def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 "retrieve_warm_latency_ms_p50": retrieve_warm_summary["p50"],
                 "retrieve_warm_latency_ms_p95": retrieve_warm_summary["p95"],
                 "retrieve_avg_items": _mean(item_counts),
+                "governance_candidate_atoms": len(
+                    candidate_atoms.get("proposals", [])
+                ),
+                "deliberation_latency_ms_p50": deliberation_summary["p50"],
+                "deliberation_latency_ms_p95": deliberation_summary["p95"],
+                "deliberation_avg_items": _mean(deliberation_item_counts),
+                "provenance_analysis_latency_ms_p50": provenance_summary["p50"],
+                "provenance_analysis_latency_ms_p95": provenance_summary["p95"],
+                "provenance_analysis_avg_roots": _mean(provenance_root_counts),
                 "reasoning_frame_latency_ms_p50": frame_summary["p50"],
                 "reasoning_frame_latency_ms_p95": frame_summary["p95"],
                 "reasoning_frame_avg_resident_units": _mean(resident_unit_counts),
@@ -408,6 +471,10 @@ def _markdown(result: dict[str, Any]) -> str:
             f"| Cold packet latency p50 / p95 | {res['retrieve_cold_latency_ms_p50']} ms / {res['retrieve_cold_latency_ms_p95']} ms |",
             f"| Warm packet latency p50 / p95 | {res['retrieve_warm_latency_ms_p50']} ms / {res['retrieve_warm_latency_ms_p95']} ms |",
             f"| Average packet items | {res['retrieve_avg_items']} |",
+            f"| Deliberative candidate retrievals | {params['retrievals']} over {res['governance_candidate_atoms']} proposed atoms |",
+            f"| Deliberation latency p50 / p95 | {res['deliberation_latency_ms_p50']} ms / {res['deliberation_latency_ms_p95']} ms |",
+            f"| Root-provenance analyses | {params['retrievals']} |",
+            f"| Provenance-analysis latency p50 / p95 | {res['provenance_analysis_latency_ms_p50']} ms / {res['provenance_analysis_latency_ms_p95']} ms |",
             f"| Reasoning frame compiles | {params['reasoning_frames']} at {params['frame_tokens']} tokens |",
             f"| Reasoning frame latency p50 / p95 | {res['reasoning_frame_latency_ms_p50']} ms / {res['reasoning_frame_latency_ms_p95']} ms |",
             f"| Average resident units / page descriptors | {res['reasoning_frame_avg_resident_units']} / {res['reasoning_frame_avg_page_descriptors']} |",

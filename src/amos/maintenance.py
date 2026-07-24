@@ -604,7 +604,7 @@ def semantic_facets_from_atoms(
 
     Proposed atoms deliberately remain isolated.  Their facet metadata is
     retained and becomes eligible on a later maintenance pass after an
-    authorized lifecycle promotion.
+    identity-authored constitutional self-ratification.
     """
 
     facets: list[SemanticFacet] = []
@@ -1169,7 +1169,19 @@ def _validate_processor(processor: Any) -> MaintenanceProcessor:
 
 
 def proposal_is_auto_committable(proposal: Mapping[str, Any]) -> bool:
+    atom = (proposal.get("payload") or {}).get("atom")
+    atom = atom if isinstance(atom, Mapping) else {}
+    payload = atom.get("payload")
+    payload = payload if isinstance(payload, Mapping) else {}
     return (
         proposal.get("action") in LOW_RISK_PROPOSAL_ACTIONS
         and proposal.get("risk_level") == "low"
+        and atom.get("type")
+        not in {"adjudication", "covenant", "primal_guidance"}
+        and not {
+            "epistemic_standing",
+            "normative_standing",
+            "operational_authority",
+            "ratification",
+        }.intersection(payload)
     )

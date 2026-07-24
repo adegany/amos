@@ -21,7 +21,7 @@ def test_current_benchmark_covers_reasoning_and_complete_storage_footprint(tmp_p
         )
     )
 
-    assert result["schema_version"] == 2
+    assert result["schema_version"] == 3
     assert result["parameters"]["retrievals"] == 2
     metrics = result["results"]
     assert metrics["semantic_facet_atoms"] == 24
@@ -29,6 +29,10 @@ def test_current_benchmark_covers_reasoning_and_complete_storage_footprint(tmp_p
     assert metrics["exact_lookup_found"] == 2
     assert metrics["retrieve_cold_latency_ms_p50"] > 0
     assert metrics["retrieve_warm_latency_ms_p50"] > 0
+    assert metrics["governance_candidate_atoms"] == 2
+    assert metrics["deliberation_avg_items"] >= 1
+    assert metrics["deliberation_latency_ms_p95"] < 1000
+    assert metrics["provenance_analysis_latency_ms_p95"] < 1000
     assert metrics["reasoning_frame_avg_page_descriptors"] >= 1
     assert metrics["reasoning_page_loads"] == 1
     assert metrics["verify_replay_status"] == "ok"
@@ -41,4 +45,6 @@ def test_current_benchmark_covers_reasoning_and_complete_storage_footprint(tmp_p
     markdown = _markdown(result)
     assert "Cold packet latency p50 / p95" in markdown
     assert "Demand-page loads" in markdown
+    assert "Deliberation latency p50 / p95" in markdown
+    assert "Provenance-analysis latency p50 / p95" in markdown
     assert "Replay verification |" in markdown

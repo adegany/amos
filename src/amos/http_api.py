@@ -179,7 +179,11 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 atoms = body.get("atoms")
                 if atoms is not None:
                     return self._write_json(
-                        amos.commit_memory_atoms(atoms, actor=body.get("actor", "http"))
+                        amos.commit_memory_atoms(
+                            atoms,
+                            actor=body.get("actor", "http"),
+                            authorization_context=body.get("authorization_context"),
+                        )
                     )
                 return self._write_json(
                     amos.commit_atom(
@@ -200,6 +204,23 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         authorization_context=body.get("authorization_context"),
                         idempotency_key=body.get("idempotency_key"),
                     )
+                )
+            if path == "/v1/proposals:ratify":
+                return self._write_json(
+                    amos.ratify_proposal(
+                        proposal_ref=body["proposal_ref"],
+                        adjudication_ref=body["adjudication_ref"],
+                        expected_version=body["expected_version"],
+                        actor=body.get("actor", "http"),
+                        authorization_context=body.get("authorization_context") or {},
+                        idempotency_key=body.get("idempotency_key"),
+                    )
+                )
+            if path == "/v1/provenance:analyze":
+                return self._write_json(amos.analyze_provenance(**body))
+            if path == "/v1/ratifications:diachronic-status":
+                return self._write_json(
+                    amos.diachronic_ratification_status(**body)
                 )
             if path == "/v1/atoms:archive":
                 return self._write_json(
@@ -302,6 +323,7 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 "scope",
                 "requester",
                 "target_processor",
+                "memory_mode",
                 "token_or_byte_budget",
                 "run_policy",
             }
@@ -334,7 +356,7 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                     and not isinstance(request[field], dict)
                 ):
                     raise ValidationError(f"{field} must be an object")
-            text_fields = {"requester", "target_processor", "depth"}
+            text_fields = {"requester", "target_processor", "depth", "memory_mode"}
             if page:
                 text_fields.add("frame_id")
             else:

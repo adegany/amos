@@ -924,6 +924,11 @@ archived -> deleted
 tombstoned -> deleted
 ```
 
+`proposed -> active` is not a generic lifecycle update. It is legal only
+through the guarded constitutional self-ratification transition described in
+section 7.16. Service privilege, maintenance policy, a consulted model, human
+review, or external approval cannot stand in for the ratifying identity.
+
 `deleted` is terminal for the removed record. If a later observation reintroduces similar content, Amos must create a new atom only if policy allows it and the tombstone does not prohibit recreation.
 
 Canonical health statuses:
@@ -1721,6 +1726,108 @@ eventual_shared:
   common_items may lag, but packet metadata must disclose graph_version and freshness
 ```
 
+### 7.16 Constitutional governance records
+
+AMOS must distinguish consulted evidence from the authority to adopt a belief,
+value, or policy. An external source, another mind, another LLM, a philosophical
+tradition, or a formal tool may contribute arguments and evidence. None of them
+becomes the author of the conclusion.
+
+```text
+constitutional self-ratification:
+  the continuing identity authors the conclusion
+  AMOS validates and records the transition
+  AMOS does not make the judgment
+  external approval is not a substitute for self-authorship
+```
+
+Three forms are first-class canonical atoms:
+
+```text
+PrimalGuidance
+  constitutional_tier: primal
+  precedence
+  interpretive_rules
+  amendability
+  amendment_requirements
+  protected_fields
+  effective_from
+
+Covenant
+  name/rule
+  constitutional_tier
+  precedence
+  interpretive_rules
+  amendability
+  amendment_requirements
+  protected_fields
+  effective_from
+
+Adjudication
+  subject_ref
+  claim_kind
+  outcome
+  reasons_for_refs
+  reasons_against_refs
+  covenant_refs
+  unresolved_objections
+  adjudication_scope
+  epistemic_standing
+  normative_standing
+  operational_authority
+  dissent_refs
+  review_triggers
+  ratifier:
+    identity_ref
+    mode: self_ratification
+  reconstructed_at
+  diachronic:
+    independent_reconstruction
+    original_reasoning_shown
+    new_experience_refs
+    disposition: initial | confirmed | revised | withdrawn
+```
+
+Standing is not one scalar:
+
+```text
+epistemic standing:
+  how warranted the claim is
+
+normative standing:
+  how the claim relates to primal guidance and covenants
+
+operational authority:
+  which actions, if any, may rely on it and under what risk ceiling
+```
+
+The only legal proposed-to-active transition is guarded
+`ratify_proposal(proposal_ref, adjudication_ref, expected_version, actor,
+authorization_context)`. It requires:
+
+```text
+proposal lifecycle is proposed
+adjudication subject matches proposal
+outcome is adopted, provisionally_adopted, or confirmed
+at least one active covenant or primal-guidance reference
+unresolved objections and adjudication scope are recorded
+authenticated identity matches ratifier.identity_ref
+authorization context contains self_ratification
+proposal and adjudication scopes match
+expected version matches
+optional diachronic reconstruction threshold is satisfied
+```
+
+The accepted event binds the proposal, adjudication, constitutional refs,
+expected version, standing and projected governance edges. Generic atom update,
+merge, distillation, privileged maintenance, or an external reviewer must not
+perform this transition or rewrite the resulting standing.
+
+Root provenance analysis follows `source_refs` and `rel:derived_from` to root
+evidence. It reports independence groups, testimony families, common ancestors,
+ancestry depth, circular support and self-descendant support. Direct citation
+count is not evidence independence.
+
 ---
 
 ## 8. Memory lifecycle
@@ -1744,8 +1851,9 @@ eventual_shared:
 6. Triage
    Score utility, novelty, confidence, privacy risk, and future retrieval value.
 
-7. Commit
-   Promote selected candidates to active canonical memory.
+7. Adjudicate and commit
+   Non-proposal writes pass normal validation. A proposed belief, value, or
+   policy becomes active only through identity-authored self-ratification.
 
 8. Render
    Generate processor-specific memory packets.
@@ -2452,7 +2560,9 @@ Creates cross-category associations.
 
 ### 18.7 Promoter
 
-Moves memories upward when stable and useful.
+Moves non-proposal memories between storage/retention tiers when stable and
+useful. It cannot activate a proposal, grant normative standing, or create
+operational authority; those changes require self-ratification.
 
 ### 18.8 Demoter
 
@@ -2564,7 +2674,7 @@ Low-risk:
 
 Medium-risk:
   merge duplicates
-  promote proposed atom to active scoped belief
+  prepare or revise a proposed adjudication
   demote low-utility memory
   rewrite generated summary view
 
@@ -2584,6 +2694,10 @@ no unresolved contradiction
 policy validation
 possible user confirmation or human review
 ```
+
+For constitutional adoption, these are safety inputs rather than sources of
+authority. Human or model review may contribute evidence and objections; the
+continuing identity remains the ratifier.
 
 ---
 
@@ -2913,6 +3027,9 @@ POST /v1/atoms:commit
 POST /v1/atoms:archive
 POST /v1/atoms:merge
 POST /v1/atoms:get
+POST /v1/proposals:ratify
+POST /v1/provenance:analyze
+POST /v1/ratifications:diachronic-status
 POST /v1/packets:retrieve
 POST /v1/retrieval-outcomes
 POST /v1/maintenance:request
@@ -3002,6 +3119,26 @@ POST /v1/atoms:commit
   response payload: committed atom refs, graph_version, projection_status
   consistency: strong; batch commits validate duplicate ids before mutation and
   commit journal entries, atoms, and edges in one transaction
+
+POST /v1/proposals:ratify
+  request payload: proposal_ref, adjudication_ref, expected_version, actor,
+  authorization_context with matching identity_ref and self_ratification
+  response payload: active subject atom, adjudication, cited covenants,
+  governance edges and proposal_ratified journal event
+  consistency: strong compare-and-swap
+
+POST /v1/provenance:analyze
+  request payload: atom_ref, optional max_depth
+  response payload: root evidence, independence groups, testimony families,
+  common ancestors, depth and circular/self-descendant support
+  consistency: one graph revision
+
+POST /v1/ratifications:diachronic-status
+  request payload: subject_ref, identity_ref, confirmation threshold and
+  minimum interval
+  response payload: qualifying independent reconstructions, intervals and
+  threshold status
+  consistency: monotonic
 
 POST /v1/atoms:archive
   request payload: atom_id, reason, optional expected_version, authorization_context
@@ -4513,6 +4650,8 @@ PreferenceAtom payload must have holder, polarity, target, applicability_scope, 
 ProcedureAtom payload must have trigger_context and steps.
 AssociationEdge must have edge_id, source_ref, target_ref, relation, confidence, scope, lifecycle_state, and health_status.
 High-risk mutations must pass authorization and review gates before commit.
+Proposed-to-active adoption additionally requires identity-authored
+self-ratification; external review is not ratification authority.
 ```
 
 This catches malformed, underspecified, orphaned, or overgeneralized memory early.
@@ -4598,7 +4737,9 @@ episode distillation
 natural-language explanations
 ```
 
-But LLM outputs should always be proposals, not authoritative mutations.
+But LLM outputs should always be proposals, not authoritative mutations. An LLM
+may supply arguments or counterevidence for an adjudication, but it cannot be
+the external authority that ratifies another identity's conclusion.
 
 The reviewer is a stateless, replaceable processor with respect to durable
 agent identity. Its model identity, provider persona, and generated
@@ -4607,8 +4748,9 @@ self-model claim.
 
 ```text
 LLM proposes
-Amos validates
-policy gates
+identity adjudicates
+Amos validates self-authorship and invariants
+self-ratification gate
 journal records
 canonical memory updates
 indexes refresh

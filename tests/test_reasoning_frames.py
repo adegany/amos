@@ -264,7 +264,7 @@ def test_supporting_rationale_is_advertised_without_forcing_initial_residency(am
     bounded_frame = amos.compile_memory_frame(
         need="runtime-owned page authorization",
         purpose="apply the current paging decision",
-        token_or_byte_budget={"tokens": 1600},
+        token_or_byte_budget={"tokens": 1700},
         run_policy=False,
     )
     bounded_rationale = next(
@@ -936,7 +936,7 @@ def test_constrained_frame_compresses_resident_before_dropping_independent_pages
         need="two-domain paging active decision Monday commitment",
         purpose="inspect two independent coherent domains",
         task_context=task_context,
-        token_or_byte_budget={"tokens": 1600},
+        token_or_byte_budget={"tokens": 1700},
         run_policy=False,
     )
 

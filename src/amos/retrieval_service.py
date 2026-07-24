@@ -25,6 +25,12 @@ from ._service_support import (
     utc_now,
 )
 
+MEMORY_MODES = {
+    "deliberation",
+    "historical_review",
+    "operational_recall",
+}
+
 
 class RetrievalService:
     def __init__(
@@ -61,6 +67,7 @@ class RetrievalService:
         scope: Mapping[str, Any] | None = None,
         requester: str = "system",
         target_processor: str = "reasoner",
+        memory_mode: str = "operational_recall",
         include_conflicts: bool = False,
         include_archived: bool = False,
         include_low_health: bool = False,
@@ -78,6 +85,11 @@ class RetrievalService:
         atom_id = str(atom_id or "").strip()
         if not atom_id:
             raise ValidationError("atom_id is required")
+        lifecycle_states = self._memory_lifecycle_states(
+            memory_mode, include_archived=include_archived
+        )
+        if memory_mode in {"deliberation", "historical_review"}:
+            include_conflicts = True
         self._mark_foreground_activity(requester)
         if run_policy:
             self.run_memory_policy(trigger="retrieve_atom", scope=scope or {})
@@ -87,6 +99,7 @@ class RetrievalService:
             "requester": requester,
             "target_processor": target_processor,
             "retrieval_mode": "exact",
+            "memory_mode": memory_mode,
             "include_conflicts": bool(include_conflicts),
             "include_archived": bool(include_archived),
             "include_low_health": bool(include_low_health),
@@ -113,11 +126,18 @@ class RetrievalService:
             atom["access_policy"], requester, target_processor
         ):
             omissions.append({"atom_ref": atom_id, "reason": "access_hidden"})
-        elif (
-            str(atom.get("lifecycle_state") or "active") == "archived"
-            and not include_archived
-        ):
-            omissions.append({"atom_ref": atom_id, "reason": "archived"})
+        elif str(atom.get("lifecycle_state") or "active") not in lifecycle_states:
+            omissions.append(
+                {
+                    "atom_ref": atom_id,
+                    "reason": (
+                        "archived"
+                        if atom.get("lifecycle_state") == "archived"
+                        else "lifecycle_hidden:"
+                        + str(atom.get("lifecycle_state") or "active")
+                    ),
+                }
+            )
         elif atom["health_status"] == "contradicted" and not include_conflicts:
             omissions.append({"atom_ref": atom_id, "reason": "contradicted"})
         elif atom["health_status"] in LOW_HEALTH_STATES and not include_low_health:
@@ -172,6 +192,7 @@ class RetrievalService:
             "generated_at": utc_now(),
             "target_processor": target_processor,
             "retrieval_mode": "exact",
+            "memory_mode": memory_mode,
             "scope": dict(scope or {}),
             "pressure_mode": self._capacity_pressure_mode(),
             "status": "found" if items else "not_found",
@@ -213,6 +234,7 @@ class RetrievalService:
         requester: str = "system",
         target_processor: str = "reasoner",
         retrieval_mode: str = "general",
+        memory_mode: str = "operational_recall",
         max_items: int | None = None,
         token_or_byte_budget: int | Mapping[str, int] | None = None,
         include_conflicts: bool | None = None,
@@ -235,6 +257,14 @@ class RetrievalService:
             token_or_byte_budget = {"tokens": int(profile["tokens"])}
         if include_conflicts is None:
             include_conflicts = bool(profile.get("include_conflicts", False))
+        lifecycle_states = self._memory_lifecycle_states(
+            memory_mode, include_archived=include_archived
+        )
+        if memory_mode in {"deliberation", "historical_review"}:
+            include_conflicts = True
+        if memory_mode == "deliberation":
+            attention_context = dict(attention_context or {})
+            attention_context["counterevidence_required"] = True
         pressure_mode = self._capacity_pressure_mode()
         pressure_degraded = pressure_mode in {"orange", "red"}
         original_max_items = max_items
@@ -249,6 +279,7 @@ class RetrievalService:
             "requester": requester,
             "target_processor": target_processor,
             "retrieval_mode": retrieval_mode,
+            "memory_mode": memory_mode,
             "max_items": max_items,
             "token_or_byte_budget": token_or_byte_budget,
             "include_conflicts": include_conflicts,
@@ -271,9 +302,6 @@ class RetrievalService:
         candidates: list[tuple[float, dict[str, Any]]] = []
         omissions: list[dict[str, Any]] = []
         allowed_types = set(type_filter or [])
-        lifecycle_states = ["active", "proposed"]
-        if include_archived:
-            lifecycle_states.append("archived")
         cue_text = " ".join(request["cues"]).lower()
         cue_tokens = {token for token in re.findall(r"[a-z0-9_]+", cue_text) if token}
         all_atoms = self.store.list_atoms_filtered(
@@ -450,6 +478,7 @@ class RetrievalService:
             "generated_at": utc_now(),
             "target_processor": target_processor,
             "retrieval_mode": retrieval_mode,
+            "memory_mode": memory_mode,
             "scope": dict(scope or {}),
             "pressure_mode": pressure_mode,
             "items": items,
@@ -504,6 +533,22 @@ class RetrievalService:
                 graph_version=graph_version,
             )
         return packet
+
+    def _memory_lifecycle_states(
+        self, memory_mode: str, *, include_archived: bool = False
+    ) -> list[str]:
+        memory_mode = str(memory_mode or "").strip()
+        if memory_mode not in MEMORY_MODES:
+            raise ValidationError(f"unsupported memory_mode: {memory_mode}")
+        if memory_mode == "operational_recall":
+            states = ["active"]
+        elif memory_mode == "deliberation":
+            states = ["active", "proposed"]
+        else:
+            states = ["active", "proposed", "archived", "superseded"]
+        if include_archived and "archived" not in states:
+            states.append("archived")
+        return states
 
 
     def _latent_retrieval_candidates(
@@ -887,10 +932,12 @@ class RetrievalService:
 
     def _attention_type_terms(self, value: Any) -> list[str]:
         known_types = {
+            "adjudication",
             "belief",
             "preference",
             "goal",
             "commitment",
+            "covenant",
             "procedure",
             "capability",
             "limitation",
@@ -902,6 +949,7 @@ class RetrievalService:
             "self_assessment",
             "semantic",
             "policy",
+            "primal_guidance",
         }
         return [
             token

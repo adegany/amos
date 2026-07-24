@@ -42,6 +42,7 @@ PAGE_DEPTH_ALIASES = {
 # endpoints therefore travel together as one coherent unit rather than
 # competing for independent ranking slots.
 MANDATORY_CONTEXT_RELATIONS = {
+    "rel:adjudicates",
     "rel:applies_to",
     "rel:caused_by",
     "rel:constrained_by",
@@ -51,9 +52,11 @@ MANDATORY_CONTEXT_RELATIONS = {
     "rel:depends_on",
     "rel:derived_from",
     "rel:forbids",
+    "rel:governed_by",
     "rel:part_of",
     "rel:produced_outcome",
     "rel:requires",
+    "rel:ratified_by",
     "rel:satisfied_commitment",
     "rel:supersedes",
 }
@@ -71,6 +74,7 @@ SUPPORTING_CONTEXT_RELATIONS = {
     "rel:miscalibrated_on",
     "rel:owns",
     "rel:prefers",
+    "rel:preserves_dissent",
     "rel:shared_responsibility_for",
     "rel:similar_to",
     "rel:supports",
@@ -133,6 +137,7 @@ class ReasoningFrameService:
         scope: Mapping[str, Any] | None = None,
         requester: str = "system",
         target_processor: str = "reasoner",
+        memory_mode: str = "operational_recall",
         token_or_byte_budget: int | Mapping[str, int] | None = None,
         run_policy: bool = True,
     ) -> dict[str, Any]:
@@ -141,6 +146,7 @@ class ReasoningFrameService:
         requester = self._required_text(requester, "requester")
         target_processor = self._required_text(target_processor, "target_processor")
         canonical_depth = self._depth(depth, FRAME_DEPTH_ALIASES)
+        self.retrieval._memory_lifecycle_states(memory_mode)
         task_context = self._mapping(task_context, "task_context")
         request_scope = normalize_scope(scope)
         semantic_scope = self._trusted_semantic_scope(task_context, request_scope)
@@ -169,6 +175,7 @@ class ReasoningFrameService:
                 semantic_scope=semantic_scope,
                 requester=requester,
                 target_processor=target_processor,
+                memory_mode=memory_mode,
                 byte_budget=budget["bytes"],
                 revision=revision,
             )
@@ -190,6 +197,7 @@ class ReasoningFrameService:
         scope: Mapping[str, Any] | None = None,
         requester: str = "system",
         target_processor: str = "reasoner",
+        memory_mode: str = "operational_recall",
         token_or_byte_budget: int | Mapping[str, int] | None = None,
         run_policy: bool = True,
     ) -> dict[str, Any]:
@@ -199,6 +207,7 @@ class ReasoningFrameService:
         expected_revision = self._revision(revision)
         descriptor = self._mapping(page, "page")
         canonical_depth = self._depth(depth, PAGE_DEPTH_ALIASES)
+        self.retrieval._memory_lifecycle_states(memory_mode)
         if need is not None:
             need = self._required_text(need, "need")
         if purpose is not None:
@@ -219,6 +228,7 @@ class ReasoningFrameService:
             descriptor,
             frame_id=frame_id,
             revision=expected_revision,
+            memory_mode=memory_mode,
         )
         semantic_scope = self._descriptor_semantic_scope(descriptor)
         visibility_scope = self._visibility_scope(request_scope, semantic_scope)
@@ -241,6 +251,7 @@ class ReasoningFrameService:
                 semantic_scope=semantic_scope,
                 requester=requester,
                 target_processor=target_processor,
+                memory_mode=memory_mode,
             )
             if reason is not None:
                 omissions.append({"atom_ref": atom_ref, "reason": reason})
@@ -296,6 +307,7 @@ class ReasoningFrameService:
                 depth=canonical_depth,
                 need=need,
                 purpose=purpose,
+                memory_mode=memory_mode,
                 units=selected_units,
                 omissions=omissions,
                 budget_omitted=budget_omitted,
@@ -310,6 +322,7 @@ class ReasoningFrameService:
             depth=canonical_depth,
             need=need,
             purpose=purpose,
+            memory_mode=memory_mode,
             units=[],
             omissions=omissions,
             budget_omitted=len(units),
@@ -354,6 +367,7 @@ class ReasoningFrameService:
         depth: str,
         need: str | None,
         purpose: str | None,
+        memory_mode: str,
         units: Sequence[Mapping[str, Any]],
         omissions: Sequence[Mapping[str, Any]],
         budget_omitted: int,
@@ -403,6 +417,7 @@ class ReasoningFrameService:
             "depth": depth,
             "need": need,
             "purpose": purpose,
+            "memory_mode": memory_mode,
             "units": [dict(unit) for unit in units],
             "sequence": sequence,
             "active_conclusion_refs": self._unit_refs(
@@ -443,6 +458,7 @@ class ReasoningFrameService:
         semantic_scope: Mapping[str, str],
         requester: str,
         target_processor: str,
+        memory_mode: str,
         byte_budget: int,
         revision: Mapping[str, Any],
     ) -> dict[str, Any]:
@@ -457,6 +473,7 @@ class ReasoningFrameService:
             work_budget=work_budget,
             requester=requester,
             target_processor=target_processor,
+            memory_mode=memory_mode,
         )
         closure = self._coherent_closure(
             seeds=seeds,
@@ -465,6 +482,7 @@ class ReasoningFrameService:
             work_budget=work_budget,
             requester=requester,
             target_processor=target_processor,
+            memory_mode=memory_mode,
         )
         units: list[dict[str, Any]] = []
         unit_omissions: list[dict[str, Any]] = []
@@ -497,6 +515,7 @@ class ReasoningFrameService:
             "scope": dict(scope),
             "requester": requester,
             "target_processor": target_processor,
+            "memory_mode": memory_mode,
             "token_or_byte_budget": {"bytes": byte_budget},
         }
         # The complete request participates in the stable frame identity, but
@@ -534,6 +553,7 @@ class ReasoningFrameService:
                 unit=unit,
                 atoms=closure["page_atoms"],
                 semantic_scope=semantic_scope,
+                memory_mode=memory_mode,
             )
             descriptors.append(descriptor)
             unit.pop("_page_atom_refs", None)
@@ -998,10 +1018,11 @@ class ReasoningFrameService:
         work_budget: Mapping[str, int],
         requester: str,
         target_processor: str,
+        memory_mode: str,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         candidate_scan_limit = int(work_budget["candidate_atoms"])
         scanned_atoms = self.store.list_atoms_filtered(
-            lifecycle_states=["active", "proposed", "archived", "superseded"],
+            lifecycle_states=self.retrieval._memory_lifecycle_states(memory_mode),
             limit=candidate_scan_limit + 1,
             prioritize_hot=True,
         )
@@ -1016,6 +1037,7 @@ class ReasoningFrameService:
                 semantic_scope=semantic_scope,
                 requester=requester,
                 target_processor=target_processor,
+                memory_mode=memory_mode,
             )
             if reason is None:
                 eligible.append(atom)
@@ -1144,6 +1166,7 @@ class ReasoningFrameService:
         work_budget: Mapping[str, int],
         requester: str,
         target_processor: str,
+        memory_mode: str,
     ) -> dict[str, Any]:
         atoms = {str(atom["id"]): dict(atom) for atom in seeds}
         scores = {
@@ -1193,6 +1216,7 @@ class ReasoningFrameService:
                         semantic_scope=semantic_scope,
                         requester=requester,
                         target_processor=target_processor,
+                        memory_mode=memory_mode,
                     )
                     if reason is not None:
                         return
@@ -1250,6 +1274,7 @@ class ReasoningFrameService:
                         semantic_scope=semantic_scope,
                         requester=requester,
                         target_processor=target_processor,
+                        memory_mode=memory_mode,
                     )
                     if reason is not None:
                         visible_endpoints = False
@@ -1346,6 +1371,7 @@ class ReasoningFrameService:
                         semantic_scope=semantic_scope,
                         requester=requester,
                         target_processor=target_processor,
+                        memory_mode=memory_mode,
                     )
                     if reason is not None:
                         visible = False
@@ -1467,6 +1493,12 @@ class ReasoningFrameService:
             edges,
             constraint_refs=constraints,
         )
+        conclusion_classes = self._conclusion_classes(
+            ordered_refs,
+            atoms,
+            constraint_refs=constraints,
+            active_refs=active_refs,
+        )
         commitments = [ref for ref in ordered_refs if atoms[ref].get("type") == "commitment"]
         conflict_edges = sorted(
             edge_id
@@ -1497,7 +1529,19 @@ class ReasoningFrameService:
             item["rank"] = len(items) + 1
             items.append(item)
             omissions.extend(evidence_omissions)
-        conclusion_ref = active_refs[0] if active_refs else ordered_refs[-1]
+        conclusion_ref = next(
+            (
+                refs[0]
+                for refs in (
+                    active_refs,
+                    conclusion_classes["candidate_conclusion_refs"],
+                    conclusion_classes["contested_conclusion_refs"],
+                    conclusion_classes["rejected_or_superseded_refs"],
+                    ordered_refs,
+                )
+                if refs
+            )
+        )
         summary = str(self.graph._render_atom(atoms[conclusion_ref])["text"])
         title = self._truncate_text(summary, 120) or unit_type.replace("_", " ").title()
         sequence = [
@@ -1505,7 +1549,15 @@ class ReasoningFrameService:
                 "atom_ref": ref,
                 "atom_type": str(atoms[ref].get("type") or ""),
                 "observed_at": self._atom_time(atoms[ref]) or None,
-                "role": self._sequence_role(ref, active_refs, constraints, commitments),
+                "role": self._sequence_role(
+                    ref,
+                    active_refs,
+                    conclusion_classes["candidate_conclusion_refs"],
+                    conclusion_classes["contested_conclusion_refs"],
+                    conclusion_classes["rejected_or_superseded_refs"],
+                    constraints,
+                    commitments,
+                ),
             }
             for ref in ordered_refs
         ]
@@ -1520,31 +1572,102 @@ class ReasoningFrameService:
             }
             for edge_id, edge in sorted(edges.items())
         ]
-        return (
-            {
-                "unit_id": unit_id,
-                "unit_type": unit_type,
-                "title": title,
-                "summary": self._truncate_text(summary, 280),
-                "relevance_score": round(max(0.0, min(1.0, relevance_score)), 4),
-                "active_conclusion_refs": active_refs,
-                "constraint_refs": constraints,
-                "commitment_refs": commitments,
-                "conflict_refs": conflict_edges,
-                "source_atom_refs": ordered_refs,
-                "relationship_refs": sorted(edges),
-                "relationships": relationship_items,
-                "items": items,
-                "sequence": sequence,
-                "inclusion_reasons": {
-                    ref: list(inclusion_reasons.get(ref, ["coherent_closure"]))
-                    for ref in ordered_refs
-                },
-                "compression": {"mode": "none"},
-                "truncated": False,
+        governance = self._governance_projection(ordered_refs, atoms)
+        unit_payload = {
+            "unit_id": unit_id,
+            "unit_type": unit_type,
+            "title": title,
+            "summary": self._truncate_text(summary, 280),
+            "relevance_score": round(max(0.0, min(1.0, relevance_score)), 4),
+            "active_conclusion_refs": active_refs,
+            **conclusion_classes,
+            "constraint_refs": constraints,
+            "commitment_refs": commitments,
+            "conflict_refs": conflict_edges,
+            "source_atom_refs": ordered_refs,
+            "relationship_refs": sorted(edges),
+            "relationships": relationship_items,
+            "items": items,
+            "sequence": sequence,
+            "inclusion_reasons": {
+                ref: list(inclusion_reasons.get(ref, ["coherent_closure"]))
+                for ref in ordered_refs
             },
+            "compression": {"mode": "none"},
+            "truncated": False,
+        }
+        if governance:
+            unit_payload["governance"] = governance
+        return (
+            unit_payload,
             omissions,
         )
+
+    def _governance_projection(
+        self,
+        refs: Sequence[str],
+        atoms: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        projection: dict[str, Any] = {}
+        for ref in refs:
+            atom = atoms[ref]
+            payload = atom.get("payload") or {}
+            item: dict[str, Any] = {}
+            for field in (
+                "epistemic_standing",
+                "normative_standing",
+                "operational_authority",
+                "ratification",
+            ):
+                if isinstance(payload.get(field), Mapping):
+                    item[field] = dict(payload[field])
+            if atom.get("type") == "adjudication":
+                for field in (
+                    "subject_ref",
+                    "claim_kind",
+                    "outcome",
+                    "reasons_for_refs",
+                    "reasons_against_refs",
+                    "covenant_refs",
+                    "unresolved_objections",
+                    "adjudication_scope",
+                    "dissent_refs",
+                    "review_triggers",
+                    "ratifier",
+                    "reconstructed_at",
+                    "diachronic",
+                ):
+                    if field in payload:
+                        value = payload[field]
+                        item[field] = (
+                            dict(value)
+                            if isinstance(value, Mapping)
+                            else list(value)
+                            if isinstance(value, list)
+                            else value
+                        )
+            if atom.get("type") in {"covenant", "primal_guidance"}:
+                for field in (
+                    "constitutional_tier",
+                    "precedence",
+                    "interpretive_rules",
+                    "amendability",
+                    "amendment_requirements",
+                    "protected_fields",
+                    "effective_from",
+                ):
+                    if field in payload:
+                        value = payload[field]
+                        item[field] = (
+                            dict(value)
+                            if isinstance(value, Mapping)
+                            else list(value)
+                            if isinstance(value, list)
+                            else value
+                        )
+            if item:
+                projection[ref] = item
+        return projection
 
     def _page_descriptor(
         self,
@@ -1554,6 +1677,7 @@ class ReasoningFrameService:
         unit: Mapping[str, Any],
         atoms: Mapping[str, Mapping[str, Any]],
         semantic_scope: Mapping[str, str],
+        memory_mode: str,
     ) -> dict[str, Any]:
         page_atom_refs = list(unit.get("_page_atom_refs", unit["source_atom_refs"]))
         page_edge_refs = list(
@@ -1572,6 +1696,7 @@ class ReasoningFrameService:
             "frame_id": frame_id,
             "revision": dict(revision),
             "semantic_scope": dict(semantic_scope),
+            "memory_mode": memory_mode,
             "unit_ref": unit["unit_id"],
             "page_type": unit["unit_type"],
             "title": descriptor_text["title"],
@@ -1688,12 +1813,14 @@ class ReasoningFrameService:
         *,
         frame_id: str,
         revision: Mapping[str, Any],
+        memory_mode: str,
     ) -> None:
         fields = (
             "descriptor_version",
             "frame_id",
             "revision",
             "semantic_scope",
+            "memory_mode",
             "unit_ref",
             "page_type",
             "title",
@@ -1723,6 +1850,8 @@ class ReasoningFrameService:
             raise ValidationError("page descriptor does not belong to frame_id")
         if self._revision(page.get("revision")) != dict(revision):
             raise ValidationError("page descriptor revision does not match frame revision")
+        if str(page.get("memory_mode") or "") != memory_mode:
+            raise ValidationError("page descriptor memory_mode does not match request")
         core = {
             key: page[key]
             for key in (
@@ -1730,6 +1859,7 @@ class ReasoningFrameService:
                 "frame_id",
                 "revision",
                 "semantic_scope",
+                "memory_mode",
                 "unit_ref",
                 "page_type",
                 "title",
@@ -1846,6 +1976,15 @@ class ReasoningFrameService:
             "summary": unit["summary"],
             "relevance_score": unit["relevance_score"],
             "active_conclusion_refs": list(unit.get("active_conclusion_refs", [])),
+            "candidate_conclusion_refs": list(
+                unit.get("candidate_conclusion_refs", [])
+            ),
+            "contested_conclusion_refs": list(
+                unit.get("contested_conclusion_refs", [])
+            ),
+            "rejected_or_superseded_refs": list(
+                unit.get("rejected_or_superseded_refs", [])
+            ),
             "constraint_refs": list(unit.get("constraint_refs", [])),
             "commitment_refs": list(unit.get("commitment_refs", [])),
             "conflict_refs": list(unit.get("conflict_refs", [])),
@@ -1856,6 +1995,11 @@ class ReasoningFrameService:
             "sequence": list(unit.get("sequence", [])),
             "inclusion_reasons": {},
             "page_id": unit.get("page_id"),
+            **(
+                {"governance": dict(unit["governance"])}
+                if isinstance(unit.get("governance"), Mapping)
+                else {}
+            ),
             "compression": {
                 "mode": "reference_summary",
                 "original_bytes": original_bytes,
@@ -1905,6 +2049,16 @@ class ReasoningFrameService:
         essential_refs = {
             str(ref) for ref in unit.get("active_conclusion_refs", []) if str(ref)
         }
+        for field in (
+            "candidate_conclusion_refs",
+            "contested_conclusion_refs",
+            "rejected_or_superseded_refs",
+        ):
+            essential_refs.update(
+                str(ref) for ref in unit.get(field, []) if str(ref)
+            )
+        if isinstance(unit.get("governance"), Mapping):
+            essential_refs.update(str(ref) for ref in unit["governance"] if str(ref))
         essential_refs.update(
             str(ref) for ref in unit.get("constraint_refs", []) if str(ref)
         )
@@ -1929,12 +2083,15 @@ class ReasoningFrameService:
         self, unit: Mapping[str, Any], essential_refs: set[str]
     ) -> list[dict[str, Any]]:
         governing_relations = {
+            "rel:adjudicates",
             "rel:constrained_by",
             "rel:contradicts",
             "rel:corrected_by",
             "rel:forbids",
+            "rel:governed_by",
             "rel:made_commitment",
             "rel:requires",
+            "rel:ratified_by",
             "rel:satisfied_commitment",
             "rel:supersedes",
         }
@@ -2006,10 +2163,73 @@ class ReasoningFrameService:
             for ref in refs
             if ref not in superseded_targets
             and ref not in constraints
-            and atoms[ref].get("type") != "episode"
-            and atoms[ref].get("lifecycle_state") in {"active", "proposed"}
+            and atoms[ref].get("type") not in {"adjudication", "episode"}
+            and atoms[ref].get("lifecycle_state") == "active"
+            and not self._atom_is_contested(atoms[ref])
+            and not self._atom_is_rejected_or_superseded(atoms[ref])
         ]
         return sorted(active, key=lambda ref: (self._atom_time(atoms[ref]), ref), reverse=True)
+
+    def _conclusion_classes(
+        self,
+        refs: Sequence[str],
+        atoms: Mapping[str, Mapping[str, Any]],
+        *,
+        constraint_refs: Sequence[str],
+        active_refs: Sequence[str],
+    ) -> dict[str, list[str]]:
+        excluded = set(constraint_refs) | set(active_refs)
+        classes = {
+            "candidate_conclusion_refs": [],
+            "contested_conclusion_refs": [],
+            "rejected_or_superseded_refs": [],
+        }
+        for ref in refs:
+            atom = atoms[ref]
+            if ref in excluded or atom.get("type") in {"adjudication", "episode"}:
+                continue
+            if self._atom_is_rejected_or_superseded(atom):
+                classes["rejected_or_superseded_refs"].append(ref)
+            elif self._atom_is_contested(atom):
+                classes["contested_conclusion_refs"].append(ref)
+            elif atom.get("lifecycle_state") == "proposed":
+                classes["candidate_conclusion_refs"].append(ref)
+        for field, values in classes.items():
+            classes[field] = sorted(
+                values,
+                key=lambda ref: (self._atom_time(atoms[ref]), ref),
+                reverse=True,
+            )
+        return classes
+
+    def _atom_is_contested(self, atom: Mapping[str, Any]) -> bool:
+        if atom.get("health_status") == "contradicted":
+            return True
+        payload = atom.get("payload") or {}
+        return any(
+            str((payload.get(field) or {}).get("status") or "") == "contested"
+            for field in (
+                "epistemic_standing",
+                "normative_standing",
+                "operational_authority",
+            )
+        )
+
+    def _atom_is_rejected_or_superseded(
+        self, atom: Mapping[str, Any]
+    ) -> bool:
+        if atom.get("lifecycle_state") in {"archived", "superseded"}:
+            return True
+        payload = atom.get("payload") or {}
+        return any(
+            str((payload.get(field) or {}).get("status") or "")
+            in {"rejected", "superseded"}
+            for field in (
+                "epistemic_standing",
+                "normative_standing",
+                "operational_authority",
+            )
+        )
 
     def _constraint_refs(
         self,
@@ -2020,7 +2240,8 @@ class ReasoningFrameService:
         constraints = {
             ref
             for ref in refs
-            if atoms[ref].get("type") in {"limitation", "policy"}
+            if atoms[ref].get("type")
+            in {"covenant", "limitation", "policy", "primal_guidance"}
             or (
                 atoms[ref].get("type") == "preference"
                 and str((atoms[ref].get("payload") or {}).get("polarity") or "")
@@ -2103,6 +2324,7 @@ class ReasoningFrameService:
         semantic_scope: Mapping[str, str],
         requester: str,
         target_processor: str,
+        memory_mode: str,
     ) -> str | None:
         if atom is None:
             return "not_found"
@@ -2110,6 +2332,12 @@ class ReasoningFrameService:
             return "deleted"
         if atom.get("health_status") == "deleted":
             return "deleted"
+        if str(atom.get("lifecycle_state") or "active") not in set(
+            self.retrieval._memory_lifecycle_states(memory_mode)
+        ):
+            return "lifecycle_hidden:" + str(
+                atom.get("lifecycle_state") or "active"
+            )
         if not self._semantic_atom_visible(atom, semantic_scope):
             return "semantic_scope_hidden"
         if not scope_visible(atom.get("scope", {}), scope):
@@ -2246,11 +2474,20 @@ class ReasoningFrameService:
         self,
         ref: str,
         active_refs: Sequence[str],
+        candidate_refs: Sequence[str],
+        contested_refs: Sequence[str],
+        rejected_refs: Sequence[str],
         constraints: Sequence[str],
         commitments: Sequence[str],
     ) -> str:
         if ref in active_refs:
             return "active_conclusion"
+        if ref in candidate_refs:
+            return "candidate_conclusion"
+        if ref in contested_refs:
+            return "contested_conclusion"
+        if ref in rejected_refs:
+            return "rejected_or_superseded"
         if ref in constraints:
             return "constraint"
         if ref in commitments:

@@ -8,6 +8,9 @@
     "client_identity": { "type": "string" },
     "target_processor": { "type": "string" },
     "retrieval_mode": { "enum": ["general", "self_awareness", "shared_coordination", "agentic_recall"] },
+    "memory_mode": {
+      "enum": ["operational_recall", "deliberation", "historical_review"]
+    },
     "task_context": { "type": "object" },
     "scope": { "$ref": "scope.schema.json" },
     "shared_view_ref": { "type": "string" },

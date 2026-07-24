@@ -21,6 +21,9 @@
     "request": { "type": "object" },
     "graph_version": { "type": "integer", "minimum": 0 },
     "generated_at": { "type": "string" },
+    "memory_mode": {
+      "enum": ["operational_recall", "deliberation", "historical_review"]
+    },
     "items": {
       "type": "array",
       "items": {

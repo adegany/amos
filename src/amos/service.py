@@ -1,8 +1,8 @@
 """High-level AMOS v1 service API.
 
-`Amos` is intentionally a thin compatibility facade. Domain behavior lives in
-explicit subsystem services so storage, retrieval, maintenance, and views can
-evolve independently without turning the public API object into a God Object.
+`Amos` is the stable public API entry point. Domain behavior lives in explicit
+subsystem services so storage, retrieval, maintenance, governance, and views
+can evolve independently without turning the entry point into a God Object.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from .access_service import AccessService
 from .capacity_service import CapacityService
 from .diagnostics_service import DiagnosticsService
 from .graph_service import GraphService
+from .governance_service import GovernanceService
 from .index_service import IndexService
 from .mutations_service import MutationService
 from .policy_service import PolicyService
@@ -54,6 +55,9 @@ class Amos:
         self.temporal = TemporalService()
         self.capacity = CapacityService(self.store)
         self.mutations = MutationService(
+            self.store, self.access, self.indexes, self.graph
+        )
+        self.governance = GovernanceService(
             self.store, self.access, self.indexes, self.graph
         )
         self.stewardship = StewardshipService(
@@ -218,13 +222,59 @@ class Amos:
     ) -> dict[str, Any]:
         return self.mutations.propose_memory_atoms(candidates, actor=actor, scope=scope)
 
+    def ratify_proposal(
+        self,
+        *,
+        proposal_ref: str,
+        adjudication_ref: str,
+        expected_version: int,
+        actor: str,
+        authorization_context: Mapping[str, Any],
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        return self.governance.ratify_proposal(
+            proposal_ref=proposal_ref,
+            adjudication_ref=adjudication_ref,
+            expected_version=expected_version,
+            actor=actor,
+            authorization_context=authorization_context,
+            idempotency_key=idempotency_key,
+        )
+
+    def analyze_provenance(
+        self, *, atom_ref: str, max_depth: int = 64
+    ) -> dict[str, Any]:
+        return self.governance.analyze_provenance(
+            atom_ref=atom_ref, max_depth=max_depth
+        )
+
+    def diachronic_ratification_status(
+        self,
+        *,
+        subject_ref: str,
+        identity_ref: str,
+        required_confirmations: int = 2,
+        min_interval_seconds: int = 0,
+    ) -> dict[str, Any]:
+        return self.governance.diachronic_ratification_status(
+            subject_ref=subject_ref,
+            identity_ref=identity_ref,
+            required_confirmations=required_confirmations,
+            min_interval_seconds=min_interval_seconds,
+        )
+
     def commit_memory_atoms(
         self,
         atoms: Sequence[Mapping[str, Any]],
         *,
         actor: str = "system",
+        authorization_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self.mutations.commit_memory_atoms(atoms, actor=actor)
+        return self.mutations.commit_memory_atoms(
+            atoms,
+            actor=actor,
+            authorization_context=authorization_context,
+        )
 
     def update_atom(
         self,
@@ -329,6 +379,7 @@ class Amos:
         requester: str = "system",
         target_processor: str = "reasoner",
         retrieval_mode: str = "general",
+        memory_mode: str = "operational_recall",
         max_items: int | None = None,
         token_or_byte_budget: int | Mapping[str, int] | None = None,
         include_conflicts: bool | None = None,
@@ -345,6 +396,7 @@ class Amos:
             requester=requester,
             target_processor=target_processor,
             retrieval_mode=retrieval_mode,
+            memory_mode=memory_mode,
             max_items=max_items,
             token_or_byte_budget=token_or_byte_budget,
             include_conflicts=include_conflicts,
@@ -363,6 +415,7 @@ class Amos:
         scope: Mapping[str, Any] | None = None,
         requester: str = "system",
         target_processor: str = "reasoner",
+        memory_mode: str = "operational_recall",
         include_conflicts: bool = False,
         include_archived: bool = False,
         include_low_health: bool = False,
@@ -376,6 +429,7 @@ class Amos:
             scope=scope,
             requester=requester,
             target_processor=target_processor,
+            memory_mode=memory_mode,
             include_conflicts=include_conflicts,
             include_archived=include_archived,
             include_low_health=include_low_health,
@@ -393,6 +447,7 @@ class Amos:
         scope: Mapping[str, Any] | None = None,
         requester: str = "system",
         target_processor: str = "reasoner",
+        memory_mode: str = "operational_recall",
         token_or_byte_budget: int | Mapping[str, int] | None = None,
         run_policy: bool = True,
     ) -> dict[str, Any]:
@@ -404,6 +459,7 @@ class Amos:
             scope=scope,
             requester=requester,
             target_processor=target_processor,
+            memory_mode=memory_mode,
             token_or_byte_budget=token_or_byte_budget,
             run_policy=run_policy,
         )
@@ -420,6 +476,7 @@ class Amos:
         scope: Mapping[str, Any] | None = None,
         requester: str = "system",
         target_processor: str = "reasoner",
+        memory_mode: str = "operational_recall",
         token_or_byte_budget: int | Mapping[str, int] | None = None,
         run_policy: bool = True,
     ) -> dict[str, Any]:
@@ -433,6 +490,7 @@ class Amos:
             scope=scope,
             requester=requester,
             target_processor=target_processor,
+            memory_mode=memory_mode,
             token_or_byte_budget=token_or_byte_budget,
             run_policy=run_policy,
         )

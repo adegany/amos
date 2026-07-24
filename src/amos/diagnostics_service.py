@@ -218,6 +218,7 @@ class DiagnosticsService:
                         edges[edge["edge_id"]] = replay_edge_projection(edge)
             elif event_type in {
                 "atom_merged",
+                "proposal_ratified",
                 "steward_run",
                 "retrieval_outcome_recorded",
                 "decay_policy_applied",

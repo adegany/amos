@@ -598,9 +598,12 @@ storage_cleanup:
   delete_archived_after_seconds: 604800
   delete_stale_after_seconds: 1209600
   protected_types:
+    - adjudication
     - policy
     - self_model
     - commitment
+    - covenant
+    - primal_guidance
   compact_idempotency_after_seconds: 604800
   max_idempotency_compactions_per_tick: 512
   sqlite_compaction:
@@ -623,6 +626,7 @@ GET /v1/health/memory
 
 POST /v1/packets:retrieve
   returns a packet from the current graph view
+  defaults to memory_mode operational_recall, which admits active atoms only
   queues a background policy tick when run_policy is true
 
 POST /v1/atoms:get
@@ -642,6 +646,18 @@ POST /v1/reasoning-pages:load
   returns focused or supporting detail while preserving conclusions,
   constraints, commitments, temporal sequence, conflicts and source references
 
+POST /v1/proposals:ratify
+  performs the only proposed-to-active transition
+  binds the proposal version, identity-authored adjudication, constitutional
+  references, objections, scope and self_ratification capability in one event
+
+POST /v1/provenance:analyze
+  reports root evidence, independence groups, testimony families, common
+  ancestors, ancestry depth and circular support
+
+POST /v1/ratifications:diachronic-status
+  evaluates independent reconstruction confirmations and minimum intervals
+
 POST /v1/memory-policy:run
   runs the policy synchronously as an explicit operator/admin action
 ```
@@ -651,6 +667,69 @@ The in-process service API still exposes `run_memory_policy()` and
 CLI use, and embedded deployments
 that intentionally want a synchronous tick. The shared-service contract is that
 connected agents do not own lifecycle maintenance themselves.
+
+### Constitutional self-ratification
+
+V1-local implements constitutional self-ratification as a generic memory
+invariant. AMOS authenticates and records the decision; it does not decide what
+the identity ought to believe.
+
+```text
+consulted source:
+  may supply evidence, testimony, arguments or counterarguments
+  never supplies ratification authority
+
+proposed atom:
+  epistemic_standing.status = candidate
+  normative_standing.status = candidate
+  operational_authority.status = withheld
+
+adjudication atom:
+  names the proposal as subject_ref
+  records claim_kind, outcome, reasons for and against, active
+  covenant/primal-guidance refs, unresolved objections, dissent, review
+  triggers, three-axis standing and reconstruction metadata
+  ratifier.mode is exactly self_ratification
+
+ratify_proposal:
+  requires expected_version and self_ratification capability
+  requires authenticated identity_ref == adjudication ratifier.identity_ref
+  requires matching proposal/adjudication envelope scope
+  atomically activates the proposal, projects governance edges and appends
+  proposal_ratified with both records and expected-version context
+```
+
+Generic update cannot perform `proposed -> active` and cannot rewrite
+epistemic, normative, operational, or ratification fields. Generic merge,
+distillation, and automatic maintenance cannot alter constitutional records or
+launder proposed/contested sources into active derived memory. Constitutional
+creation and amendment use separate `constitutional_authoring` and
+`constitutional_amendment` capabilities; immutable primal guidance remains
+immutable even to a privileged service actor. Entrenched records additionally
+require `constitutional_entrenched_amendment`; changing a named protected field
+requires `constitutional_protected_field_amendment` and every capability listed
+in `amendment_requirements.required_capabilities`.
+
+Retrieval and reasoning accept one of three lifecycle modes:
+
+```text
+operational_recall:
+  active atoms only
+
+deliberation:
+  active and proposed atoms
+  conflicts included
+  counterevidence required
+
+historical_review:
+  active, proposed, archived and superseded atoms
+```
+
+Reasoning units expose `active_conclusion_refs`,
+`candidate_conclusion_refs`, `contested_conclusion_refs`, and
+`rejected_or_superseded_refs`. Governance projections preserve ratification,
+standing, objections, dissent, covenants and diachronic metadata through frame
+compression and demand paging.
 
 ### Revision-bound reasoning memory
 
@@ -686,7 +765,8 @@ the response does not spend the frame budget echoing the request's free text or
 duplicated runtime context. Orientation echoes only bounded semantic/task
 fields. Units remain coherent while admission proceeds from complete form, to
 essential projection, reference summary, and reference-only form. Every
-compressed form retains active conclusions, governing constraints and
+compressed form retains active, candidate, contested and rejected/superseded
+conclusions, governing constraints and
 commitments, causal/temporal sequence, conflicts, supersession and source
 references before peripheral detail is removed, and keeps a descriptor for the
 omitted detail. An omitted unit receives a descriptor only if that descriptor
@@ -711,8 +791,8 @@ references.
 
 The packet endpoints remain the v1 compatibility path for associative recall,
 and `/v1/atoms:get` remains the exact-ID path. AMOS does not select a Cogito
-memory mode and does not own application rollback; Cogito chooses its supported
-mode, retains the active working-memory set, enforces total-cycle budgets, and
+memory mode on its own: it enforces the mode explicitly selected by Cogito.
+Cogito retains the active working-memory set, enforces total-cycle budgets, and
 can return to its legacy packet integration independently. `X-Request-ID` is
 echoed on JSON responses for cross-service tracing without logging request
 bodies.
@@ -741,6 +821,10 @@ commit only low-risk, policy-allowed proposals such as add_atom distillations
   and explicit structural graph relations with active endpoints
 defer medium/high-risk proposals, health changes, merges, archives, access
   policy changes, and ambiguous claims to explicit review
+never create or amend covenants, primal guidance, identity commitments,
+  standing, operational authority, or ratification records
+never create active derived output from proposed, contested, or unratified
+  source atoms
 prune archived/stale atoms from hot retrieval indexes during idle cleanup
 delete expired archived/stale atoms through normal tombstone and journal
   projection paths while preserving protected types
@@ -763,8 +847,8 @@ associator from mixing otherwise similar records from unrelated projects or
 domains; activity-role facets do not imply support merely because they are
 sequential. `graph_relations` declare ontology relation ids and endpoints,
 using `$self` for the owning atom. AMOS validates both structures at ingestion,
-ignores them while the owning atom is proposed, and re-evaluates them on later
-maintenance passes after authorized promotion. Structural relations may be
+ignores them while the owning atom is proposed, and re-evaluates them after
+constitutional self-ratification. Structural relations may be
 auto-committed; causal and other non-low-risk declarations remain reviewable.
 Intrinsic and explicitly declared edges carry the owning atom's evidence and
 confidence by default. A relation may supply narrower evidence/confidence
@@ -1085,6 +1169,9 @@ service artifacts:
   record_retrieval_outcome endpoint
   retrieval outcome utility/salience feedback loop
   request_maintenance endpoint
+  constitutional self-ratification endpoint
+  root provenance analysis endpoint
+  diachronic ratification-status endpoint
   memory-policy status/configure/run endpoints
   memory-policy decay executor
   maintenance-processor listing endpoint
@@ -1103,9 +1190,10 @@ service artifacts:
   LLM reviewer policy endpoint
   journal/replay verification endpoint
   stdlib HTTP adapter
-  CLI commands for init, capture, commit, retrieve, self-awareness,
-  agentic-recall, steward, distill, merge, maintenance, memory policy,
-  maintenance processors, capacity, SMP analysis, health, verify, and serve
+  CLI commands for init, capture, commit, retrieve, ratify-proposal,
+  provenance-analysis, diachronic-status, self-awareness, agentic-recall,
+  steward, distill, merge, maintenance, memory policy, maintenance processors,
+  capacity, SMP analysis, health, verify, and serve
 
 active worker artifact:
   background memory policy worker

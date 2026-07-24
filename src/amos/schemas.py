@@ -19,21 +19,33 @@ SCHEMA_VERSION = "amos.v1"
 
 ATOM_TYPES = {
     "action_outcome",
+    "adjudication",
     "agentic_trace",
     "belief",
     "capability",
     "commitment",
+    "covenant",
     "episode",
     "goal",
     "limitation",
     "policy",
     "preference",
+    "primal_guidance",
     "procedure",
     "runtime_state",
     "self_assessment",
     "self_model",
     "self_narrative",
     "semantic",
+}
+
+CONSTITUTIONAL_ATOM_TYPES = {"covenant", "primal_guidance"}
+
+GOVERNANCE_PAYLOAD_FIELDS = {
+    "epistemic_standing",
+    "normative_standing",
+    "operational_authority",
+    "ratification",
 }
 
 EDGE_RELATIONS = SEED_RELATION_IDS
@@ -184,6 +196,30 @@ PREFERENCE_POLARITIES = {
     "requires",
 }
 
+POSITIVE_ADJUDICATION_OUTCOMES = {
+    "adopted",
+    "confirmed",
+    "provisionally_adopted",
+}
+
+ADJUDICATION_OUTCOMES = POSITIVE_ADJUDICATION_OUTCOMES | {
+    "rejected",
+    "revised",
+    "withdrawn",
+}
+
+STANDING_STATUSES = {
+    "candidate",
+    "contested",
+    "none",
+    "operative",
+    "provisional",
+    "rejected",
+    "settled",
+    "superseded",
+    "withheld",
+}
+
 
 def _has_payload_field(payload: Mapping[str, Any], field: str) -> bool:
     return field in payload and payload[field] is not None
@@ -259,8 +295,179 @@ def _require_agent_identity_types(atom_type: str, payload: Mapping[str, Any]) ->
     )
 
 
+def _validate_standing(
+    atom_type: str, payload: Mapping[str, Any], *, required: bool = False
+) -> None:
+    fields = (
+        "epistemic_standing",
+        "normative_standing",
+        "operational_authority",
+    )
+    if required:
+        _require_payload_fields(atom_type, payload, fields)
+    for field in fields:
+        if field not in payload:
+            continue
+        value = payload[field]
+        if not isinstance(value, Mapping):
+            raise ValidationError(f"{atom_type} payload field {field} must be an object")
+        status = str(value.get("status") or "")
+        if not status:
+            raise ValidationError(
+                f"{atom_type} payload field {field}.status is required"
+            )
+        if status not in STANDING_STATUSES:
+            raise ValidationError(
+                f"unsupported {field}.status: {status}"
+            )
+
+
+def _validate_adjudication_payload(payload: Mapping[str, Any]) -> None:
+    atom_type = "adjudication"
+    _require_payload_fields(
+        atom_type,
+        payload,
+        (
+            "subject_ref",
+            "claim_kind",
+            "outcome",
+            "reasons_for_refs",
+            "reasons_against_refs",
+            "covenant_refs",
+            "unresolved_objections",
+            "adjudication_scope",
+            "epistemic_standing",
+            "normative_standing",
+            "operational_authority",
+            "dissent_refs",
+            "review_triggers",
+            "ratifier",
+            "reconstructed_at",
+            "diachronic",
+        ),
+    )
+    _require_payload_types(
+        atom_type,
+        payload,
+        {
+            "subject_ref": str,
+            "claim_kind": str,
+            "outcome": str,
+            "adjudication_scope": Mapping,
+            "ratifier": Mapping,
+            "reconstructed_at": str,
+            "diachronic": Mapping,
+        },
+    )
+    for field in (
+        "reasons_for_refs",
+        "reasons_against_refs",
+        "covenant_refs",
+        "unresolved_objections",
+        "dissent_refs",
+        "review_triggers",
+    ):
+        _require_payload_string_list(atom_type, payload, field)
+    if not payload.get("covenant_refs"):
+        raise ValidationError("adjudication payload field covenant_refs must not be empty")
+    outcome = str(payload.get("outcome") or "")
+    if outcome not in ADJUDICATION_OUTCOMES:
+        raise ValidationError(f"unsupported adjudication outcome: {outcome}")
+    ratifier = payload.get("ratifier")
+    if not isinstance(ratifier, Mapping):
+        raise ValidationError("adjudication payload field ratifier must be an object")
+    if not str(ratifier.get("identity_ref") or "").strip():
+        raise ValidationError("adjudication ratifier.identity_ref is required")
+    if ratifier.get("mode") != "self_ratification":
+        raise ValidationError(
+            "adjudication ratifier.mode must be self_ratification"
+        )
+    diachronic = payload.get("diachronic")
+    if not isinstance(diachronic, Mapping):
+        raise ValidationError("adjudication payload field diachronic must be an object")
+    if not isinstance(diachronic.get("independent_reconstruction"), bool):
+        raise ValidationError(
+            "adjudication diachronic.independent_reconstruction must be a boolean"
+        )
+    if not isinstance(diachronic.get("original_reasoning_shown"), bool):
+        raise ValidationError(
+            "adjudication diachronic.original_reasoning_shown must be a boolean"
+        )
+    new_experience_refs = diachronic.get("new_experience_refs")
+    if not isinstance(new_experience_refs, list) or not all(
+        isinstance(item, str) for item in new_experience_refs
+    ):
+        raise ValidationError(
+            "adjudication diachronic.new_experience_refs must be a list of strings"
+        )
+    if diachronic.get("disposition") not in {
+        "confirmed",
+        "initial",
+        "revised",
+        "withdrawn",
+    }:
+        raise ValidationError(
+            "unsupported adjudication diachronic.disposition"
+        )
+    _validate_standing(atom_type, payload, required=True)
+
+
+def _validate_constitutional_payload(
+    atom_type: str, payload: Mapping[str, Any]
+) -> None:
+    _require_payload_fields(
+        atom_type,
+        payload,
+        (
+            "constitutional_tier",
+            "precedence",
+            "interpretive_rules",
+            "amendability",
+            "amendment_requirements",
+            "protected_fields",
+            "effective_from",
+        ),
+    )
+    _require_payload_types(
+        atom_type,
+        payload,
+        {
+            "constitutional_tier": str,
+            "precedence": int,
+            "amendment_requirements": Mapping,
+            "effective_from": str,
+        },
+    )
+    for field in ("interpretive_rules", "protected_fields"):
+        _require_payload_string_list(atom_type, payload, field)
+    amendability = str(payload.get("amendability") or "")
+    if amendability not in {"amendable", "entrenched", "immutable"}:
+        raise ValidationError(f"unsupported {atom_type} amendability: {amendability}")
+    if atom_type == "covenant":
+        _require_payload_alternative(
+            atom_type, payload, (("name",), ("description",), ("rule",), ("rules",))
+        )
+    else:
+        _require_payload_alternative(
+            atom_type, payload, (("guidance",), ("description",), ("principle",))
+        )
+        if payload.get("constitutional_tier") != "primal":
+            raise ValidationError(
+                "primal_guidance constitutional_tier must be primal"
+            )
+
+
 def validate_atom_payload(atom_type: str, payload: Mapping[str, Any]) -> None:
     """Enforce the v1 typed payload contracts used by MemoryAtom.type."""
+
+    _validate_standing(atom_type, payload)
+
+    if atom_type == "adjudication":
+        _validate_adjudication_payload(payload)
+        return
+    if atom_type in {"covenant", "primal_guidance"}:
+        _validate_constitutional_payload(atom_type, payload)
+        return
 
     if atom_type == "belief":
         _require_payload_alternative(

@@ -7,6 +7,7 @@ def test_amos_facade_composes_subsystems_without_backreferences(amos):
         "capacity": amos.capacity,
         "diagnostics": amos.diagnostics,
         "graph": amos.graph,
+        "governance": amos.governance,
         "indexes": amos.indexes,
         "mutations": amos.mutations,
         "policy": amos.policy,

@@ -328,7 +328,7 @@ def test_propose_batch_commit_deletion_request_and_shared_refresh(amos):
     assert deleted["residual_retention"]["packet_cache"] == "purged"
 
 
-def test_proposed_intrinsic_links_are_isolated_until_atom_promotion(amos):
+def test_proposed_intrinsic_links_are_isolated_from_generic_promotion(amos):
     source = amos.commit_atom(
         {
             "id": "active_source_for_proposal",
@@ -356,19 +356,15 @@ def test_proposed_intrinsic_links_are_isolated_until_atom_promotion(amos):
     assert proposal["edges"] == []
     assert amos.store.list_edges() == []
 
-    promoted = amos.update_atom(
-        proposal["atom"]["id"],
-        set_fields={"lifecycle_state": "active"},
-        expected_version=proposal["atom"]["version"],
-    )
+    with pytest.raises(ValidationError, match="ratify_proposal"):
+        amos.update_atom(
+            proposal["atom"]["id"],
+            set_fields={"lifecycle_state": "active"},
+            expected_version=proposal["atom"]["version"],
+        )
 
-    assert promoted["atom"]["lifecycle_state"] == "active"
-    assert len(promoted["projected_edges"]) == 1
-    edge = promoted["projected_edges"][0]
-    assert edge["source_ref"] == proposal["atom"]["id"]
-    assert edge["target_ref"] == source["id"]
-    assert edge["relation"] == "rel:derived_from"
-    assert edge["lifecycle_state"] == "active"
+    assert amos.store.get_atom(proposal["atom"]["id"])["lifecycle_state"] == "proposed"
+    assert amos.store.list_edges() == []
     assert amos.verify_replay()["status"] == "ok"
 
 

@@ -21,6 +21,9 @@
     "scope": { "$ref": "scope.schema.json" },
     "requester": { "type": "string", "minLength": 1 },
     "target_processor": { "type": "string", "minLength": 1 },
+    "memory_mode": {
+      "enum": ["operational_recall", "deliberation", "historical_review"]
+    },
     "token_or_byte_budget": {
       "oneOf": [
         { "type": "integer", "minimum": 1 },

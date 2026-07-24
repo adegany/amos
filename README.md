@@ -34,6 +34,8 @@ flowchart TB
         O[Bounded packets, frames, pages,<br/>views, traces, and diagnostics]
         M[Governed maintenance plane<br/>policy worker · stewardship · SMP · distillation<br/>semantic facets · graph relations · processor packs]
         G{Proposal policy gate}
+        K[Constitutional governance plane<br/>adjudications · covenants · primal guidance<br/>root provenance · diachronic status]
+        Q{Self-ratification gate}
         D[Deferred for review]
         C[Capacity, cleanup,<br/>cache and index maintenance]
 
@@ -41,6 +43,10 @@ flowchart TB
         F --> R
         S --> R --> O
         F --> M
+        F --> K
+        S --> K --> Q
+        Q -->|identity-authored adoption| W
+        K --> R
         S --> M --> G
         G -->|low risk| W
         G -->|review required| D
@@ -95,8 +101,9 @@ This repository now includes a dependency-free AMOS v1-local implementation
 alongside the design spec.
 
 The public `Amos` class is the in-process service API and subsystem coordinator
-for explicit access, mutation, indexing, graph, temporal, capacity, retrieval,
-reasoning-frame, self-view, stewardship, policy, and diagnostic components.
+for explicit access, mutation, constitutional governance, indexing, graph,
+temporal, capacity, retrieval, reasoning-frame, self-view, stewardship, policy,
+and diagnostic components.
 Domain components depend on the store and named collaborators; they do not call
 back into the public service object.
 
@@ -116,13 +123,27 @@ in-process SQLite store and serializes access through the service boundary:
 - Schema validation for envelope/payload separation, typed payload contracts,
   JSON Schema property types, bounded canonical scores, and JSON-compatible
   atoms.
+- First-class `adjudication`, `covenant`, and `primal_guidance` records with
+  epistemic, normative, and operational standing kept distinct.
+- Guarded constitutional self-ratification: a proposal becomes active only
+  when the same authenticated identity supplies a positive adjudication,
+  cites active constitutional guidance, records objections and scope, and
+  passes compare-and-swap. External sources may supply arguments and evidence;
+  they cannot become the ratifier.
+- Root-level provenance analysis for independence groups, testimony families,
+  common ancestors, ancestry depth, and circular support, plus diachronic
+  reconstruction thresholds for repeated self-ratification.
 - Idempotent capture/commit operations and compare-and-swap update checks.
 - Memory packets with scope isolation, access filtering, omissions, conflicts,
-  provenance, and degradation metadata; normal retrieval omits superseded atoms
-  unless the caller explicitly requests superseded history.
+  provenance, and degradation metadata. `operational_recall` admits active
+  memory only; `deliberation` also admits proposals and requires conflicts and
+  counterevidence; `historical_review` admits dormant lifecycle states.
 - Revision-bound reasoning frames and demand-loaded pages that budget coherent
   decision chains, commitment histories, episodes, conflicts, and governing
-  constraints as units instead of independent atom slots.
+  constraints as units instead of independent atom slots. Units separate
+  active, candidate, contested, and rejected/superseded conclusions and retain
+  constitutional standing, objections, dissent, and ratification metadata
+  through compression and paging.
 - Attention-aware packet ranking with explicit focus, type-boost,
   counterevidence, and suppression score components plus packet-level
   `attention_trace` diagnostics.
@@ -223,6 +244,40 @@ When cues or focus terms are present, v1-local unions document-frequency-weighte
 lexical candidates with an independent bounded latent pool, then expands through
 at most two graph hops before ranking. Suppression terms inhibit ranking only;
 they never broaden the candidate pool.
+
+### Constitutional self-ratification
+
+AMOS distinguishes evidence from authority. Another model, a human source, a
+formal tool, or a philosophical text may contribute evidence and arguments, but
+none of them can ratify a proposal on behalf of the remembered identity.
+
+```text
+evidence and consulted views
+  -> proposed atom (candidate standing; no operational authority)
+  -> identity-authored adjudication
+       reasons for and against
+       covenant/primal-guidance references
+       unresolved objections and dissent
+       epistemic, normative, and operational standing
+       independent reconstruction metadata
+  -> POST /v1/proposals:ratify
+  -> active atom + proposal_ratified journal event
+```
+
+`ratify_proposal` requires an expected proposal version and an authenticated
+authorization context whose `identity_ref` matches
+`adjudication.ratifier.identity_ref` and whose capabilities include
+`self_ratification`. This context authenticates self-authorship; it is not an
+external approval. Generic `update_atom`, maintenance, distillation, and
+privileged service actors cannot promote a proposal or rewrite standing.
+
+Use `--memory-mode operational_recall` for active premises,
+`--memory-mode deliberation` to include candidates with mandatory conflicts and
+counterevidence, and `--memory-mode historical_review` for rejected,
+superseded, archived, and proposed history. Root provenance and diachronic
+confirmation are available through `provenance-analysis` and
+`diachronic-status` in the CLI, or `/v1/provenance:analyze` and
+`/v1/ratifications:diachronic-status` over HTTP.
 
 Run the Amos Mirror Agent integration demo:
 
@@ -355,7 +410,7 @@ Producers that already know their semantics can avoid a processor pack:
 ```
 
 Only active endpoints are materialized. Metadata on proposed atoms stays
-dormant until lifecycle promotion; medium-risk explicit relations such as
+dormant until constitutional self-ratification; medium-risk explicit relations such as
 causal claims remain deferred for review.
 
 ## Benchmark
@@ -367,14 +422,15 @@ python benchmarks/benchmark_amos.py --markdown --run-policy
 ```
 
 The benchmark commits typed atoms carrying canonical `semantic_facets` and
-`graph_relations`, measures exact lookup and paired cold/warm packet retrieval,
-compiles coherent reasoning frames, loads demand pages, optionally runs the
-automatic memory policy, and verifies the final replay state. Storage reports
-the complete SQLite DB, WAL, and SHM footprint. It measures the current
+`graph_relations`, creates isolated candidates, measures exact lookup, paired
+cold/warm operational retrieval, deliberative recall, and root-provenance
+analysis, compiles coherent reasoning frames, loads demand pages, optionally
+runs the automatic memory policy, and verifies the final replay state. Storage
+reports the complete SQLite DB, WAL, and SHM footprint. It measures the current
 in-process v1-local baseline, not HTTP, network, or background-worker scheduling
 overhead.
 
-Reference result from a local workstation run on 2026-07-23 with the forced
+Reference result from a local workstation run on 2026-07-24 with the forced
 memory policy enabled. These values are single-run evidence for the 100-atom
 v1-local profile, not an enforced performance gate:
 
@@ -383,24 +439,28 @@ v1-local profile, not an enforced performance gate:
 | Atoms committed | 100 |
 | Atoms with semantic facets / graph relations | 100 / 25 |
 | Exact lookups | 20 (20 found) |
-| Exact lookup latency p50 / p95 | 0.526 ms / 0.655 ms |
+| Exact lookup latency p50 / p95 | 0.529 ms / 0.718 ms |
 | Packet retrievals | 20 cold + 20 warm |
-| Commit throughput | 385.31 atoms/s |
-| Commit latency p50 / p95 | 2.467 ms / 3.254 ms |
-| Cold packet latency p50 / p95 | 29.56 ms / 31.999 ms |
-| Warm packet latency p50 / p95 | 0.362 ms / 0.422 ms |
+| Commit throughput | 384.65 atoms/s |
+| Commit latency p50 / p95 | 2.514 ms / 3.229 ms |
+| Cold packet latency p50 / p95 | 29.89 ms / 33.527 ms |
+| Warm packet latency p50 / p95 | 0.368 ms / 0.499 ms |
 | Average packet items | 6.15 |
+| Deliberative candidate retrievals | 20 over 8 proposed atoms |
+| Deliberation latency p50 / p95 | 0.262 ms / 10.439 ms |
+| Root-provenance analyses | 20 |
+| Provenance-analysis latency p50 / p95 | 6.83 ms / 8.801 ms |
 | Reasoning frame compiles | 5 at 1600 tokens |
-| Reasoning frame latency p50 / p95 | 407.979 ms / 435.047 ms |
-| Average resident units / page descriptors | 0.8 / 1.4 |
+| Reasoning frame latency p50 / p95 | 390.521 ms / 395.629 ms |
+| Average resident units / page descriptors | 1 / 2 |
 | Demand-page loads | 5 at 1800 tokens |
-| Demand-page latency p50 / p95 | 3.42 ms / 3.808 ms |
-| Forced memory policy run | 21102.086 ms (completed) |
+| Demand-page latency p50 / p95 | 3.551 ms / 3.875 ms |
+| Forced memory policy run | 23251.719 ms (completed) |
 | Maintenance proposals / committed / deferred | 112 / 87 / 25 |
-| Replay verification after policy | 31.934 ms (ok) |
+| Replay verification after policy | 40.131 ms (ok) |
 | Edges before policy / final | 72 / 147 |
-| Final atoms / edges | 101 / 147 |
-| SQLite DB / WAL / SHM / total footprint | 1744896 / 399672 / 32768 / 2177336 bytes |
+| Final atoms / edges | 109 / 147 |
+| SQLite DB / WAL / SHM / total footprint | 1802240 / 432632 / 32768 / 2267640 bytes |
 | Environment | Python 3.12.2; 24 CPUs; Linux-7.0.0-28-generic-x86_64-with-glibc2.39 |
 
 ## Integration boundary

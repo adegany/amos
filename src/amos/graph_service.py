@@ -322,6 +322,18 @@ class GraphService:
         for ref in _structured_ref_list(payload.get("memory_references")):
             add(atom_id, ref, "rel:uses")
 
+        if atom.get("type") == "adjudication":
+            for ref in _structured_ref_list(payload.get("covenant_refs")):
+                add(atom_id, ref, "rel:governed_by")
+            for ref in _structured_ref_list(payload.get("dissent_refs")):
+                add(atom_id, ref, "rel:preserves_dissent")
+
+        ratification = payload.get("ratification")
+        if isinstance(ratification, Mapping):
+            adjudication_ref = ratification.get("adjudication_ref")
+            if adjudication_ref:
+                add(atom_id, adjudication_ref, "rel:ratified_by")
+
         directive_ref = payload.get("directive_atom_ref") or payload.get(
             "source_directive_ref"
         )
