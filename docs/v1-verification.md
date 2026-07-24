@@ -19,6 +19,7 @@ Status terms:
 | Public API composition | `src/amos/service.py` thin `Amos` facade | `tests/test_architecture.py`, plus the entire suite through the stable facade |
 | Mutations and lifecycle | `src/amos/mutations_service.py`, `src/amos/access_service.py`, `src/amos/graph_service.py` | `tests/test_schema_and_mutations.py` |
 | Retrieval, attention, and ranking | `src/amos/retrieval_service.py`, `src/amos/index_service.py` | `tests/test_retrieval.py` |
+| Coherent reasoning frames and demand pages | `src/amos/reasoning_service.py` | `tests/test_reasoning_frames.py`, `tests/test_mirror_agent_demo.py` |
 | Self-model and shared views | `src/amos/views_service.py` | `tests/test_self_models.py` |
 | Stewardship and SMP | `src/amos/stewardship_service.py`, `src/amos/maintenance.py`, `src/amos/smp.py` | `tests/test_maintenance.py` |
 | Automatic policy and capacity | `src/amos/policy_service.py`, `src/amos/capacity_service.py`, `src/amos/workers.py` | `tests/test_policy_and_capacity.py` |
@@ -28,7 +29,7 @@ Status terms:
 | Graph/proposal/processor quality diagnostics | `src/amos/policy_service.py` | `tests/test_policy_and_capacity.py` |
 | Journal and health verification | `src/amos/diagnostics_service.py`, `src/amos/store.py` | `tests/test_schema_and_mutations.py`, `tests/test_policy_and_capacity.py` |
 | HTTP and CLI adapters | `src/amos/http_api.py`, `src/amos/cli.py` | `tests/test_cli_http.py` |
-| Mirror Agent example | `examples/mirror_agent_demo.py`, `examples/mirror_agent_ui.py` | `tests/test_mirror_agent_demo.py` |
+| Mirror Agent reference integration | `examples/mirror_agent_demo.py`, `examples/mirror_agent_ui.py` | `tests/test_mirror_agent_demo.py` (packets, frames/pages, exact lookup, canonical graph metadata, governed proposals, truthful feedback, browser endpoints) |
 | JSON Schema artifacts | `schemas/*.schema.json`, dependency-free runtime mirror in `src/amos/schemas.py` | `tests/test_schema_and_mutations.py::test_runtime_enforces_typed_payload_contracts`, `tests/test_schema_and_mutations.py::test_runtime_enforces_json_schema_property_types_and_score_bounds` |
 | SQLite migration | `migrations/sqlite/001_initial.sql` | Migration smoke command below |
 | Postgres target contract | `migrations/postgres/001_initial.sql` | Artifact only; runtime verification is intentionally absent |

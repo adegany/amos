@@ -89,6 +89,38 @@ class MirrorDemoTrainingProcessor:
                                         "score": round(current - previous, 6)
                                     },
                                     "created_by_processor": self.processor_id,
+                                    "maintenance_hints": {
+                                        "cohort_key": "mirror-demo-training",
+                                        "graph_metadata_profile": "mirror.demo.training.v1",
+                                    },
+                                    "semantic_facets": [
+                                        {
+                                            "subject": "mirror demo training controls",
+                                            "intent": "evaluate sampled control packet",
+                                            "outcome": "supported",
+                                            "outcome_direction": "positive",
+                                            "confidence": 0.82,
+                                            "controls": {
+                                                "control_signature": signature,
+                                            },
+                                            "metrics": {
+                                                "score_delta": round(
+                                                    current - previous, 6
+                                                )
+                                            },
+                                            "semantic_context_key": (
+                                                "mirror-demo-training"
+                                            ),
+                                        }
+                                    ],
+                                    "graph_relations": [
+                                        {
+                                            "source_ref": "$self",
+                                            "target_ref": outcome["id"],
+                                            "relation": "rel:derived_from",
+                                            "confidence": 0.82,
+                                        }
+                                    ],
                                 },
                                 "scope": dict(window.scope),
                                 "layer": "consolidated_long_term",
@@ -114,6 +146,10 @@ class MirrorAgentDemo:
         self.chat: list[dict[str, Any]] = []
         self.service_views: dict[str, dict[str, Any]] = {}
         self.packets: dict[str, dict[str, Any]] = {}
+        self.reasoning_frames: dict[str, dict[str, Any]] = {}
+        self.loaded_reasoning_pages: dict[str, dict[str, Any]] = {}
+        self.exact_lookups: dict[str, dict[str, Any]] = {}
+        self.retrieval_feedback: list[dict[str, Any]] = []
         self.scenario_results: dict[str, dict[str, Any]] = {}
 
     def run(self) -> dict[str, Any]:
@@ -121,6 +157,7 @@ class MirrorAgentDemo:
         self.scenario_self_model_bootstrap()
         self.scenario_cross_session_continuity()
         self.scenario_correction_driven_improvement()
+        self.scenario_demand_paged_reasoning()
         self.scenario_introspective_explanation()
         self.scenario_shared_service_coherence()
         self.scenario_capacity_pressure()
@@ -362,6 +399,80 @@ class MirrorAgentDemo:
                     "utility": 0.9,
                 }
             )
+        original = self.commit_once(
+            {
+                "id": "mirror_reasoning_design_original",
+                "type": "belief",
+                "payload": {
+                    "claim": (
+                        "Mirror Agent design work originally moved from discussion "
+                        "directly into implementation code before scope and evidence "
+                        "were mature. That approach could separate the active decision "
+                        "from its correction and governing constraints."
+                    ),
+                    "subject": AGENT_ID,
+                    "relation": "followed_design_mode",
+                    "object": "implementation_first",
+                    "semantic_facets": [
+                        {
+                            "subject": "mirror agent design workflow",
+                            "intent": "choose design response mode",
+                            "outcome": "implementation first",
+                            "outcome_direction": "negative",
+                            "confidence": 0.62,
+                            "time_index": 1,
+                            "semantic_context_key": "mirror-agent-design",
+                        }
+                    ],
+                },
+                "scope": SCOPE,
+                "evidence_refs": evidence_refs,
+                "confidence": {"level": "medium", "score": 0.62},
+                "utility": 0.75,
+            }
+        )
+        self.commit_once(
+            {
+                "id": "mirror_reasoning_design_current",
+                "type": "belief",
+                "payload": {
+                    "claim": (
+                        "Mirror Agent design work now stays at the specification "
+                        "level unless implementation code is explicitly requested. "
+                        "The current decision binds the user preference, corrected "
+                        "procedure, supporting evidence, and governing constraint into "
+                        "one coherent reasoning unit."
+                    ),
+                    "subject": AGENT_ID,
+                    "relation": "follows_design_mode",
+                    "object": "specification_first",
+                    "semantic_facets": [
+                        {
+                            "subject": "mirror agent design workflow",
+                            "intent": "choose design response mode",
+                            "outcome": "specification first",
+                            "outcome_direction": "positive",
+                            "confidence": 0.94,
+                            "time_index": 2,
+                            "semantic_context_key": "mirror-agent-design",
+                        }
+                    ],
+                    "graph_relations": [
+                        {
+                            "source_ref": "$self",
+                            "target_ref": "mirror_proc_architecture_design",
+                            "relation": "rel:constrained_by",
+                            "confidence": 0.92,
+                        }
+                    ],
+                },
+                "scope": SCOPE,
+                "evidence_refs": evidence_refs,
+                "confidence": {"level": "high", "score": 0.94},
+                "utility": 0.96,
+                "supersedes": [original["id"]],
+            }
+        )
 
     def scenario_self_model_bootstrap(self) -> None:
         self.capture(
@@ -544,7 +655,16 @@ class MirrorAgentDemo:
                 "utility": 0.95,
             }
         )
-        procedure = self.amos.store.get_atom("mirror_proc_architecture_design")
+        procedure_lookup = self.amos.retrieve_atom(
+            "mirror_proc_architecture_design",
+            scope=SCOPE,
+            requester="self_observer",
+            target_processor="self_observer",
+            include_conflicts=True,
+            include_low_health=True,
+            run_policy=False,
+        )
+        procedure = procedure_lookup.get("item")
         if procedure is None:
             raise RuntimeError("bootstrap procedure missing")
         steps = list(procedure["payload"]["steps"])
@@ -562,6 +682,7 @@ class MirrorAgentDemo:
                     set(procedure["evidence_refs"] + [correction["evidence_id"]])
                 )
             },
+            expected_version=procedure["version"],
             actor="self_observer",
             authorization_context={"roles": ["owner"]},
         )["atom"]
@@ -617,6 +738,95 @@ class MirrorAgentDemo:
             },
         )
 
+    def scenario_demand_paged_reasoning(self) -> None:
+        frame = self.amos.compile_memory_frame(
+            need=(
+                "Why is the current Mirror Agent design workflow "
+                "specification first instead of implementation code?"
+            ),
+            purpose=(
+                "apply the current specification-first decision, its history, "
+                "constraints, corrections, and commitments"
+            ),
+            depth="working_frame",
+            task_context={
+                "human_id": USER_ID,
+                "project_id": "amos",
+                "project_thread_id": "mirror-agent-demo",
+                "phase": "design_review",
+            },
+            scope=SCOPE,
+            requester="reasoner",
+            target_processor="reasoner",
+            token_or_byte_budget={"tokens": 1000},
+            run_policy=False,
+        )
+        descriptor = next(
+            (
+                item
+                for item in frame["page_index"]
+                if "mirror_reasoning_design_current"
+                in item.get("focus_atom_refs", [])
+            ),
+            frame["page_index"][0] if frame["page_index"] else None,
+        )
+        loaded_page: dict[str, Any] = {}
+        if descriptor is not None:
+            loaded_page = self.amos.load_memory_page(
+                frame_id=frame["frame_id"],
+                revision=frame["revision"],
+                page=descriptor,
+                need="load the complete specification-first decision history",
+                purpose="verify the active conclusion and its governing context",
+                depth="supporting",
+                scope=SCOPE,
+                requester="reasoner",
+                target_processor="reasoner",
+                token_or_byte_budget={"tokens": 1400},
+                run_policy=False,
+            )
+        exact = self.amos.retrieve_atom(
+            "mirror_reasoning_design_current",
+            scope=SCOPE,
+            requester="reasoner",
+            target_processor="reasoner",
+            include_conflicts=True,
+            include_low_health=True,
+            include_superseded=True,
+            run_policy=False,
+        )
+        self.reasoning_frames["scripted_demand_paging"] = frame
+        if loaded_page:
+            self.loaded_reasoning_pages["scripted_demand_paging"] = loaded_page
+        self.exact_lookups["scripted_current_decision"] = exact
+        loaded_refs = set(loaded_page.get("source_atom_refs", []))
+        self.service_views["reasoner"] = {
+            "graph_version": frame["revision"]["graph_version"],
+            "frame_id": frame["frame_id"],
+            "loaded_page_id": loaded_page.get("page_id"),
+            "exact_packet_id": exact["packet_id"],
+        }
+        self.result(
+            "demand_paged_reasoning",
+            bool(frame["page_index"])
+            and loaded_page.get("status") == "loaded"
+            and {
+                "mirror_reasoning_design_original",
+                "mirror_reasoning_design_current",
+            }.issubset(loaded_refs)
+            and exact["retrieval_mode"] == "exact"
+            and exact["found"] is True
+            and exact["item"]["atom_ref"] == "mirror_reasoning_design_current",
+            {
+                "frame_id": frame["frame_id"],
+                "resident_units": len(frame["units"]),
+                "page_descriptors": len(frame["page_index"]),
+                "loaded_page_id": loaded_page.get("page_id"),
+                "loaded_refs": sorted(loaded_refs),
+                "exact_packet_id": exact["packet_id"],
+            },
+        )
+
     def scenario_introspective_explanation(self) -> None:
         self.capture(
             "user_message",
@@ -629,7 +839,7 @@ class MirrorAgentDemo:
             max_items=8,
         )
         cited_refs = [item["atom_ref"] for item in packet["items"][:4]]
-        self.amos.record_retrieval_outcome(
+        feedback = self.amos.record_retrieval_outcome(
             packet_id=packet["packet_id"],
             request=packet["request"],
             outcome={
@@ -638,6 +848,7 @@ class MirrorAgentDemo:
                 "question": "Why did you suggest adding a Capacity Governor?",
             },
         )
+        self.retrieval_feedback.append(feedback)
         answer = (
             "Because AMOS memories say capacity governance owns budgets, watermarks, "
             "pressure modes, admin extension requests, and shielding connected agents "
@@ -848,8 +1059,80 @@ class MirrorAgentDemo:
                 "utility": 0.7,
             }
         )
+        proposal_evidence = self.capture(
+            "model_suggestion",
+            "scenario/proposal-retention/repeated-reflection",
+            {
+                "summary": "Generated reflection requires review before promotion.",
+                "authority": "proposal_only",
+            },
+        )
+        proposed = self.amos.propose_memory_atoms(
+            [
+                {
+                    "id": "mirror_proposed_reflection_a",
+                    "type": "semantic",
+                    "payload": {
+                        "summary": "Generated reflection awaiting governed review.",
+                        "proposal_retention": {
+                            "profile": "mirror.demo.generated.v1",
+                            "deduplication_key": "mirror-generated-reflection",
+                            "archive_after_seconds": 86400,
+                        },
+                        "semantic_facets": [
+                            {
+                                "subject": "mirror generated reflection",
+                                "intent": "suggest self-model refinement",
+                                "outcome": "awaiting review",
+                                "outcome_direction": "neutral",
+                                "semantic_context_key": "mirror-agent-proposals",
+                            }
+                        ],
+                    },
+                    "scope": SCOPE,
+                    "evidence_refs": [proposal_evidence["evidence_id"]],
+                    "confidence": {"level": "low-medium", "score": 0.35},
+                },
+                {
+                    "id": "mirror_proposed_reflection_b",
+                    "type": "semantic",
+                    "payload": {
+                        "summary": "Generated reflection awaiting governed review.",
+                        "proposal_retention": {
+                            "profile": "mirror.demo.generated.v1",
+                            "deduplication_key": "mirror-generated-reflection",
+                            "archive_after_seconds": 86400,
+                        },
+                        "semantic_facets": [
+                            {
+                                "subject": "mirror generated reflection",
+                                "intent": "suggest self-model refinement",
+                                "outcome": "awaiting review",
+                                "outcome_direction": "neutral",
+                                "semantic_context_key": "mirror-agent-proposals",
+                            }
+                        ],
+                    },
+                    "scope": SCOPE,
+                    "evidence_refs": [proposal_evidence["evidence_id"]],
+                    "confidence": {"level": "low", "score": 0.25},
+                },
+            ],
+            actor="mirror_chat_processor",
+            scope=SCOPE,
+        )
         demo_control_signature = "trainable_roles=encoder; replay_ratio=0.3"
         demo_scope = dict(SCOPE)
+        directive_evidence = self.capture(
+            "demo_training_directive",
+            "scenario/maintenance/chunk-7/directive",
+            {
+                "chunk": 7,
+                "control_signature": demo_control_signature,
+                "trainable_roles": ["encoder"],
+                "replay_ratio": 0.3,
+            },
+        )
         demo_directive = self.commit_once(
             {
                 "id": "mirror_demo_directive_chunk7",
@@ -870,12 +1153,38 @@ class MirrorAgentDemo:
                         "trainable_roles": ["encoder"],
                         "replay_ratio": 0.3,
                     },
+                    "semantic_facets": [
+                        {
+                            "subject": "mirror demo training controls",
+                            "intent": "evaluate sampled control packet",
+                            "outcome": "issued as planned",
+                            "outcome_direction": "positive",
+                            "confidence": 0.78,
+                            "controls": {
+                                "control_signature": demo_control_signature,
+                            },
+                            "time_index": 7,
+                            "semantic_context_key": "mirror-demo-training",
+                        }
+                    ],
                 },
                 "scope": demo_scope,
+                "evidence_refs": [directive_evidence["evidence_id"]],
+                "confidence": {"level": "medium-high", "score": 0.78},
                 "salience": 0.75,
                 "utility": 0.85,
             },
             actor="demo_trainer",
+        )
+        outcome_evidence = self.capture(
+            "demo_training_outcome",
+            "scenario/maintenance/chunk-7/outcome",
+            {
+                "chunk": 7,
+                "control_signature": demo_control_signature,
+                "previous_score": 1.02,
+                "score": 1.11,
+            },
         )
         demo_outcome = self.commit_once(
             {
@@ -891,8 +1200,40 @@ class MirrorAgentDemo:
                     "control_signature": demo_control_signature,
                     "previous_score": 1.02,
                     "score": 1.11,
+                    "source_directive_ref": demo_directive["id"],
+                    "semantic_facets": [
+                        {
+                            "subject": "mirror demo training controls",
+                            "intent": "evaluate sampled control packet",
+                            "outcome": "supported",
+                            "outcome_direction": "positive",
+                            "confidence": 0.86,
+                            "controls": {
+                                "control_signature": demo_control_signature,
+                            },
+                            "metrics": {"score_delta": 0.09},
+                            "time_index": 8,
+                            "semantic_context_key": "mirror-demo-training",
+                        }
+                    ],
+                    "graph_relations": [
+                        {
+                            "source_ref": "$self",
+                            "target_ref": demo_directive["id"],
+                            "relation": "rel:derived_from",
+                            "confidence": 0.86,
+                        },
+                        {
+                            "source_ref": "$self",
+                            "target_ref": demo_directive["id"],
+                            "relation": "rel:caused_by",
+                            "confidence": 0.72,
+                        },
+                    ],
                 },
                 "scope": demo_scope,
+                "evidence_refs": [outcome_evidence["evidence_id"]],
+                "confidence": {"level": "high", "score": 0.86},
                 "salience": 0.78,
                 "utility": 0.88,
             },
@@ -917,12 +1258,51 @@ class MirrorAgentDemo:
         maintenance_distiller = policy_results.get("maintenance_distiller", {})
         steward_action_counts = steward.get("action_counts", {})
         committed_refs = maintenance_distiller.get("committed_refs", [])
+        graph_edges = self.amos.store.list_edges()
+        distiller_event = next(
+            (
+                event
+                for event in self.amos.store.list_events()
+                if event["event_id"] == maintenance_distiller.get("event_id")
+            ),
+            None,
+        )
+        distiller_audit = (
+            dict(distiller_event.get("payload", {}))
+            if distiller_event is not None
+            else {}
+        )
+        proposal_states = {
+            atom_id: (
+                self.amos.store.get_atom(atom_id) or {}
+            ).get("lifecycle_state")
+            for atom_id in (
+                "mirror_proposed_reflection_a",
+                "mirror_proposed_reflection_b",
+            )
+        }
         self.result(
             "non_llm_maintenance",
             smp["status"] == "completed"
             and steward["status"] == "completed"
             and steward_action_counts.get("deduplicate", 0) > 0
             and bool(committed_refs)
+            and any(
+                edge.get("relation") == "rel:supports"
+                for edge in graph_edges
+            )
+            and any(
+                edge.get("relation") == "rel:derived_from"
+                for edge in graph_edges
+            )
+            and int(maintenance_distiller.get("deferred_count", 0)) > 0
+            and (
+                distiller_audit.get("processor_results", {})
+                .get("amos.graph.canonical.v1", {})
+                .get("deferred", 0)
+                > 0
+            )
+            and sorted(proposal_states.values()) == ["archived", "proposed"]
             and policy_event["payload"]["trigger"] == "retrieve_packet"
             and self.amos.llm_reviewer_policy()["enabled_by_default"] is False,
             {
@@ -932,6 +1312,21 @@ class MirrorAgentDemo:
                     "processors": maintenance_distiller.get("processors", []),
                     "proposal_count": maintenance_distiller.get("proposal_count", 0),
                     "committed": committed_refs,
+                    "graph_edge_relations": sorted(
+                        {edge["relation"] for edge in graph_edges}
+                    ),
+                    "deferred_count": maintenance_distiller.get(
+                        "deferred_count", 0
+                    ),
+                    "processor_results": distiller_audit.get(
+                        "processor_results", {}
+                    ),
+                },
+                "proposal_queue": {
+                    "submitted": [
+                        item["atom"]["id"] for item in proposed["proposals"]
+                    ],
+                    "lifecycle_states": proposal_states,
                 },
                 "demo_source_refs": [
                     demo_directive["id"],
@@ -953,9 +1348,51 @@ class MirrorAgentDemo:
             "steward": steward,
             "distillation": policy_results.get("distillation", {}),
             "maintenance_distiller": maintenance_distiller,
+            "maintenance_distiller_audit": distiller_audit,
             "index": index,
             "packet_cache": policy_results.get("packet_cache", {}),
             "lm_used": False,
+            "proposal_queue": {
+                "submitted": [item["atom"]["id"] for item in proposed["proposals"]],
+                "lifecycle_states": proposal_states,
+            },
+        }
+
+    def reasoning_report(self) -> dict[str, Any]:
+        source = (
+            "interactive_chat"
+            if "interactive_chat" in self.reasoning_frames
+            else "scripted_demand_paging"
+        )
+        frame = self.reasoning_frames.get(source, {})
+        loaded_page = self.loaded_reasoning_pages.get(source, {})
+        exact_lookup = self.exact_lookups.get(
+            "interactive_chat",
+            self.exact_lookups.get("scripted_current_decision", {}),
+        )
+        current_revision = self.amos.store.memory_revision()
+        return {
+            "source": source,
+            "frame": frame,
+            "loaded_page": loaded_page,
+            "exact_lookup": exact_lookup,
+            "revision_current": (
+                bool(frame)
+                and dict(frame.get("revision", {})) == dict(current_revision)
+            ),
+            "current_revision": current_revision,
+            "frame_history": [
+                {
+                    "source": name,
+                    "frame_id": item.get("frame_id"),
+                    "revision": item.get("revision", {}),
+                    "unit_count": len(item.get("units", [])),
+                    "page_count": len(item.get("page_index", [])),
+                    "truncated": item.get("truncated", False),
+                    "token_estimate": item.get("token_estimate"),
+                }
+                for name, item in self.reasoning_frames.items()
+            ],
         }
 
     def report(self) -> dict[str, Any]:
@@ -1042,6 +1479,8 @@ class MirrorAgentDemo:
                 }
                 for source, packet in packet_history
             ],
+            "reasoning": self.reasoning_report(),
+            "retrieval_feedback": list(self.retrieval_feedback[-20:]),
             "evidence": {
                 "captured": evidence_records,
                 "cited_evidence_refs": sorted(
@@ -1191,7 +1630,12 @@ def edge_summary(edge: Mapping[str, Any]) -> dict[str, Any]:
         "source_ref": edge["source_ref"],
         "target_ref": edge["target_ref"],
         "relation": edge["relation"],
+        "confidence": edge.get("confidence", {}),
+        "evidence_refs": edge.get("evidence_refs", []),
+        "derivation": edge.get("derivation", {}),
+        "lifecycle_state": edge.get("lifecycle_state"),
         "health_status": edge["health_status"],
+        "version": edge.get("version"),
     }
 
 

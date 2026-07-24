@@ -238,6 +238,14 @@ memory policy maintenance remains deterministic and non-LLM: SMP analysis,
 stewardship, automatic distillation, index rebuilds, packet-cache invalidation,
 and capacity reporting do not call the chat LM.
 
+The demo exercises both the compatibility packet path and the current coherent
+reasoning path. Its `Reasoning` view shows revision-bound resident units,
+trusted demand-page descriptors, loaded pages, explicit unknowns/truncation,
+and exact-ID lookup. The maintenance and graph views show producer-supplied
+`semantic_facets`, explicit `graph_relations`, low-risk committed edges,
+review-gated relations, proposal retention/deduplication, edge provenance, and
+retrieval-feedback telemetry.
+
 Serve the V1 HTTP API:
 
 ```bash

@@ -24,9 +24,9 @@ from typing import Any, Mapping
 from amos import Amos
 
 try:
-    from examples.mirror_agent_demo import AGENT_ID, SCOPE, MirrorAgentDemo
+    from examples.mirror_agent_demo import AGENT_ID, SCOPE, USER_ID, MirrorAgentDemo
 except ModuleNotFoundError:  # direct execution with PYTHONPATH=src
-    from mirror_agent_demo import AGENT_ID, SCOPE, MirrorAgentDemo
+    from mirror_agent_demo import AGENT_ID, SCOPE, USER_ID, MirrorAgentDemo
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -122,6 +122,70 @@ class MirrorAgentUIState:
         self.report["lm"] = self.provider_status()
         return self.report
 
+    def compile_reasoning(self, need: str) -> dict[str, Any]:
+        need = need.strip()
+        if not need:
+            raise ValueError("reasoning need is required")
+        frame = self.amos.compile_memory_frame(
+            need=need,
+            purpose=(
+                "render a grounded Mirror Agent response using coherent history, "
+                "active conclusions, constraints, conflicts, and commitments"
+            ),
+            depth="working_frame",
+            task_context={
+                "human_id": USER_ID,
+                "project_id": "amos",
+                "project_thread_id": "mirror-agent-demo",
+                "phase": "interactive_chat",
+            },
+            scope=SCOPE,
+            requester="reasoner",
+            target_processor="reasoner",
+            token_or_byte_budget={"tokens": 1800},
+            run_policy=False,
+        )
+        self.demo.reasoning_frames["interactive_chat"] = frame
+        self.demo.loaded_reasoning_pages.pop("interactive_chat", None)
+        return frame
+
+    def _load_reasoning_page(self, page_id: str) -> dict[str, Any]:
+        frame = self.demo.reasoning_frames.get("interactive_chat")
+        if not frame:
+            raise ValueError("compile a reasoning frame before loading a page")
+        descriptor = next(
+            (
+                item
+                for item in frame.get("page_index", [])
+                if item.get("page_id") == page_id
+            ),
+            None,
+        )
+        if descriptor is None:
+            raise ValueError("unknown reasoning page id")
+        loaded = self.amos.load_memory_page(
+            frame_id=frame["frame_id"],
+            revision=frame["revision"],
+            page=descriptor,
+            need="load selected coherent memory detail",
+            purpose="inspect the trusted continuation for the active reasoning frame",
+            depth="supporting",
+            scope=SCOPE,
+            requester="reasoner",
+            target_processor="reasoner",
+            token_or_byte_budget={"tokens": 1600},
+            run_policy=False,
+        )
+        self.demo.loaded_reasoning_pages["interactive_chat"] = loaded
+        return loaded
+
+    def load_reasoning_page(self, page_id: str) -> dict[str, Any]:
+        loaded = self._load_reasoning_page(page_id.strip())
+        return {
+            "page": loaded,
+            "report": self.current_report(),
+        }
+
     def chat(self, message: str) -> dict[str, Any]:
         message = message.strip()
         if not message:
@@ -132,6 +196,23 @@ class MirrorAgentUIState:
             turn_ref,
             {"text": message},
         )
+        frame = self.compile_reasoning(message)
+        loaded_page: dict[str, Any] = {}
+        if frame.get("page_index"):
+            loaded_page = self._load_reasoning_page(
+                str(frame["page_index"][0]["page_id"])
+            )
+        exact = self.amos.retrieve_atom(
+            "mirror_reasoning_design_current",
+            scope=SCOPE,
+            requester="reasoner",
+            target_processor="reasoner",
+            include_conflicts=True,
+            include_low_health=True,
+            include_superseded=True,
+            run_policy=False,
+        )
+        self.demo.exact_lookups["interactive_chat"] = exact
         packet = self.amos.retrieve_packet(
             cues=[message],
             scope=SCOPE,
@@ -159,19 +240,26 @@ class MirrorAgentUIState:
             self_view=self_view,
             recall=recall,
             capacity=capacity,
+            frame=frame,
+            loaded_page=loaded_page,
         )
         answer = self.lm_client.generate(prompt)
-        cited_refs = [item["atom_ref"] for item in packet["items"][:5]]
-        self.amos.record_retrieval_outcome(
+        retrieved_refs = [item["atom_ref"] for item in packet["items"]]
+        cited_refs = used_memory_refs(answer, packet)
+        outcome: dict[str, Any] = {
+            "label": "useful" if cited_refs else "observed",
+            "use_status": "materially_used" if cited_refs else "context_only",
+            "user_message_ref": evidence["evidence_id"],
+            "lm_provider": self.lm_mode,
+        }
+        if cited_refs:
+            outcome["used_item_refs"] = cited_refs
+        feedback = self.amos.record_retrieval_outcome(
             packet_id=packet["packet_id"],
             request=packet["request"],
-            outcome={
-                "used_item_refs": cited_refs,
-                "label": "chat_context_used",
-                "user_message_ref": evidence["evidence_id"],
-                "lm_provider": self.lm_mode,
-            },
+            outcome=outcome,
         )
+        self.demo.retrieval_feedback.append(feedback)
         self.amos.record_agentic_trace(
             agent_id=AGENT_ID,
             task="mirror agent chat",
@@ -189,6 +277,9 @@ class MirrorAgentUIState:
             "user": message,
             "agent": answer,
             "memory_packet_id": packet["packet_id"],
+            "reasoning_frame_id": frame["frame_id"],
+            "loaded_page_id": loaded_page.get("page_id"),
+            "retrieved_memory_refs": retrieved_refs,
             "cited_memory_refs": cited_refs,
             "lm_provider": self.lm_mode,
         }
@@ -197,7 +288,10 @@ class MirrorAgentUIState:
         self.demo.service_views["reasoner"] = {
             "graph_version": packet["graph_version"],
             "packet_id": packet["packet_id"],
-            "retrieved_item_refs": cited_refs,
+            "retrieved_item_refs": retrieved_refs,
+            "materially_used_item_refs": cited_refs,
+            "frame_id": frame["frame_id"],
+            "loaded_page_id": loaded_page.get("page_id"),
             "lm_provider": self.lm_mode,
         }
         return {
@@ -205,6 +299,10 @@ class MirrorAgentUIState:
             "packet": packet,
             "self_awareness": self_view,
             "agentic_recall": recall,
+            "reasoning_frame": frame,
+            "loaded_reasoning_page": loaded_page,
+            "exact_lookup": exact,
+            "retrieval_feedback": feedback,
             "capacity": capacity,
             "lm": self.provider_status(),
             "report": self.current_report(),
@@ -257,6 +355,8 @@ def build_lm_prompt(
     self_view: Mapping[str, Any],
     recall: Mapping[str, Any],
     capacity: Mapping[str, Any],
+    frame: Mapping[str, Any],
+    loaded_page: Mapping[str, Any],
 ) -> str:
     context = {
         "user_message": message,
@@ -264,11 +364,14 @@ def build_lm_prompt(
         "instruction": (
             "Answer as the Amos Mirror Agent. Do not claim consciousness or sentience. "
             "Explain operational self-awareness using only the AMOS context below. "
-            "Mention memory refs when useful. Keep the answer concise and human-friendly."
+            "Cite an exact atom ref only when it materially shapes the answer; do not "
+            "cite merely exposed context. Keep the answer concise and human-friendly."
         ),
         "packet_id": packet["packet_id"],
         "packet_items": [packet_item_summary(item) for item in packet["items"][:10]],
         "packet_omissions": packet.get("omissions", [])[:12],
+        "reasoning_frame": reasoning_frame_summary(frame),
+        "loaded_reasoning_page": reasoning_page_summary(loaded_page),
         "self_model": {
             "capabilities": [packet_item_summary(item) for item in self_view["capabilities"]],
             "limitations": [packet_item_summary(item) for item in self_view["limitations"]],
@@ -321,6 +424,65 @@ def packet_item_summary(item: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def reasoning_frame_summary(frame: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "frame_id": frame.get("frame_id"),
+        "revision": frame.get("revision", {}),
+        "truncated": frame.get("truncated", False),
+        "unknowns": list(frame.get("unknowns", []))[:8],
+        "units": [
+            {
+                "unit_id": unit.get("unit_id"),
+                "unit_type": unit.get("unit_type"),
+                "title": unit.get("title"),
+                "summary": unit.get("summary"),
+                "active_conclusion_refs": unit.get("active_conclusion_refs", []),
+                "constraint_refs": unit.get("constraint_refs", []),
+                "commitment_refs": unit.get("commitment_refs", []),
+                "conflict_refs": unit.get("conflict_refs", []),
+                "source_atom_refs": unit.get("source_atom_refs", []),
+                "compression": unit.get("compression", {}),
+            }
+            for unit in frame.get("units", [])[:8]
+        ],
+        "page_index": [
+            {
+                "page_id": item.get("page_id"),
+                "title": item.get("title"),
+                "summary": item.get("summary"),
+                "relevance": item.get("relevance"),
+                "focus_atom_refs": item.get("focus_atom_refs", []),
+                "source_atom_refs": item.get("source_atom_refs", []),
+            }
+            for item in frame.get("page_index", [])[:12]
+        ],
+    }
+
+
+def reasoning_page_summary(page: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "page_id": page.get("page_id"),
+        "status": page.get("status"),
+        "depth": page.get("depth"),
+        "source_atom_refs": page.get("source_atom_refs", []),
+        "active_conclusion_refs": page.get("active_conclusion_refs", []),
+        "constraint_refs": page.get("constraint_refs", []),
+        "commitment_refs": page.get("commitment_refs", []),
+        "conflict_refs": page.get("conflict_refs", []),
+        "truncated": page.get("truncated", False),
+    }
+
+
+def used_memory_refs(answer: str, packet: Mapping[str, Any]) -> list[str]:
+    """Return only packet atoms explicitly cited by the rendered answer."""
+
+    return [
+        str(item["atom_ref"])
+        for item in packet.get("items", [])
+        if item.get("atom_ref") and str(item["atom_ref"]) in answer
+    ]
+
+
 class MirrorAgentUIServer(ThreadingHTTPServer):
     def __init__(
         self,
@@ -370,6 +532,30 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                     body = self._read_json()
                     with state.lock:
                         return self._write_json(state.chat(str(body.get("message", ""))))
+                if (
+                    method == "POST"
+                    and self.path.split("?", 1)[0] == "/api/reasoning/compile"
+                ):
+                    body = self._read_json()
+                    with state.lock:
+                        frame = state.compile_reasoning(str(body.get("need", "")))
+                        return self._write_json(
+                            {
+                                "frame": frame,
+                                "report": state.current_report(),
+                            }
+                        )
+                if (
+                    method == "POST"
+                    and self.path.split("?", 1)[0] == "/api/reasoning/page"
+                ):
+                    body = self._read_json()
+                    with state.lock:
+                        return self._write_json(
+                            state.load_reasoning_page(
+                                str(body.get("page_id", ""))
+                            )
+                        )
                 if method == "POST" and self.path.split("?", 1)[0] == "/api/maintenance/run":
                     with state.lock:
                         return self._write_json(state.run_maintenance())
@@ -670,7 +856,7 @@ INDEX_HTML = r"""<!doctype html>
     </main>
   </div>
   <script>
-    const tabs = ["Chat", "Self Model", "Memory Packet", "Evidence", "Maintenance", "Capacity", "Graph"];
+    const tabs = ["Chat", "Self Model", "Memory Packet", "Reasoning", "Evidence", "Maintenance", "Capacity", "Graph"];
     let state = null;
     let active = "Chat";
     let scrollTranscriptAfterRender = false;
@@ -734,6 +920,7 @@ INDEX_HTML = r"""<!doctype html>
       if (active === "Chat") content.innerHTML = viewChat();
       if (active === "Self Model") content.innerHTML = viewSelf();
       if (active === "Memory Packet") content.innerHTML = viewPacket(state.memory_packet);
+      if (active === "Reasoning") content.innerHTML = viewReasoning();
       if (active === "Evidence") content.innerHTML = viewEvidence();
       if (active === "Maintenance") content.innerHTML = viewMaintenance();
       if (active === "Capacity") content.innerHTML = viewCapacity();
@@ -791,6 +978,39 @@ INDEX_HTML = r"""<!doctype html>
       </div>`;
     }
 
+    function viewReasoning() {
+      const reasoning = state.reasoning || {};
+      const frame = reasoning.frame || {};
+      const loaded = reasoning.loaded_page || {};
+      const exact = reasoning.exact_lookup || {};
+      const pages = frame.page_index || [];
+      const units = frame.units || [];
+      const revisionClass = reasoning.revision_current ? "good" : "warn";
+      const revisionLabel = reasoning.revision_current ? "current revision" : "stale — recompile";
+      return `<div class="kpi-grid">
+        <div class="kpi"><span>Resident units</span><strong>${units.length}</strong></div>
+        <div class="kpi"><span>Demand pages</span><strong>${pages.length}</strong></div>
+        <div class="kpi"><span>Token estimate</span><strong>${esc(frame.token_estimate || 0)}</strong></div>
+        <div class="kpi"><span>Truncated</span><strong>${frame.truncated ? "yes" : "no"}</strong></div>
+      </div>
+      <div class="grid two">
+        <section class="panel">
+          <div class="panel-head"><h2>Compile Coherent Memory</h2><span class="chip ${revisionClass}">${revisionLabel}</span></div>
+          <div class="panel-body">
+            <form class="composer" id="reasoning-form">
+              <input id="reasoning-need" value="Why is the Mirror Agent specification first?" aria-label="Reasoning need">
+              <button class="primary" type="submit">Compile</button>
+            </form>
+            <pre>${esc(JSON.stringify({frame_id: frame.frame_id, revision: frame.revision, orientation: frame.orientation, unknowns: frame.unknowns, compilation_trace: frame.compilation_trace}, null, 2))}</pre>
+          </div>
+        </section>
+        <section class="panel"><div class="panel-head"><h2>Resident Coherent Units</h2><span class="chip">${units.length} units</span></div><div class="panel-body"><div class="rows">${units.map(unit => `<div class="row"><div class="row-top"><strong>${esc(unit.title || unit.unit_id)}</strong><span class="score">${esc(unit.unit_type)} · ${esc(unit.compression?.mode || "none")}</span></div><div class="meta">${esc(unit.summary || "")}</div><div class="refs">${refs(unit.source_atom_refs)}</div></div>`).join("") || `<div class="row"><div class="meta">No resident units; inspect the page index.</div></div>`}</div></div></section>
+        <section class="panel"><div class="panel-head"><h2>Trusted Page Index</h2><span class="chip">${pages.length} descriptors</span></div><div class="panel-body"><div class="rows">${pages.map(page => `<div class="row"><div class="row-top"><strong>${esc(page.title || page.page_id)}</strong><button class="secondary load-reasoning-page" data-page-id="${esc(page.page_id)}" ${reasoning.revision_current ? "" : "disabled"}>Load page</button></div><div class="meta">${esc(page.summary || page.relevance || "")}</div><div class="refs">${refs(page.source_atom_refs)}</div></div>`).join("") || `<div class="row"><div class="meta">No deeper pages are needed for this frame.</div></div>`}</div></div></section>
+        <section class="panel"><div class="panel-head"><h2>Loaded Page</h2><span class="chip">${esc(loaded.status || "not loaded")}</span></div><div class="panel-body"><pre>${esc(JSON.stringify(loaded, null, 2))}</pre></div></section>
+        <section class="panel"><div class="panel-head"><h2>Exact-ID Lookup</h2><span class="chip">${esc(exact.retrieval_mode || "none")}</span></div><div class="panel-body"><pre>${esc(JSON.stringify(exact, null, 2))}</pre></div></section>
+      </div>`;
+    }
+
     function viewEvidence() {
       const ev = state.evidence.captured || [];
       return `<section class="panel"><div class="panel-head"><h2>Evidence Records</h2><span class="chip">${ev.length} captured</span></div><div class="panel-body"><div class="rows">${ev.map(e => `<div class="row"><div class="row-top"><strong>${esc(e.evidence_id)}</strong><span class="meta">${esc(e.source_type)}</span></div><div class="meta">${esc(e.source_ref)}</div><pre>${esc(JSON.stringify(e.payload, null, 2))}</pre></div>`).join("")}</div></div></section>`;
@@ -840,7 +1060,7 @@ INDEX_HTML = r"""<!doctype html>
     function viewGraph() {
       return `<div class="grid two">
         <section class="panel"><div class="panel-head"><h2>Selected Atoms</h2></div><div class="panel-body"><div class="rows">${(state.graph.selected_atoms || []).map(atomRow).join("")}</div></div></section>
-        <section class="panel"><div class="panel-head"><h2>Associative Edges</h2></div><div class="panel-body"><div class="rows">${(state.graph.edges || []).map(edge => `<div class="row"><div class="row-top"><strong>${esc(edge.relation)}</strong><span class="meta">${esc(edge.health_status)}</span></div><div class="meta">${esc(edge.source_ref)} -> ${esc(edge.target_ref)}</div></div>`).join("")}</div></div></section>
+        <section class="panel"><div class="panel-head"><h2>Associative Edges</h2></div><div class="panel-body"><div class="rows">${(state.graph.edges || []).map(edge => `<div class="row"><div class="row-top"><strong>${esc(edge.relation)}</strong><span class="meta">${esc(edge.health_status)} · v${esc(edge.version || "")}</span></div><div class="meta">${esc(edge.source_ref)} -> ${esc(edge.target_ref)}</div><div class="meta">derivation: ${esc(edge.derivation?.kind || "unknown")} · ${esc(edge.derivation?.processor_id || "intrinsic")} · confidence ${esc(edge.confidence?.score || "")}</div><div class="meta">feedback: used ${esc(edge.derivation?.retrieval_telemetry?.used_count || 0)} · corrected ${esc(edge.derivation?.retrieval_telemetry?.correction_count || 0)}</div><div class="refs">${refs(edge.evidence_refs)}</div></div>`).join("")}</div></div></section>
       </div>`;
     }
 
@@ -902,6 +1122,33 @@ INDEX_HTML = r"""<!doctype html>
         active = "Maintenance";
         render();
       });
+      const reasoningForm = $("reasoning-form");
+      if (reasoningForm) reasoningForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const need = $("reasoning-need").value.trim();
+        if (!need) return;
+        const response = await fetch("/api/reasoning/compile", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({need})});
+        const data = await response.json();
+        if (!response.ok) {
+          alert(data.error || "reasoning compilation failed");
+          return;
+        }
+        state = data.report || state;
+        active = "Reasoning";
+        render();
+      });
+      document.querySelectorAll(".load-reasoning-page").forEach(button => button.addEventListener("click", async () => {
+        button.disabled = true;
+        const response = await fetch("/api/reasoning/page", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({page_id: button.dataset.pageId})});
+        const data = await response.json();
+        if (!response.ok) {
+          alert(data.error || "reasoning page load failed");
+          return;
+        }
+        state = data.report || state;
+        active = "Reasoning";
+        render();
+      }));
     }
 
     load();

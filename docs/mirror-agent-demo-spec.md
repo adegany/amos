@@ -14,7 +14,10 @@ and explain an explicit self-model stored as typed AMOS memory.
 
 The demo models these service roles against one authoritative AMOS instance:
 
-- `reasoner`: retrieves task-relevant memory packets and renders answers.
+- `reasoner`: retrieves task-relevant compatibility packets, compiles coherent
+  reasoning frames, retains trusted page descriptors, loads deeper pages
+  without accepting scope, revision, or descriptor authority from the LM, and
+  renders answers.
 - `planner`: retrieves active goals, commitments, procedures, and constraints.
 - `executor`: records simulated tool/file/action events and outcomes.
 - `critic`: records quality judgments, failure signals, and outcome telemetry.
@@ -90,6 +93,8 @@ The demo seeds AMOS with typed atoms for the Mirror Agent:
 - open and completed `Commitment` atoms
 - `ProcedureAtom` records for design discussion and spec updates
 - calibration and uncertainty beliefs
+- a superseded/current design-decision chain used to demonstrate coherent
+  demand-paged reasoning
 
 Acceptance:
 
@@ -100,6 +105,8 @@ Acceptance:
   identifies the configured LM only as a replaceable cognitive processor.
 - Model or provider identity is absent from the Mirror Agent self-model unless
   it is explicitly stored as non-self substrate metadata.
+- Known atom IDs are resolved through the exact retrieval contract rather than
+  associative ranking or direct agent-side database reads.
 
 ### 2. Cross-Session Continuity
 
@@ -183,6 +190,13 @@ review disabled by default. The browser UI may expose a `Run Now` control for
 operator inspection, but routine maintenance must be a service-owned policy tick
 rather than a manual bridge call.
 
+The demo-owned producer attaches canonical `semantic_facets` and
+`graph_relations` to typed directive/outcome atoms. The built-in generic
+processors construct provenance-bearing associative edges from those contracts
+without domain-specific AMOS code. Low-risk structural and supporting
+relationships may commit automatically; causal or otherwise review-gated
+relationships remain deferred.
+
 Acceptance:
 
 - `memory_policy` status reports the configured schedule, due reasons, and
@@ -195,8 +209,38 @@ Acceptance:
   evidence is supported.
 - Confounded or sanitized processor-pack proposals stay deferred for review;
   the optional reviewer is displayed as `draft_only`, not authoritative.
+- Matching canonical semantic facets produce a committed
+  `rel:supports` edge with evidence, confidence, and derivation metadata.
+- An explicit low-risk `rel:derived_from` relation is active while a
+  medium-risk `rel:caused_by` declaration remains deferred for review.
+- Repeated model-generated proposals carry producer-owned
+  `proposal_retention` metadata; deterministic policy deduplicates the queue
+  while the retained proposal remains dormant and non-canonical.
 - The maintenance journal includes `memory_policy_run` events and remains
   inspectable from AMOS events.
+
+### 8. Coherent Demand-Paged Reasoning
+
+The demo stores an historical design conclusion and a later active conclusion
+that supersedes it. The reasoner compiles a bounded working frame for the
+question "Why did you not write code here?", retains the returned page
+descriptors in trusted runtime state, and loads supporting detail from one
+descriptor.
+
+Acceptance:
+
+- `compile_memory_frame` returns a revision-bound frame with coherent units,
+  explicit unknown/truncation state, and a non-empty `page_index`.
+- `load_memory_page` receives only a runtime-retained descriptor and returns the
+  historical and current design conclusions together.
+- The client displays frame revision, compression, resident units, descriptors,
+  loaded page, and token budget.
+- A browser page-load request supplies only a `page_id`; the runtime resolves
+  scope, requester, revision, and the signed descriptor locally.
+- `retrieve_atom` resolves the known active design conclusion through the exact
+  access/lifecycle contract.
+- Any graph mutation makes the retained frame visibly stale and requires a
+  fresh compile before another page can be loaded.
 
 ## UI And Inspector Output Contract
 
@@ -208,6 +252,9 @@ The demo must include a human-friendly browser UI with these main views:
   commitments, procedures, calibration, and runtime state.
 - `Memory Packet`: item rows with atom type, score, health, evidence refs,
   omissions, degradation, and packet provenance.
+- `Reasoning`: coherent resident units, revision and budget state, explicit
+  unknowns, trusted demand-page descriptors, loaded page detail, and exact-ID
+  lookup output.
 - `Evidence`: captured source events and evidence references used by current
   packet items.
 - `Maintenance`: automatic memory policy status, non-LLM SMP/steward actions,
@@ -216,7 +263,8 @@ The demo must include a human-friendly browser UI with these main views:
   memories, and reviewer policy.
 - `Capacity`: budget, pressure mode, degradation, admin guidance, and packet
   impact.
-- `Graph`: selected atom neighborhood and associative edges in readable form.
+- `Graph`: selected atom neighborhood and associative edges with evidence,
+  confidence, derivation processor, and retrieval-feedback telemetry.
 
 The UI should be an operational dashboard, not a marketing page. It should be
 usable from a local dev server and expose JSON endpoints for tests.
@@ -228,6 +276,10 @@ The demo must emit a report with these top-level sections:
 - `chat`: scripted user/agent turns.
 - `current_self_model`: self-awareness view plus goals, commitments, and procedures.
 - `memory_packet`: the packet used for the introspective Capacity Governor answer.
+- `reasoning`: latest coherent frame, loaded page, exact lookup, current-revision
+  status, and frame history.
+- `retrieval_feedback`: packet outcome records showing materially used,
+  context-only, corrected, and ignored references.
 - `evidence`: captured evidence records and cited evidence refs.
 - `maintenance_journal`: memory-policy, SMP/steward, distillation,
   processor-pack proposal/commit results, and journal entries.
