@@ -423,6 +423,15 @@ class ReasoningFrameService:
             "active_conclusion_refs": self._unit_refs(
                 units, "active_conclusion_refs"
             ),
+            "candidate_conclusion_refs": self._unit_refs(
+                units, "candidate_conclusion_refs"
+            ),
+            "contested_conclusion_refs": self._unit_refs(
+                units, "contested_conclusion_refs"
+            ),
+            "rejected_or_superseded_refs": self._unit_refs(
+                units, "rejected_or_superseded_refs"
+            ),
             "constraint_refs": self._unit_refs(units, "constraint_refs"),
             "conflict_refs": self._unit_refs(units, "conflict_refs"),
             "related_pages": list(descriptor.get("related_pages", [])),
@@ -574,6 +583,7 @@ class ReasoningFrameService:
             return self._frame_payload(
                 frame_id=frame_id,
                 revision=revision,
+                memory_mode=memory_mode,
                 request=response_request,
                 task_context=task_context,
                 selected_units=selected_units,
@@ -771,6 +781,7 @@ class ReasoningFrameService:
         *,
         frame_id: str,
         revision: Mapping[str, Any],
+        memory_mode: str,
         request: Mapping[str, Any],
         task_context: Mapping[str, Any],
         selected_units: Sequence[Mapping[str, Any]],
@@ -856,6 +867,7 @@ class ReasoningFrameService:
             "schema_version": SCHEMA_VERSION,
             "revision": dict(revision),
             "generated_at": utc_now(),
+            "memory_mode": memory_mode,
             "request": dict(request),
             "orientation": {
                 "task_context": {
@@ -882,6 +894,18 @@ class ReasoningFrameService:
             "commitments": sections["commitments"],
             "relevant_episodes": sections["episodes"],
             "conflicts": sections["conflicts"],
+            "active_conclusion_refs": self._unit_refs(
+                selected_units, "active_conclusion_refs"
+            ),
+            "candidate_conclusion_refs": self._unit_refs(
+                selected_units, "candidate_conclusion_refs"
+            ),
+            "contested_conclusion_refs": self._unit_refs(
+                selected_units, "contested_conclusion_refs"
+            ),
+            "rejected_or_superseded_refs": self._unit_refs(
+                selected_units, "rejected_or_superseded_refs"
+            ),
             "unknowns": unknowns,
             "page_index": [dict(page) for page in page_index],
             "source_atom_refs": source_refs,
@@ -1094,6 +1118,9 @@ class ReasoningFrameService:
         superseded_refs = self.graph._active_superseded_refs(
             [str(atom["id"]) for atom in candidates]
         )
+        ranking_superseded_refs = (
+            None if memory_mode == "historical_review" else superseded_refs
+        )
         edge_degrees = self.graph._hot_graph_edge_degree_counts(
             candidates,
             edge_scan_limit=int(work_budget["ranking_edges"]),
@@ -1125,7 +1152,7 @@ class ReasoningFrameService:
                 edge_degrees=edge_degrees,
                 edge_activation_scores=edge_scores,
                 attention_policy=attention_policy,
-                superseded_refs=superseded_refs,
+                superseded_refs=ranking_superseded_refs,
             )
             if cues and not matched:
                 continue
@@ -1190,6 +1217,63 @@ class ReasoningFrameService:
         supporting_atoms_added = 0
         seen_mandatory_edges: set[str] = set()
         seen_supporting_edges: set[str] = set()
+
+        if memory_mode == "historical_review":
+            ancestry_frontier = list(atoms)
+            seen_ancestry = set(ancestry_frontier)
+            while ancestry_frontier and len(expansions) < mandatory_atom_limit:
+                source_ref = ancestry_frontier.pop(0)
+                source_atom = atoms[source_ref]
+                for target_ref in source_atom.get("supersedes", []):
+                    target_ref = str(target_ref or "")
+                    if not target_ref:
+                        continue
+                    if target_ref not in seen_ancestry:
+                        target_atom = self.store.get_atom(target_ref)
+                        reason = self._atom_omission_reason(
+                            target_atom,
+                            scope=scope,
+                            semantic_scope=semantic_scope,
+                            requester=requester,
+                            target_processor=target_processor,
+                            memory_mode=memory_mode,
+                        )
+                        if reason is not None:
+                            continue
+                        seen_ancestry.add(target_ref)
+                        atoms[target_ref] = dict(target_atom)
+                        scores.setdefault(target_ref, 0.0)
+                        reasons.setdefault(target_ref, []).append(
+                            f"structured_supersedes:{source_ref}"
+                        )
+                        ancestry_frontier.append(target_ref)
+                        expansions.append(
+                            {
+                                "atom_ref": target_ref,
+                                "relation": "rel:supersedes",
+                                "reason": "historical_ancestry",
+                            }
+                        )
+                    if target_ref not in atoms:
+                        continue
+                    edge_id = f"structured:supersedes:{source_ref}:{target_ref}"
+                    edges[edge_id] = {
+                        "edge_id": edge_id,
+                        "source_ref": source_ref,
+                        "target_ref": target_ref,
+                        "relation": "rel:supersedes",
+                        "confidence": {"level": "high", "score": 1.0},
+                        "evidence_refs": list(source_atom.get("evidence_refs", [])),
+                        "scope": dict(source_atom.get("scope", {})),
+                        "lifecycle_state": "active",
+                        "health_status": "healthy",
+                        "derivation": {
+                            "kind": "structured_atom_field",
+                            "field": "supersedes",
+                        },
+                    }
+                    if expansions and expansions[-1].get("atom_ref") == target_ref:
+                        expansions[-1]["edge_id"] = edge_id
 
         def record_continuation(edge: Mapping[str, Any]) -> None:
             edge_id = str(edge.get("edge_id") or "")

@@ -241,6 +241,48 @@ class Amos:
             idempotency_key=idempotency_key,
         )
 
+    def resolve_proposal(
+        self,
+        *,
+        proposal_ref: str,
+        adjudication_ref: str,
+        expected_version: int,
+        actor: str,
+        authorization_context: Mapping[str, Any],
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        return self.governance.resolve_proposal(
+            proposal_ref=proposal_ref,
+            adjudication_ref=adjudication_ref,
+            expected_version=expected_version,
+            actor=actor,
+            authorization_context=authorization_context,
+            idempotency_key=idempotency_key,
+        )
+
+    def replace_constitutional_record(
+        self,
+        *,
+        current_ref: str,
+        successor_ref: str,
+        adjudication_ref: str,
+        expected_current_version: int,
+        expected_successor_version: int,
+        actor: str,
+        authorization_context: Mapping[str, Any],
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        return self.governance.replace_constitutional_record(
+            current_ref=current_ref,
+            successor_ref=successor_ref,
+            adjudication_ref=adjudication_ref,
+            expected_current_version=expected_current_version,
+            expected_successor_version=expected_successor_version,
+            actor=actor,
+            authorization_context=authorization_context,
+            idempotency_key=idempotency_key,
+        )
+
     def analyze_provenance(
         self, *, atom_ref: str, max_depth: int = 64
     ) -> dict[str, Any]:

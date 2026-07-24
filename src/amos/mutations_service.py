@@ -151,6 +151,11 @@ class MutationService:
             authorization_context,
             operation="create",
         )
+        GovernanceService.assert_adjudication_capability(
+            normalized,
+            authorization_context,
+            actor=actor,
+        )
         with self.store.transaction() as conn:
             prior = self._idempotency_hit(conn, actor, idempotency_key, request_payload)
             if prior is not None:
@@ -251,6 +256,11 @@ class MutationService:
             GovernanceService.assert_constitutional_capability(
                 str(atom["type"]), authorization_context, operation="create"
             )
+            GovernanceService.assert_adjudication_capability(
+                atom,
+                authorization_context,
+                actor=actor,
+            )
         seen_ids: set[str] = set()
         for atom in prepared:
             if atom["id"] in seen_ids:
@@ -339,12 +349,15 @@ class MutationService:
                 operation="amend",
             )
             requested_set_fields = dict(set_fields or {})
+            requested_lifecycle = requested_set_fields.get("lifecycle_state")
             if (
                 current.get("lifecycle_state") == "proposed"
-                and requested_set_fields.get("lifecycle_state") == "active"
+                and requested_lifecycle is not None
+                and requested_lifecycle != "proposed"
             ):
                 raise ValidationError(
-                    "proposed atoms can only become active through ratify_proposal"
+                    "proposed atoms can only change authority through "
+                    "ratify_proposal or resolve_proposal"
                 )
             payload_changes = set(dict(payload_patch or {}))
             replacement_payload = requested_set_fields.get("payload")
@@ -360,6 +373,23 @@ class MutationService:
                 authorization_context,
                 changed_payload_fields=payload_changes,
             )
+            if current.get("type") == "adjudication":
+                raise ValidationError(
+                    "adjudications are immutable governance records"
+                )
+            if current.get("type") in CONSTITUTIONAL_ATOM_TYPES:
+                derived_graph_fields = {
+                    "semantic_facets",
+                    "graph_relations",
+                    "graph_metadata_profile",
+                }
+                if requested_set_fields or not payload_changes.issubset(
+                    derived_graph_fields
+                ):
+                    raise ValidationError(
+                        "constitutional records can only change through "
+                        "replace_constitutional_record"
+                    )
             protected_changes = sorted(payload_changes.intersection(GOVERNANCE_PAYLOAD_FIELDS))
             if protected_changes:
                 raise ValidationError(
@@ -499,6 +529,11 @@ class MutationService:
             current = self.store.get_atom(atom_id)
             if current is None:
                 raise ValidationError(f"unknown atom: {atom_id}")
+            if current.get("lifecycle_state") == "proposed":
+                raise ValidationError(
+                    "proposed atoms can only change authority through "
+                    "ratify_proposal or resolve_proposal"
+                )
             self._assert_mutation_allowed(
                 current, actor=actor, authorization_context=authorization_context
             )
@@ -507,6 +542,15 @@ class MutationService:
                 authorization_context,
                 operation="amend",
             )
+            if current.get("type") == "adjudication":
+                raise ValidationError(
+                    "adjudications are immutable governance records"
+                )
+            if current.get("type") in CONSTITUTIONAL_ATOM_TYPES:
+                raise ValidationError(
+                    "constitutional records can only change through "
+                    "replace_constitutional_record"
+                )
             GovernanceService.assert_constitutional_amendment_policy(
                 current,
                 authorization_context,

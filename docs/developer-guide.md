@@ -114,6 +114,19 @@ dissent, review triggers, three-axis standing, and reconstruction metadata.
 The ratifier must be
 `{"identity_ref": "...", "mode": "self_ratification"}`.
 
+The HTTP server must be started with a private principals file:
+
+```bash
+PYTHONPATH=src python -m amos.cli --db /var/lib/amos/amos.sqlite3 serve \
+  --host 127.0.0.1 --port 8765 \
+  --governance-principals @/run/amos/governance-principals.json
+```
+
+The file maps an unguessable bearer token to `identity_ref`, the exact service
+`actor`, and capabilities. A protected request sends `Authorization: Bearer
+<token>`. Never put identity, actor, capabilities, or authentication material
+in the JSON payload; protected endpoints reject those caller-supplied claims.
+
 Finally call:
 
 ```http
@@ -125,24 +138,25 @@ POST /v1/proposals:ratify
   "proposal_ref": "atom_candidate",
   "adjudication_ref": "atom_adjudication",
   "expected_version": 1,
-  "actor": "agent:cogito",
-  "authorization_context": {
-    "identity_ref": "agent:cogito",
-    "capabilities": ["self_ratification"]
-  },
   "idempotency_key": "cogito:ratify:atom_candidate:v1"
 }
 ```
 
 AMOS validates self-authorship, scope, standing and compare-and-swap, projects
 `rel:ratified_by`, `rel:adjudicates`, and `rel:governed_by`, and journals both
-records. A normal update cannot substitute for this endpoint.
+records. Adjudication creation requires the same principal to carry
+`self_adjudication`. A normal update cannot substitute for this endpoint.
+
+Use `/v1/proposals:resolve` for `rejected`, `revised`, `withdrawn`, `deferred`,
+or `contested` outcomes. Use `/v1/constitutional-records:replace` for an atomic
+constitutional successor after the required independent reconstructions.
 
 Constitutional amendments are separate from ratification. Amendable records
 require `constitutional_amendment`; entrenched records also require
 `constitutional_entrenched_amendment`, and protected fields require
 `constitutional_protected_field_amendment`. Immutable primal guidance cannot be
-rewritten or deleted.
+rewritten or deleted; it can only enter an explicitly permitted,
+diachronically confirmed `successor_creation`.
 
 ## 4. Retrieve Packets For The Current Role
 

@@ -203,6 +203,8 @@ POSITIVE_ADJUDICATION_OUTCOMES = {
 }
 
 ADJUDICATION_OUTCOMES = POSITIVE_ADJUDICATION_OUTCOMES | {
+    "contested",
+    "deferred",
     "rejected",
     "revised",
     "withdrawn",

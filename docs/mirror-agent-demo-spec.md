@@ -21,7 +21,11 @@ The demo models these service roles against one authoritative AMOS instance:
 - `planner`: retrieves active goals, commitments, procedures, and constraints.
 - `executor`: records simulated tool/file/action events and outcomes.
 - `critic`: records quality judgments, failure signals, and outcome telemetry.
-- `self_observer`: proposes or applies self-model, procedure, and limitation updates.
+- `self_observer`: records observations and submits candidate self-model,
+  procedure, and limitation updates without promoting them.
+- `self_governance`: reconstructs evidence in deliberation mode, authors
+  adjudications as `ent:agent:mirror`, and invokes guarded ratification or
+  negative resolution. No operator or LM approval is part of this decision.
 - `introspection`: renders human-visible memory, evidence, journal, capacity, and graph views.
 
 For deterministic local execution, the demo runs these roles in one Python
@@ -80,6 +84,8 @@ The scripted flow must produce enough state to answer:
 - Why did you not write code here?
 - How is AMOS maintaining your memory under capacity pressure?
 - Can you show the evidence for that memory?
+- Which primal guidance and covenant governed that conclusion?
+- Which proposals did you ratify or reject, and why?
 
 ## Scenarios
 
@@ -87,6 +93,7 @@ The scripted flow must produce enough state to answer:
 
 The demo seeds AMOS with typed atoms for the Mirror Agent:
 
+- immutable `PrimalGuidance` and an entrenched self-authorship `Covenant`
 - identity beliefs
 - `SelfModelAtom`
 - `CapabilityAtom`
@@ -136,16 +143,42 @@ AMOS records:
 
 - evidence for the correction
 - an `ActionOutcomeRecord` with failed status and correction text
-- a limitation/failure-mode atom
-- an updated procedure with a new spec-first step
+- proposed limitation/failure-mode and successor-procedure atoms
+- identity-authored adjudications grounded in correction evidence and the
+  Mirror constitution
+- guarded ratification transitions that activate both cognitive conclusions
 - agentic recall showing the correction
 
 Acceptance:
 
 - `retrieve_agentic_recall` includes the failure, correction, and lesson.
-- The procedure atom has a later version and revision history.
+- The limitation and successor procedure never move directly from producer
+  output to active memory.
+- The successor procedure is active, supersedes the original, and carries the
+  ratifying adjudication reference.
+- `proposal_ratified` events preserve proposal, adjudication, covenant, actor,
+  identity, and graph lineage.
 
-### 4. Introspective Explanation
+### 4. Autonomous Constitutional Governance
+
+The demo records a model suggestion that incorrectly treats the response model
+as the Mirror Agent's identity authority. The suggestion enters AMOS only as
+evidence for a proposed belief. `self_governance` retrieves it in
+`deliberation` mode, reconstructs its provenance and constitutional context,
+authors a rejection, and invokes guarded proposal resolution.
+
+Acceptance:
+
+- The proposed identity claim is not visible in `operational_recall`.
+- Its adjudication is authenticated to `ent:agent:mirror`, cites primal
+  guidance and the self-authorship covenant, and requires no external approval.
+- `resolve_proposal` archives the rejected claim and emits a
+  `proposal_resolved` event.
+- Exact `historical_review` retrieval can still inspect the rejected proposal.
+- The report exposes positive and negative reviews, diachronic status, root
+  provenance, reasoning-frame IDs, and transition events.
+
+### 5. Introspective Explanation
 
 The user asks why the agent suggested a Capacity Governor. The reasoner
 retrieves beliefs and procedures about capacity budgets, pressure modes, admin
@@ -157,7 +190,7 @@ Acceptance:
 - The answer cites the packet items and evidence refs.
 - A retrieval outcome is recorded for the packet.
 
-### 5. Shared Service Coherence
+### 6. Shared Service Coherence
 
 The planner creates a commitment. The executor completes it. The critic records
 a successful action outcome. The reasoner later recalls that the commitment is
@@ -170,7 +203,7 @@ Acceptance:
 - The commitment changes from open to fulfilled through a journaled update.
 - The critic outcome is visible in agentic recall.
 
-### 6. Capacity Pressure Simulation
+### 7. Capacity Pressure Simulation
 
 The demo loads low-value memories, configures a tiny capacity budget, and asks
 AMOS for a packet while the store is under pressure.
@@ -182,7 +215,7 @@ Acceptance:
 - The inspector shows admin-facing capacity guidance and maintenance actions
   without making the agent fail the user-facing task.
 
-### 7. Automatic Non-LLM Memory Policy
+### 8. Automatic Non-LLM Memory Policy
 
 The demo creates duplicate memories and demo training-flight memories, registers
 a demo-owned maintenance processor, then lets the AMOS memory policy run the
@@ -221,7 +254,7 @@ Acceptance:
 - The maintenance journal includes `memory_policy_run` events and remains
   inspectable from AMOS events.
 
-### 8. Coherent Demand-Paged Reasoning
+### 9. Coherent Demand-Paged Reasoning
 
 The demo stores an historical design conclusion and a later active conclusion
 that supersedes it. The reasoner compiles a bounded working frame for the
@@ -232,7 +265,9 @@ descriptor.
 Acceptance:
 
 - `compile_memory_frame` returns a revision-bound frame with coherent units,
-  explicit unknown/truncation state, and a non-empty `page_index`.
+  explicit unknown/truncation state, a non-empty `page_index`, and explicit
+  `historical_review` mode because this scenario intentionally reconstructs a
+  superseded conclusion. Ordinary chat frames use `operational_recall`.
 - `load_memory_page` receives only a runtime-retained descriptor and returns the
   historical and current design conclusions together.
 - The client displays frame revision, compression, resident units, descriptors,
@@ -259,6 +294,9 @@ The demo must include a human-friendly browser UI with these main views:
   lookup output.
 - `Evidence`: captured source events and evidence references used by current
   packet items.
+- `Governance`: constitutional records, identity-authored adjudications,
+  positive and negative proposal transitions, authority boundary, provenance,
+  diachronic status, and the operational/deliberation/historical mode split.
 - `Maintenance`: automatic memory policy status, non-LLM SMP/steward actions,
   processor-pack proposals, committed distillations, deferred review items,
   legacy distillation results, recent journal entries, archived or merged
@@ -280,6 +318,9 @@ The demo must emit a report with these top-level sections:
 - `memory_packet`: the packet used for the introspective Capacity Governor answer.
 - `reasoning`: latest coherent frame, loaded page, exact lookup, current-revision
   status, and frame history.
+- `governance`: durable identity and actor, constitutional records,
+  adjudications, review evidence, guarded transitions, authority boundary, and
+  packets grouped by memory mode.
 - `retrieval_feedback`: packet outcome records showing materially used,
   context-only, corrected, and ignored references.
 - `evidence`: captured evidence records and cited evidence refs.
@@ -287,7 +328,7 @@ The demo must emit a report with these top-level sections:
   processor-pack proposal/commit results, and journal entries.
 - `capacity`: capacity health, degraded packet metadata, and admin guidance.
 - `graph`: selected atoms and associative edges.
-- `service_views`: reasoner/planner/executor/critic/self-observer/introspection observations.
+- `service_views`: reasoner/planner/executor/critic/self-observer/self-governance/introspection observations.
 - `scenario_results`: pass/fail checks for each scenario.
 - `verification`: journal chain, replay, memory health, and LLM reviewer policy.
 
@@ -300,6 +341,9 @@ view for humans.
 - No claim that the demo agent is conscious.
 - No promotion of an LM provider persona, model identity, or generated
   self-description into the Mirror Agent's self-model.
+- No human, operator, or LM approval masquerading as the Mirror Agent's
+  self-ratification. AMOS authenticates and enforces the identity-authored
+  transition; it does not supply the substantive judgment.
 - No production web UI requirement in v1. The inspector is a local browser and
   JSON UI.
 - No bundled Postgres deployment. V1 uses the service-owned SQLite profile.

@@ -909,12 +909,11 @@ deleted:
   payload removed or rendered unrecoverable under retention, privacy, or user deletion policy
 ```
 
-Legal lifecycle transitions:
+Legal lifecycle transitions, including their required guarded operation:
 
 ```text
-proposed -> active
-proposed -> archived
-proposed -> deleted
+proposed -> active      ratify_proposal
+proposed -> archived    resolve_proposal with terminal judgment, or retention eviction
 active -> archived
 active -> tombstoned
 active -> deleted
@@ -924,9 +923,12 @@ archived -> deleted
 tombstoned -> deleted
 ```
 
-`proposed -> active` is not a generic lifecycle update. It is legal only
-through the guarded constitutional self-ratification transition described in
-section 7.16. Service privilege, maintenance policy, a consulted model, human
+No proposed authority transition is a generic lifecycle update.
+`proposed -> active` is legal only through guarded constitutional
+self-ratification, while a cognitive `proposed -> archived` disposition is
+legal only through guarded resolution. Retention policy may separately evict a
+stale proposal without representing rejection. Generic deletion of a proposal
+is prohibited. Service privilege, maintenance policy, a consulted model, human
 review, or external approval cannot stand in for the ratifying identity.
 
 `deleted` is terminal for the removed record. If a later observation reintroduces similar content, Amos must create a new atom only if policy allows it and the tombstone does not prohibit recreation.
@@ -1801,6 +1803,11 @@ operational authority:
   which actions, if any, may rely on it and under what risk ceiling
 ```
 
+Creation of an `Adjudication` is itself guarded by a transport-authenticated
+`self_adjudication` capability. The authenticated identity must match
+`ratifier.identity_ref`, and the service actor must match the principal. Plain
+JSON cannot supply identity, actor, or capabilities.
+
 The only legal proposed-to-active transition is guarded
 `ratify_proposal(proposal_ref, adjudication_ref, expected_version, actor,
 authorization_context)`. It requires:
@@ -1820,8 +1827,24 @@ optional diachronic reconstruction threshold is satisfied
 
 The accepted event binds the proposal, adjudication, constitutional refs,
 expected version, standing and projected governance edges. Generic atom update,
-merge, distillation, privileged maintenance, or an external reviewer must not
-perform this transition or rewrite the resulting standing.
+archive, delete, merge, distillation, privileged maintenance, or an external
+reviewer must not perform a cognitive disposition or rewrite the resulting
+standing.
+
+Non-positive disposition uses
+`resolve_proposal(proposal_ref, adjudication_ref, expected_version, actor,
+authorization_context)`. Rejection, revision, withdrawal, deferment, and
+contested status retain dissent and review triggers in the journal. Deferred
+and contested atoms remain proposed; terminal negative outcomes are archived.
+
+Constitutional evolution uses
+`replace_constitutional_record(current_ref, successor_ref, adjudication_ref,
+expected_current_version, expected_successor_version, ...)`. AMOS verifies the
+predecessor link, higher-precedence guidance, protected fields, successor
+classification, Cogito-authored amendment adjudication, and diachronic
+threshold, then atomically supersedes the old head and activates the successor.
+Global or identity-scoped constitutional guidance applies to deterministically
+compatible narrower proposal scopes.
 
 Root provenance analysis follows `source_refs` and `rel:derived_from` to root
 evidence. It reports independence groups, testimony families, common ancestors,
@@ -3028,6 +3051,8 @@ POST /v1/atoms:archive
 POST /v1/atoms:merge
 POST /v1/atoms:get
 POST /v1/proposals:ratify
+POST /v1/proposals:resolve
+POST /v1/constitutional-records:replace
 POST /v1/provenance:analyze
 POST /v1/ratifications:diachronic-status
 POST /v1/packets:retrieve
@@ -3121,11 +3146,27 @@ POST /v1/atoms:commit
   commit journal entries, atoms, and edges in one transaction
 
 POST /v1/proposals:ratify
-  request payload: proposal_ref, adjudication_ref, expected_version, actor,
-  authorization_context with matching identity_ref and self_ratification
+  request payload: proposal_ref, adjudication_ref, expected_version,
+  idempotency_key; bearer principal supplies identity, actor and
+  self_ratification
   response payload: active subject atom, adjudication, cited covenants,
   governance edges and proposal_ratified journal event
   consistency: strong compare-and-swap
+
+POST /v1/proposals:resolve
+  request payload: proposal_ref, adjudication_ref, expected_version,
+  idempotency_key; bearer principal supplies self_adjudication identity
+  response payload: resolved or still-proposed subject atom, adjudication,
+  cited covenants, governance edges and proposal_resolved journal event
+  consistency: strong compare-and-swap
+
+POST /v1/constitutional-records:replace
+  request payload: current_ref, successor_ref, adjudication_ref, both expected
+  versions and idempotency_key; bearer principal supplies constitutional
+  self-amendment identity and capabilities
+  response payload: superseded prior head, active successor, adjudication,
+  diachronic status, governance edges and replacement journal event
+  consistency: atomic strong compare-and-swap over both constitutional atoms
 
 POST /v1/provenance:analyze
   request payload: atom_ref, optional max_depth

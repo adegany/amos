@@ -31,7 +31,7 @@
         "outcome": {
           "enum": [
             "adopted", "confirmed", "provisionally_adopted", "rejected",
-            "revised", "withdrawn"
+            "revised", "withdrawn", "deferred", "contested"
           ]
         },
         "reasons_for_refs": { "$ref": "#/$defs/ReferenceList" },

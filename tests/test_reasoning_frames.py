@@ -60,6 +60,65 @@ def test_frame_keeps_supersession_chain_as_one_coherent_unit(amos):
     assert unit["unit_id"] not in {page["unit_ref"] for page in frame["page_index"]}
 
 
+def test_historical_frame_reconstructs_archived_structured_supersession(amos):
+    old = amos.commit_atom(
+        {
+            "id": "historical_frame_old_decision",
+            "type": "belief",
+            "payload": {"claim": "The agent delegated identity authority to its model."},
+        }
+    )["atom"]
+    new = amos.commit_atom(
+        {
+            "id": "historical_frame_current_decision",
+            "type": "belief",
+            "payload": {
+                "claim": "The continuing agent retains identity authority across models."
+            },
+            "supersedes": [old["id"]],
+        }
+    )["atom"]
+    amos.archive_atom(old["id"], reason="superseded historical conclusion")
+
+    operational = amos.compile_memory_frame(
+        need="continuing agent retains identity authority across models",
+        purpose="apply the active identity conclusion",
+        memory_mode="operational_recall",
+        token_or_byte_budget={"tokens": 3000},
+        run_policy=False,
+    )
+    operational_refs = {
+        ref
+        for unit in operational["units"]
+        for ref in unit["source_atom_refs"]
+    }
+    assert new["id"] in operational_refs
+    assert old["id"] not in operational_refs
+
+    historical = amos.compile_memory_frame(
+        need="continuing agent retains identity authority across models",
+        purpose="reconstruct the superseded identity conclusion",
+        memory_mode="historical_review",
+        token_or_byte_budget={"tokens": 3000},
+        run_policy=False,
+    )
+    unit = next(
+        unit
+        for unit in historical["units"]
+        if new["id"] in unit["source_atom_refs"]
+    )
+    assert unit["unit_type"] == "decision_chain"
+    assert set(unit["source_atom_refs"]) == {old["id"], new["id"]}
+    assert unit["active_conclusion_refs"] == [new["id"]]
+    assert unit["rejected_or_superseded_refs"] == [old["id"]]
+    assert any(
+        relationship["relation"] == "rel:supersedes"
+        and relationship["source_ref"] == new["id"]
+        and relationship["target_ref"] == old["id"]
+        for relationship in unit["relationships"]
+    )
+
+
 def test_frame_keeps_both_sides_of_a_conflict(amos):
     left = amos.commit_atom(
         {
@@ -264,7 +323,7 @@ def test_supporting_rationale_is_advertised_without_forcing_initial_residency(am
     bounded_frame = amos.compile_memory_frame(
         need="runtime-owned page authorization",
         purpose="apply the current paging decision",
-        token_or_byte_budget={"tokens": 1700},
+        token_or_byte_budget={"tokens": 1800},
         run_policy=False,
     )
     bounded_rationale = next(
@@ -719,7 +778,7 @@ def test_budget_derived_closure_truncation_exposes_loadable_continuation(amos):
         revision=frame["revision"],
         page=descriptor,
         depth="supporting",
-        token_or_byte_budget={"tokens": 1500},
+        token_or_byte_budget={"tokens": 1700},
         run_policy=False,
     )
     assert continuation_refs <= set(page["source_atom_refs"])

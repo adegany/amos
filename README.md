@@ -264,12 +264,23 @@ evidence and consulted views
   -> active atom + proposal_ratified journal event
 ```
 
-`ratify_proposal` requires an expected proposal version and an authenticated
-authorization context whose `identity_ref` matches
+`ratify_proposal` requires an expected proposal version and a
+transport-authenticated service principal whose `identity_ref` matches
 `adjudication.ratifier.identity_ref` and whose capabilities include
-`self_ratification`. This context authenticates self-authorship; it is not an
-external approval. Generic `update_atom`, maintenance, distillation, and
-privileged service actors cannot promote a proposal or rewrite standing.
+`self_ratification`. Adjudication creation separately requires
+`self_adjudication`. HTTP callers send only a bearer token; AMOS rejects
+identity, actor, or capabilities supplied in JSON. This principal authenticates
+self-authorship; it is not an external approval.
+
+`POST /v1/proposals:resolve` applies authenticated rejection, revision,
+withdrawal, deferment, or contested status. `POST
+/v1/constitutional-records:replace` atomically supersedes a constitutional head
+after an identity-authored amendment adjudication and its diachronic threshold.
+Global or identity constitutional scope applies to compatible narrower scopes.
+Generic update, archive, delete, maintenance, distillation, and privileged
+service actors cannot complete a cognitive proposal disposition or rewrite
+standing. Retention eviction of stale proposals remains storage policy, not a
+rejection judgment.
 
 Use `--memory-mode operational_recall` for active premises,
 `--memory-mode deliberation` to include candidates with mandatory conflicts and
@@ -296,19 +307,37 @@ memory policy maintenance remains deterministic and non-LLM: SMP analysis,
 stewardship, automatic distillation, index rebuilds, packet-cache invalidation,
 and capacity reporting do not call the chat LM.
 
-The demo exercises both the compatibility packet path and the current coherent
-reasoning path. Its `Reasoning` view shows revision-bound resident units,
-trusted demand-page descriptors, loaded pages, explicit unknowns/truncation,
-and exact-ID lookup. The maintenance and graph views show producer-supplied
-`semantic_facets`, explicit `graph_relations`, low-risk committed edges,
-review-gated relations, proposal retention/deduplication, edge provenance, and
-retrieval-feedback telemetry.
+The demo also dogfoods autonomous constitutional governance. It seeds immutable
+primal guidance and an entrenched self-authorship covenant, treats observer and
+model conclusions as proposals, reconstructs them in `deliberation` mode, and
+uses authenticated Mirror identity adjudications to ratify supported
+self-model/procedure changes or reject an invalid model-identity claim. There
+is no human or LM approval step: the Mirror Agent supplies the substantive
+judgment and AMOS authenticates, validates, journals, and applies the guarded
+transition. Rejected claims remain inspectable through `historical_review`;
+ordinary chat and reasoning use `operational_recall`.
+
+The browser adds a `Governance` view for constitutional records,
+adjudications, provenance/diachronic evidence, authority boundaries, and
+`proposal_ratified` / `proposal_resolved` journal transitions. Its `Reasoning`
+view shows revision-bound resident units, trusted demand-page descriptors,
+loaded pages, explicit unknowns/truncation, memory mode, and exact-ID lookup.
+The maintenance and graph views show producer-supplied `semantic_facets`,
+explicit `graph_relations`, low-risk committed edges, review-gated relations,
+proposal retention/deduplication, edge provenance, and retrieval-feedback
+telemetry.
 
 Serve the V1 HTTP API:
 
 ```bash
-PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 serve --host 127.0.0.1 --port 8765
+PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 serve \
+  --host 127.0.0.1 --port 8765 \
+  --governance-principals @/run/amos/governance-principals.json
 ```
+
+The principals file is a JSON object keyed by bearer token. Each value binds
+`identity_ref`, `actor`, and `capabilities`. Keep it mode 0600 and outside
+request-accessible storage.
 
 The HTTP service starts a background memory-policy worker. `GET
 /v1/health/memory` reports health and worker status without running maintenance
@@ -465,10 +494,13 @@ v1-local profile, not an enforced performance gate:
 
 ## Integration boundary
 
-AMOS owns canonical memory, recall, provenance, cleanup metadata, self-awareness
-views, and advisory maintenance. It does not directly execute external actions.
-Integrations such as the Mirror Agent demo should keep live control authority,
-validation, approval checks, and runtime packet application outside AMOS.
+AMOS owns canonical memory, recall, provenance, constitutional transition
+enforcement, cleanup metadata, self-awareness views, and advisory maintenance.
+It does not directly execute external actions. Integrations such as the Mirror
+Agent demo should keep live external-action authority, validation, approval
+checks, and runtime packet application outside AMOS. Cognitive proposal
+disposition remains identity-authored while AMOS enforces the authenticated
+ratification or resolution contract.
 Domain-specific maintenance packs should follow the same boundary: they inspect
 bounded AMOS evidence windows and return side-effect-free proposals; optional
 `window_request` metadata narrows lifecycle/type/profile and evidence needs but

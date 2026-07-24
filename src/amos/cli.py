@@ -96,6 +96,32 @@ def _parser() -> argparse.ArgumentParser:
     ratify.add_argument("--idempotency-key")
     ratify.set_defaults(func=_ratify_proposal)
 
+    resolve = sub.add_parser(
+        "resolve-proposal",
+        help="apply a guarded non-positive or unresolved adjudication",
+    )
+    resolve.add_argument("--proposal-ref", required=True)
+    resolve.add_argument("--adjudication-ref", required=True)
+    resolve.add_argument("--expected-version", type=int, required=True)
+    resolve.add_argument("--actor", required=True)
+    resolve.add_argument("--authorization-context", required=True)
+    resolve.add_argument("--idempotency-key")
+    resolve.set_defaults(func=_resolve_proposal)
+
+    replace = sub.add_parser(
+        "replace-constitutional-record",
+        help="atomically activate a self-ratified constitutional successor",
+    )
+    replace.add_argument("--current-ref", required=True)
+    replace.add_argument("--successor-ref", required=True)
+    replace.add_argument("--adjudication-ref", required=True)
+    replace.add_argument("--expected-current-version", type=int, required=True)
+    replace.add_argument("--expected-successor-version", type=int, required=True)
+    replace.add_argument("--actor", required=True)
+    replace.add_argument("--authorization-context", required=True)
+    replace.add_argument("--idempotency-key")
+    replace.set_defaults(func=_replace_constitutional_record)
+
     provenance = sub.add_parser(
         "provenance-analysis",
         help="analyze root evidence independence and circular support",
@@ -229,6 +255,14 @@ def _parser() -> argparse.ArgumentParser:
     http = sub.add_parser("serve", help="serve the AMOS v1 HTTP API")
     http.add_argument("--host", default="127.0.0.1")
     http.add_argument("--port", type=int, default=8765)
+    http.add_argument(
+        "--governance-principals",
+        default="{}",
+        help=(
+            "JSON token-to-principal map or @file; identity and cognitive "
+            "governance capabilities are never accepted from request JSON"
+        ),
+    )
     http.set_defaults(func=_serve)
     return parser
 
@@ -282,6 +316,32 @@ def _ratify_proposal(amos: Amos, args: argparse.Namespace) -> dict[str, Any]:
         proposal_ref=args.proposal_ref,
         adjudication_ref=args.adjudication_ref,
         expected_version=args.expected_version,
+        actor=args.actor,
+        authorization_context=parse_json_arg(args.authorization_context),
+        idempotency_key=args.idempotency_key,
+    )
+
+
+def _resolve_proposal(amos: Amos, args: argparse.Namespace) -> dict[str, Any]:
+    return amos.resolve_proposal(
+        proposal_ref=args.proposal_ref,
+        adjudication_ref=args.adjudication_ref,
+        expected_version=args.expected_version,
+        actor=args.actor,
+        authorization_context=parse_json_arg(args.authorization_context),
+        idempotency_key=args.idempotency_key,
+    )
+
+
+def _replace_constitutional_record(
+    amos: Amos, args: argparse.Namespace
+) -> dict[str, Any]:
+    return amos.replace_constitutional_record(
+        current_ref=args.current_ref,
+        successor_ref=args.successor_ref,
+        adjudication_ref=args.adjudication_ref,
+        expected_current_version=args.expected_current_version,
+        expected_successor_version=args.expected_successor_version,
         actor=args.actor,
         authorization_context=parse_json_arg(args.authorization_context),
         idempotency_key=args.idempotency_key,
@@ -422,6 +482,7 @@ def _serve(amos: Amos, args: argparse.Namespace) -> dict[str, Any]:
         args.port,
         db_path,
         maintenance_processor_paths=args.maintenance_processor,
+        governance_principals=parse_json_arg(args.governance_principals),
     )
     return {"status": "stopped"}
 

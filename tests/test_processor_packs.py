@@ -652,6 +652,7 @@ def test_proposed_canonical_facets_remain_dormant_until_ratification(amos):
         actor="canonical-proposal:self",
         authorization_context={
             "identity_ref": "canonical-proposal:self",
+            "actor": "canonical-proposal:self",
             "capabilities": ["constitutional_authoring"],
         },
     )["atom"]
@@ -686,7 +687,13 @@ def test_proposed_canonical_facets_remain_dormant_until_ratification(amos):
                 },
             },
             "scope": scope,
-        }
+        },
+        actor="canonical-proposal:self",
+        authorization_context={
+            "identity_ref": "canonical-proposal:self",
+            "actor": "canonical-proposal:self",
+            "capabilities": ["self_adjudication"],
+        },
     )["atom"]
     amos.ratify_proposal(
         proposal_ref=proposed["id"],
@@ -695,6 +702,7 @@ def test_proposed_canonical_facets_remain_dormant_until_ratification(amos):
         actor="canonical-proposal:self",
         authorization_context={
             "identity_ref": "canonical-proposal:self",
+            "actor": "canonical-proposal:self",
             "capabilities": ["self_ratification"],
         },
     )

@@ -649,7 +649,16 @@ POST /v1/reasoning-pages:load
 POST /v1/proposals:ratify
   performs the only proposed-to-active transition
   binds the proposal version, identity-authored adjudication, constitutional
-  references, objections, scope and self_ratification capability in one event
+  references, objections, scope and bearer-authenticated self_ratification
+  capability in one event
+
+POST /v1/proposals:resolve
+  applies authenticated rejected, revised, withdrawn, deferred or contested
+  disposition while preserving dissent and review triggers
+
+POST /v1/constitutional-records:replace
+  atomically supersedes one constitutional head and activates its proposed
+  successor after amendment adjudication and diachronic checks
 
 POST /v1/provenance:analyze
   reports root evidence, independence groups, testimony families, common
@@ -673,6 +682,12 @@ connected agents do not own lifecycle maintenance themselves.
 V1-local implements constitutional self-ratification as a generic memory
 invariant. AMOS authenticates and records the decision; it does not decide what
 the identity ought to believe.
+
+HTTP deployments configure bearer-token principals at server startup. A
+principal binds identity, exact service actor, and capabilities. Protected
+operations reject those fields when supplied in caller JSON. Creation of an
+adjudication requires `self_adjudication`; positive transition requires
+`self_ratification`.
 
 ```text
 consulted source:
@@ -699,10 +714,13 @@ ratify_proposal:
   proposal_ratified with both records and expected-version context
 ```
 
-Generic update cannot perform `proposed -> active` and cannot rewrite
-epistemic, normative, operational, or ratification fields. Generic merge,
-distillation, and automatic maintenance cannot alter constitutional records or
-launder proposed/contested sources into active derived memory. Constitutional
+Generic update, archive, and delete cannot dispose of or activate a proposed
+atom; those authority-changing outcomes require `ratify_proposal` or
+`resolve_proposal`. They also cannot rewrite epistemic, normative, operational,
+or ratification fields. Generic merge, distillation, and automatic maintenance
+cannot alter constitutional records or launder proposed/contested sources into
+active derived memory. Retention policy may evict a stale proposal for bounded
+storage, but that event is not a cognitive rejection. Constitutional
 creation and amendment use separate `constitutional_authoring` and
 `constitutional_amendment` capabilities; immutable primal guidance remains
 immutable even to a privileged service actor. Entrenched records additionally

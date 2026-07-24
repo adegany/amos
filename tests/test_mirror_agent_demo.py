@@ -19,6 +19,7 @@ def test_mirror_agent_demo_runs_all_scenarios_and_emits_inspector_report(tmp_pat
         "current_self_model",
         "memory_packet",
         "reasoning",
+        "governance",
         "retrieval_feedback",
         "evidence",
         "maintenance_journal",
@@ -56,6 +57,7 @@ def test_mirror_agent_demo_runs_all_scenarios_and_emits_inspector_report(tmp_pat
     assert reasoning["exact_lookup"]["item"]["atom_ref"] == (
         "mirror_reasoning_design_current"
     )
+    assert reasoning["frame"]["memory_mode"] == "historical_review"
     current_claim = reasoning["exact_lookup"]["item"]["payload"]["claim"]
     sentences = [
         sentence.strip()
@@ -93,12 +95,53 @@ def test_mirror_agent_demo_runs_all_scenarios_and_emits_inspector_report(tmp_pat
     )
     assert report["capacity"]["degraded_packet"]["reduced_recall_depth"] is True
 
+    governance = report["governance"]
+    assert governance["identity_ref"] == "ent:agent:mirror"
+    assert governance["authority"] == {
+        "substantive_judgment": "mirror_agent_identity",
+        "mechanical_enforcement": "amos",
+        "external_approval_required": False,
+        "response_models": "evidence_and_proposals_only",
+    }
+    assert {
+        (atom["id"], atom["type"], atom["lifecycle_state"])
+        for atom in governance["constitution"]
+    } == {
+        ("mirror_primal_guidance_v1", "primal_guidance", "active"),
+        ("mirror_covenant_self_authorship_v1", "covenant", "active"),
+    }
+    reviews = {item["proposal_ref"]: item for item in governance["reviews"]}
+    assert reviews["mirror_failure_premature_implementation"]["outcome"] == "adopted"
+    assert reviews["mirror_proc_architecture_design_v2"]["event_type"] == (
+        "proposal_ratified"
+    )
+    assert reviews["mirror_proc_architecture_design_v2"]["lifecycle_state"] == "active"
+    assert reviews["mirror_proposed_provider_identity"]["outcome"] == "rejected"
+    assert reviews["mirror_proposed_provider_identity"]["lifecycle_state"] == "archived"
+    assert all(item["external_approval_required"] is False for item in reviews.values())
+    assert all(item["actor"] == "svc:mirror:self-governance" for item in reviews.values())
+    assert governance["memory_modes"]["operational_recall"]
+    assert governance["memory_modes"]["deliberation"]
+    assert governance["memory_modes"]["historical_review"]
+    assert {item["event_type"] for item in governance["transitions"]} >= {
+        "proposal_ratified",
+        "proposal_resolved",
+    }
+    assert any(
+        atom["id"] == "mirror_proc_architecture_design_v2"
+        and atom["ratification"]["adjudication_ref"]
+        == reviews["mirror_proc_architecture_design_v2"]["adjudication_ref"]
+        and atom["supersedes"] == ["mirror_proc_architecture_design"]
+        for atom in report["current_self_model"]["canonical_self_atoms"]
+    )
+
     assert {
         "reasoner",
         "planner",
         "executor",
         "critic",
         "self_observer",
+        "self_governance",
         "introspection",
     }.issubset(report["service_views"])
     assert report["verification"]["journal"]["status"] == "ok"
@@ -134,6 +177,8 @@ def test_mirror_agent_ui_serves_report_chat_and_non_llm_maintenance(tmp_path):
         report = http_json(f"{base}/api/report")
         assert report["demo"] == "amos_mirror_agent"
         assert report["lm"]["provider"] == "offline_test_renderer"
+        assert report["governance"]["reviews"]
+        assert report["governance"]["authority"]["external_approval_required"] is False
 
         chat = http_json(
             f"{base}/api/chat",
@@ -142,7 +187,9 @@ def test_mirror_agent_ui_serves_report_chat_and_non_llm_maintenance(tmp_path):
         assert chat["lm"]["maintenance_uses_llm"] is False
         assert chat["turn"]["lm_provider"] == "offline_test_renderer"
         assert chat["packet"]["items"]
+        assert chat["packet"]["request"]["memory_mode"] == "operational_recall"
         assert chat["reasoning_frame"]["frame_id"]
+        assert chat["reasoning_frame"]["memory_mode"] == "operational_recall"
         assert chat["loaded_reasoning_page"]["status"] == "loaded"
         assert chat["exact_lookup"]["retrieval_mode"] == "exact"
         assert chat["turn"]["reasoning_frame_id"] == chat["reasoning_frame"]["frame_id"]

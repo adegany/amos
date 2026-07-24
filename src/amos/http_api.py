@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import hmac
 import sqlite3
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, cast
+from typing import Any, Mapping, cast
 
-from .errors import AmosError, StaleFrameError, ValidationError
+from .errors import AccessDenied, AmosError, StaleFrameError, ValidationError
+from .schemas import CONSTITUTIONAL_ATOM_TYPES
 from .service import Amos
 from .workers import BackgroundMemoryPolicyWorker
 
@@ -21,9 +23,15 @@ class AmosHTTPServer(ThreadingHTTPServer):
         db_path: str,
         *,
         maintenance_processor_paths: list[str] | None = None,
+        governance_principals: Mapping[str, Mapping[str, Any]] | None = None,
     ):
         self.db_path = db_path
         self.maintenance_processor_paths = list(maintenance_processor_paths or [])
+        self.governance_principals = {
+            str(token): dict(principal)
+            for token, principal in dict(governance_principals or {}).items()
+            if str(token)
+        }
         self.amos = Amos(
             db_path,
             maintenance_processor_paths=self.maintenance_processor_paths,
@@ -94,6 +102,11 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         "retryable": False,
                     },
                     status=HTTPStatus.CONFLICT,
+                )
+            except AccessDenied as exc:
+                self._write_json(
+                    {"status": "error", "error": str(exc)},
+                    status=HTTPStatus.FORBIDDEN,
                 )
             except AmosError as exc:
                 self._write_json(
@@ -177,42 +190,117 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 )
             if path == "/v1/atoms:commit":
                 atoms = body.get("atoms")
+                candidates = (
+                    atoms
+                    if isinstance(atoms, list)
+                    else [body.get("atom")]
+                )
+                protected = any(
+                    isinstance(atom, Mapping)
+                    and str(atom.get("type") or "")
+                    in {*CONSTITUTIONAL_ATOM_TYPES, "adjudication"}
+                    for atom in candidates
+                )
+                context = self._authorization_context(
+                    server, body, required=protected
+                )
+                actor = (
+                    str(context["actor"])
+                    if protected and context.get("actor")
+                    else body.get("actor", "http")
+                )
                 if atoms is not None:
                     return self._write_json(
                         amos.commit_memory_atoms(
                             atoms,
-                            actor=body.get("actor", "http"),
-                            authorization_context=body.get("authorization_context"),
+                            actor=actor,
+                            authorization_context=context,
                         )
                     )
                 return self._write_json(
                     amos.commit_atom(
                         body["atom"],
-                        actor=body.get("actor", "http"),
+                        actor=actor,
                         idempotency_key=body.get("idempotency_key"),
-                        authorization_context=body.get("authorization_context"),
+                        authorization_context=context,
                     )
                 )
             if path == "/v1/atoms:update":
+                current = amos.store.get_atom(str(body.get("atom_id") or ""))
+                protected = bool(
+                    current
+                    and (
+                        current.get("type")
+                        in {*CONSTITUTIONAL_ATOM_TYPES, "adjudication"}
+                        or any(
+                            key
+                            in {
+                                "ratification",
+                                "epistemic_standing",
+                                "normative_standing",
+                                "operational_authority",
+                            }
+                            for key in dict(body.get("payload_patch") or {})
+                        )
+                    )
+                )
+                context = self._authorization_context(
+                    server, body, required=protected
+                )
                 return self._write_json(
                     amos.update_atom(
                         body["atom_id"],
                         payload_patch=body.get("payload_patch"),
                         set_fields=body.get("set_fields"),
                         expected_version=body.get("expected_version"),
-                        actor=body.get("actor", "http"),
-                        authorization_context=body.get("authorization_context"),
+                        actor=(
+                            str(context["actor"])
+                            if protected and context.get("actor")
+                            else body.get("actor", "http")
+                        ),
+                        authorization_context=context,
                         idempotency_key=body.get("idempotency_key"),
                     )
                 )
             if path == "/v1/proposals:ratify":
+                context = self._authorization_context(server, body, required=True)
                 return self._write_json(
                     amos.ratify_proposal(
                         proposal_ref=body["proposal_ref"],
                         adjudication_ref=body["adjudication_ref"],
                         expected_version=body["expected_version"],
-                        actor=body.get("actor", "http"),
-                        authorization_context=body.get("authorization_context") or {},
+                        actor=str(context["actor"]),
+                        authorization_context=context,
+                        idempotency_key=body.get("idempotency_key"),
+                    )
+                )
+            if path == "/v1/proposals:resolve":
+                context = self._authorization_context(server, body, required=True)
+                return self._write_json(
+                    amos.resolve_proposal(
+                        proposal_ref=body["proposal_ref"],
+                        adjudication_ref=body["adjudication_ref"],
+                        expected_version=body["expected_version"],
+                        actor=str(context["actor"]),
+                        authorization_context=context,
+                        idempotency_key=body.get("idempotency_key"),
+                    )
+                )
+            if path == "/v1/constitutional-records:replace":
+                context = self._authorization_context(server, body, required=True)
+                return self._write_json(
+                    amos.replace_constitutional_record(
+                        current_ref=body["current_ref"],
+                        successor_ref=body["successor_ref"],
+                        adjudication_ref=body["adjudication_ref"],
+                        expected_current_version=body[
+                            "expected_current_version"
+                        ],
+                        expected_successor_version=body[
+                            "expected_successor_version"
+                        ],
+                        actor=str(context["actor"]),
+                        authorization_context=context,
                         idempotency_key=body.get("idempotency_key"),
                     )
                 )
@@ -223,13 +311,26 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                     amos.diachronic_ratification_status(**body)
                 )
             if path == "/v1/atoms:archive":
+                current = amos.store.get_atom(str(body.get("atom_id") or ""))
+                protected = bool(
+                    current
+                    and current.get("type")
+                    in {*CONSTITUTIONAL_ATOM_TYPES, "adjudication"}
+                )
+                context = self._authorization_context(
+                    server, body, required=protected
+                )
                 return self._write_json(
                     amos.archive_atom(
                         body["atom_id"],
                         reason=body.get("reason", "archived"),
                         expected_version=body.get("expected_version"),
-                        actor=body.get("actor", "http"),
-                        authorization_context=body.get("authorization_context"),
+                        actor=(
+                            str(context["actor"])
+                            if protected and context.get("actor")
+                            else body.get("actor", "http")
+                        ),
+                        authorization_context=context,
                     )
                 )
             if path == "/v1/atoms:merge":
@@ -397,6 +498,36 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 raise json.JSONDecodeError("expected JSON object", raw.decode("utf-8"), 0)
             return data
 
+        def _authorization_context(
+            self,
+            server: AmosHTTPServer,
+            body: Mapping[str, Any],
+            *,
+            required: bool,
+        ) -> dict[str, Any]:
+            supplied = dict(body.get("authorization_context") or {})
+            forbidden = sorted(
+                {"identity_ref", "actor", "capabilities"}.intersection(supplied)
+            )
+            if forbidden:
+                raise AccessDenied(
+                    "identity, actor, and capabilities are transport-authenticated; "
+                    "caller JSON cannot supply: " + ", ".join(forbidden)
+                )
+            header = str(self.headers.get("Authorization") or "")
+            principal: dict[str, Any] | None = None
+            if header.startswith("Bearer "):
+                candidate = header[7:]
+                for token, configured in server.governance_principals.items():
+                    if hmac.compare_digest(candidate, token):
+                        principal = dict(configured)
+                        break
+            if required and principal is None:
+                raise AccessDenied(
+                    "cognitive governance requires an authenticated service principal"
+                )
+            return {**supplied, **(principal or {})}
+
         def _write_json(
             self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK
         ) -> None:
@@ -427,11 +558,13 @@ def serve(
     db_path: str,
     *,
     maintenance_processor_paths: list[str] | None = None,
+    governance_principals: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> None:
     server = AmosHTTPServer(
         (host, port),
         db_path,
         maintenance_processor_paths=maintenance_processor_paths,
+        governance_principals=governance_principals,
     )
     try:
         server.serve_forever()

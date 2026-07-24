@@ -93,8 +93,8 @@ def test_cli_constitutional_governance_commands(tmp_path, capsys):
                 adjudication["id"],
                 "--expected-version",
                 str(proposal["version"]),
-                "--actor",
-                "cogito:self",
+                    "--actor",
+                    "svc:cogito:self-governance",
                 "--authorization-context",
                 json.dumps(RATIFICATION),
             ]
@@ -214,7 +214,11 @@ def test_http_constitutional_governance_endpoints(tmp_path):
 
     db_path = str(tmp_path / "http_governance.sqlite3")
     try:
-        server = AmosHTTPServer(("127.0.0.1", 0), db_path)
+        server = AmosHTTPServer(
+            ("127.0.0.1", 0),
+            db_path,
+            governance_principals={"test-governance-token": RATIFICATION},
+        )
     except PermissionError as exc:
         pytest.skip(f"loopback sockets unavailable in this sandbox: {exc}")
     covenant = _covenant(server.amos)
@@ -228,15 +232,37 @@ def test_http_constitutional_governance_endpoints(tmp_path):
     thread.start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
     try:
+        with pytest.raises(urllib.error.HTTPError) as unauthenticated:
+            http_json(
+                f"{base}/v1/proposals:ratify",
+                {
+                    "proposal_ref": proposal["id"],
+                    "adjudication_ref": adjudication["id"],
+                    "expected_version": proposal["version"],
+                },
+            )
+        assert unauthenticated.value.code == 403
+        with pytest.raises(urllib.error.HTTPError) as forged:
+            http_json(
+                f"{base}/v1/atoms:commit",
+                {
+                    "atom": {
+                        **adjudication,
+                        "id": "http_forged_adjudication",
+                    },
+                    "actor": "svc:cogito:self-governance",
+                    "authorization_context": RATIFICATION,
+                },
+            )
+        assert forged.value.code == 403
         ratified = http_json(
             f"{base}/v1/proposals:ratify",
             {
                 "proposal_ref": proposal["id"],
                 "adjudication_ref": adjudication["id"],
                 "expected_version": proposal["version"],
-                "actor": "cogito:self",
-                "authorization_context": RATIFICATION,
             },
+            headers={"Authorization": "Bearer test-governance-token"},
         )
         assert ratified["status"] == "ratified"
         provenance = http_json(
@@ -443,12 +469,12 @@ def test_http_reasoning_frame_page_contract_and_stale_revision(tmp_path):
         thread.join(timeout=2)
 
 
-def http_json(url, payload=None):
+def http_json(url, payload=None, *, headers=None):
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **dict(headers or {})},
         method="POST" if payload is not None else "GET",
     )
     with urllib.request.urlopen(request, timeout=5) as response:

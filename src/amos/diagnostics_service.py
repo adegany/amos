@@ -219,6 +219,8 @@ class DiagnosticsService:
             elif event_type in {
                 "atom_merged",
                 "proposal_ratified",
+                "proposal_resolved",
+                "constitutional_record_replaced",
                 "steward_run",
                 "retrieval_outcome_recorded",
                 "decay_policy_applied",

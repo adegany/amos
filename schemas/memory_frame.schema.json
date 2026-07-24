@@ -4,8 +4,10 @@
   "title": "AMOS ReasoningMemoryFrame",
   "type": "object",
   "required": [
-    "status", "frame_id", "schema_version", "revision", "generated_at",
-    "request", "orientation", "units", "sections", "unknowns", "page_index",
+    "status", "frame_id", "schema_version", "revision", "generated_at", "memory_mode",
+    "request", "orientation", "units", "sections", "active_conclusion_refs",
+    "candidate_conclusion_refs", "contested_conclusion_refs",
+    "rejected_or_superseded_refs", "unknowns", "page_index",
     "source_atom_refs", "omissions", "truncated", "token_estimate", "budget",
     "compilation_trace", "provenance"
   ],
@@ -15,6 +17,9 @@
     "schema_version": { "const": "amos.v1" },
     "revision": { "$ref": "#/$defs/revision" },
     "generated_at": { "type": "string" },
+    "memory_mode": {
+      "enum": ["operational_recall", "deliberation", "historical_review"]
+    },
     "request": { "type": "object" },
     "orientation": { "type": "object" },
     "units": { "type": "array", "items": { "$ref": "#/$defs/coherentUnit" } },
@@ -25,6 +30,10 @@
     "commitments": { "type": "array", "items": { "type": "string" } },
     "relevant_episodes": { "type": "array", "items": { "type": "string" } },
     "conflicts": { "type": "array", "items": { "type": "string" } },
+    "active_conclusion_refs": { "type": "array", "items": { "type": "string" } },
+    "candidate_conclusion_refs": { "type": "array", "items": { "type": "string" } },
+    "contested_conclusion_refs": { "type": "array", "items": { "type": "string" } },
+    "rejected_or_superseded_refs": { "type": "array", "items": { "type": "string" } },
     "unknowns": { "type": "array", "items": { "type": "object" } },
     "page_index": { "type": "array", "items": { "$ref": "#/$defs/pageDescriptor" } },
     "source_atom_refs": { "type": "array", "items": { "type": "string" } },

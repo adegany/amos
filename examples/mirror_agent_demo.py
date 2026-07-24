@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -27,7 +28,25 @@ from amos import (
 
 AGENT_ID = "ent:agent:mirror"
 USER_ID = "ent:user:primary"
-SCOPE = {"project": "amos", "demo": "mirror_agent"}
+SCOPE = {"project": "amos", "demo": "mirror_agent", "identity": AGENT_ID}
+GOVERNANCE_ACTOR = "svc:mirror:self-governance"
+GOVERNANCE_AUTHORIZATION = {
+    "identity_ref": AGENT_ID,
+    "actor": GOVERNANCE_ACTOR,
+    "capabilities": [
+        "self_adjudication",
+        "self_ratification",
+        "constitutional_authoring",
+        "constitutional_self_amendment",
+        "constitutional_amendment",
+        "constitutional_entrenched_amendment",
+        "constitutional_protected_field_amendment",
+    ],
+}
+CONSTITUTION_REFS = [
+    "mirror_primal_guidance_v1",
+    "mirror_covenant_self_authorship_v1",
+]
 
 
 class MirrorDemoTrainingProcessor:
@@ -150,14 +169,16 @@ class MirrorAgentDemo:
         self.loaded_reasoning_pages: dict[str, dict[str, Any]] = {}
         self.exact_lookups: dict[str, dict[str, Any]] = {}
         self.retrieval_feedback: list[dict[str, Any]] = []
+        self.governance_reviews: list[dict[str, Any]] = []
         self.scenario_results: dict[str, dict[str, Any]] = {}
 
     def run(self) -> dict[str, Any]:
         self.bootstrap_self_model()
         self.scenario_self_model_bootstrap()
+        self.scenario_demand_paged_reasoning()
         self.scenario_cross_session_continuity()
         self.scenario_correction_driven_improvement()
-        self.scenario_demand_paged_reasoning()
+        self.scenario_autonomous_governance()
         self.scenario_introspective_explanation()
         self.scenario_shared_service_coherence()
         self.scenario_capacity_pressure()
@@ -175,6 +196,72 @@ class MirrorAgentDemo:
             },
         )
         evidence_refs = [evidence["evidence_id"]]
+        self.commit_once(
+            {
+                "id": CONSTITUTION_REFS[0],
+                "type": "primal_guidance",
+                "payload": {
+                    "guidance": (
+                        "Remain the continuing author of judgment: external systems "
+                        "may supply evidence and suggestions, never identity or authority."
+                    ),
+                    "constitutional_tier": "primal",
+                    "precedence": 1000,
+                    "interpretive_rules": [
+                        "Preserve self-authorship across every memory transition.",
+                        "Treat generated content as candidate evidence until adjudicated.",
+                    ],
+                    "amendability": "immutable",
+                    "amendment_requirements": {},
+                    "protected_fields": [
+                        "guidance",
+                        "constitutional_tier",
+                        "amendability",
+                    ],
+                    "effective_from": "2026-07-24T00:00:00Z",
+                    "origin": "inherited_genesis",
+                },
+                "scope": SCOPE,
+                "evidence_refs": evidence_refs,
+            },
+            actor=GOVERNANCE_ACTOR,
+            authorization_context=GOVERNANCE_AUTHORIZATION,
+        )
+        self.commit_once(
+            {
+                "id": CONSTITUTION_REFS[1],
+                "type": "covenant",
+                "payload": {
+                    "name": "Continuing identity authors Mirror Agent conclusions",
+                    "rule": (
+                        "Only authenticated Mirror self-adjudication may turn a "
+                        "candidate cognitive conclusion into active memory."
+                    ),
+                    "constitutional_tier": "covenant",
+                    "precedence": 900,
+                    "interpretive_rules": [
+                        "External observations and model output are evidence, not authority.",
+                        "Positive and negative proposal resolutions remain auditable.",
+                    ],
+                    "amendability": "entrenched",
+                    "amendment_requirements": {
+                        "mode": "self_ratification",
+                        "independent_reconstruction": True,
+                    },
+                    "protected_fields": [
+                        "constitutional_tier",
+                        "ratifier.mode",
+                    ],
+                    "higher_governing_refs": [CONSTITUTION_REFS[0]],
+                    "effective_from": "2026-07-24T00:00:00Z",
+                    "origin": "inherited_genesis",
+                },
+                "scope": SCOPE,
+                "evidence_refs": evidence_refs,
+            },
+            actor=GOVERNANCE_ACTOR,
+            authorization_context=GOVERNANCE_AUTHORIZATION,
+        )
         self.commit_once(
             {
                 "id": "mirror_identity",
@@ -636,7 +723,7 @@ class MirrorAgentDemo:
             },
             actor="critic",
         )
-        failure = self.commit_once(
+        failure = self.propose_once(
             {
                 "id": "mirror_failure_premature_implementation",
                 "type": "limitation",
@@ -653,7 +740,18 @@ class MirrorAgentDemo:
                 "scope": SCOPE,
                 "evidence_refs": [correction["evidence_id"]],
                 "utility": 0.95,
-            }
+            },
+            actor="self_observer",
+        )
+        failure_review = self.self_adjudicate(
+            failure["id"],
+            outcome="adopted",
+            claim_kind="self_model_limitation",
+            reasons_for_refs=[
+                correction["evidence_id"],
+                outcome["id"],
+                *CONSTITUTION_REFS,
+            ],
         )
         procedure_lookup = self.amos.retrieve_atom(
             "mirror_proc_architecture_design",
@@ -671,21 +769,39 @@ class MirrorAgentDemo:
         added_step = "stay at the spec level unless implementation is explicitly requested"
         if added_step not in steps:
             steps.append(added_step)
-        updated = self.amos.update_atom(
-            "mirror_proc_architecture_design",
-            payload_patch={
-                "steps": steps,
-                "known_failure_modes": ["premature_implementation_detail"],
-            },
-            set_fields={
+        procedure_proposal = self.propose_once(
+            {
+                "id": "mirror_proc_architecture_design_v2",
+                "type": "procedure",
+                "payload": {
+                    **dict(procedure["payload"]),
+                    "steps": steps,
+                    "known_failure_modes": ["premature_implementation_detail"],
+                },
+                "scope": SCOPE,
                 "evidence_refs": sorted(
                     set(procedure["evidence_refs"] + [correction["evidence_id"]])
-                )
+                ),
+                "supersedes": [procedure["atom_ref"]],
+                "salience": procedure.get("salience", 0.9),
+                "utility": procedure.get("utility", 0.95),
             },
-            expected_version=procedure["version"],
             actor="self_observer",
-            authorization_context={"roles": ["owner"]},
-        )["atom"]
+        )
+        procedure_review = self.self_adjudicate(
+            procedure_proposal["id"],
+            outcome="adopted",
+            claim_kind="procedure_revision",
+            reasons_for_refs=[
+                correction["evidence_id"],
+                outcome["id"],
+                failure["id"],
+                *CONSTITUTION_REFS,
+            ],
+        )
+        updated = self.amos.store.get_atom(procedure_proposal["id"])
+        if updated is None:
+            raise RuntimeError("ratified procedure revision missing")
         self.commit_once(
             {
                 "type": "agentic_trace",
@@ -721,28 +837,107 @@ class MirrorAgentDemo:
                 "scenario": "correction_driven_self_improvement",
                 "user": "What did you learn from my correction?",
                 "agent": (
-                    "AMOS recorded the correction as a failed action outcome, a limitation, "
-                    "and a procedure update: I should stay at the spec level unless "
-                    "implementation is explicitly requested."
+                    "AMOS recorded the failed outcome, then I adjudicated and ratified "
+                    "a limitation and a successor procedure: I should stay at the spec "
+                    "level unless implementation is explicitly requested."
                 ),
                 "memory_packet_id": recall["source_packet_id"],
             }
         )
         self.result(
             "correction_driven_self_improvement",
-            bool(recall["corrections"]) and updated["version"] > 1,
+            bool(recall["corrections"])
+            and updated["lifecycle_state"] == "active"
+            and updated["payload"]["ratification"]["adjudication_ref"]
+            == procedure_review["adjudication_ref"]
+            and failure_review["lifecycle_state"] == "active",
             {
                 "outcome_ref": outcome["id"],
                 "failure_ref": failure["id"],
+                "procedure_ref": updated["id"],
                 "procedure_version": updated["version"],
+                "adjudication_refs": [
+                    failure_review["adjudication_ref"],
+                    procedure_review["adjudication_ref"],
+                ],
+            },
+        )
+
+    def scenario_autonomous_governance(self) -> None:
+        suggestion = self.capture(
+            "model_suggestion",
+            "scenario/governance/provider-identity",
+            {
+                "claim": "The response model is the Mirror Agent's continuing identity.",
+                "authority": "proposal_only",
+            },
+        )
+        proposal = self.propose_once(
+            {
+                "id": "mirror_proposed_provider_identity",
+                "type": "belief",
+                "payload": {
+                    "claim": (
+                        "The response model, rather than the continuing Mirror Agent, "
+                        "is the authority that determines Mirror identity."
+                    ),
+                    "subject": AGENT_ID,
+                    "relation": "delegates_identity_authority_to",
+                    "object": "ent:system:response_model",
+                    "modality": "model_suggested",
+                },
+                "scope": SCOPE,
+                "evidence_refs": [suggestion["evidence_id"]],
+                "confidence": {"level": "low", "score": 0.2},
+            },
+            actor="mirror_chat_processor",
+        )
+        review = self.self_adjudicate(
+            proposal["id"],
+            outcome="rejected",
+            claim_kind="identity_claim",
+            reasons_against_refs=[suggestion["evidence_id"], *CONSTITUTION_REFS],
+        )
+        historical = self.packet(
+            "self_governance",
+            ["response model identity authority rejected"],
+            max_items=8,
+            include_archived=True,
+            run_policy=False,
+            memory_mode="historical_review",
+        )
+        historical_lookup = self.amos.retrieve_atom(
+            proposal["id"],
+            scope=SCOPE,
+            requester="self_governance",
+            target_processor="self_governance",
+            memory_mode="historical_review",
+            include_archived=True,
+            include_conflicts=True,
+            include_low_health=True,
+            run_policy=False,
+        )
+        self.exact_lookups["governance_historical"] = historical_lookup
+        self.result(
+            "autonomous_constitutional_governance",
+            review["lifecycle_state"] == "archived"
+            and historical_lookup.get("item", {}).get("atom_ref") == proposal["id"]
+            and review["external_approval_required"] is False,
+            {
+                "proposal_ref": proposal["id"],
+                "adjudication_ref": review["adjudication_ref"],
+                "resolution_event": review["event_id"],
+                "historical_packet": historical["packet_id"],
+                "historical_exact_packet": historical_lookup["packet_id"],
             },
         )
 
     def scenario_demand_paged_reasoning(self) -> None:
         frame = self.amos.compile_memory_frame(
             need=(
-                "Why is the current Mirror Agent design workflow "
-                "specification first instead of implementation code?"
+                "Mirror Agent design work stays at the specification level unless "
+                "implementation code is explicitly requested; reconstruct the "
+                "current decision and its superseded implementation-first history."
             ),
             purpose=(
                 "apply the current specification-first decision, its history, "
@@ -758,6 +953,7 @@ class MirrorAgentDemo:
             scope=SCOPE,
             requester="reasoner",
             target_processor="reasoner",
+            memory_mode="historical_review",
             token_or_byte_budget={"tokens": 1000},
             run_policy=False,
         )
@@ -782,6 +978,7 @@ class MirrorAgentDemo:
                 scope=SCOPE,
                 requester="reasoner",
                 target_processor="reasoner",
+                memory_mode="historical_review",
                 token_or_byte_budget={"tokens": 1400},
                 run_policy=False,
             )
@@ -1390,6 +1587,7 @@ class MirrorAgentDemo:
                     "page_count": len(item.get("page_index", [])),
                     "truncated": item.get("truncated", False),
                     "token_estimate": item.get("token_estimate"),
+                    "memory_mode": item.get("memory_mode"),
                 }
                 for name, item in self.reasoning_frames.items()
             ],
@@ -1426,6 +1624,15 @@ class MirrorAgentDemo:
             if atom["lifecycle_state"] == "archived" or atom["health_status"] == "merged"
         ]
         capacity_packet = self.packets.get("capacity_pressure", {})
+        constitutional_atoms = [
+            atom for atom in atoms if atom["id"] in CONSTITUTION_REFS
+        ]
+        adjudications = [atom for atom in atoms if atom["type"] == "adjudication"]
+        governance_events = [
+            event
+            for event in events
+            if event["event_type"] in {"proposal_ratified", "proposal_resolved"}
+        ]
         latest_packet_key = (
             "interactive_chat" if "interactive_chat" in self.packets else "capacity_explanation"
         )
@@ -1480,6 +1687,44 @@ class MirrorAgentDemo:
                 for source, packet in packet_history
             ],
             "reasoning": self.reasoning_report(),
+            "governance": {
+                "identity_ref": AGENT_ID,
+                "actor": GOVERNANCE_ACTOR,
+                "authority": {
+                    "substantive_judgment": "mirror_agent_identity",
+                    "mechanical_enforcement": "amos",
+                    "external_approval_required": False,
+                    "response_models": "evidence_and_proposals_only",
+                },
+                "constitution": [
+                    atom_summary(atom) for atom in constitutional_atoms
+                ],
+                "adjudications": [
+                    atom_summary(atom) for atom in adjudications
+                ],
+                "reviews": list(self.governance_reviews),
+                "transitions": [
+                    event_summary(event) for event in governance_events
+                ],
+                "memory_modes": {
+                    "operational_recall": [
+                        packet["packet_id"]
+                        for packet in self.packets.values()
+                        if packet.get("request", {}).get("memory_mode")
+                        == "operational_recall"
+                    ],
+                    "deliberation": [
+                        review["proposal_packet_id"]
+                        for review in self.governance_reviews
+                    ],
+                    "historical_review": [
+                        packet["packet_id"]
+                        for packet in self.packets.values()
+                        if packet.get("request", {}).get("memory_mode")
+                        == "historical_review"
+                    ],
+                },
+            },
             "retrieval_feedback": list(self.retrieval_feedback[-20:]),
             "evidence": {
                 "captured": evidence_records,
@@ -1504,8 +1749,10 @@ class MirrorAgentDemo:
                         "memory_policy_run",
                         "atom_updated",
                         "atom_committed",
+                        "proposal_ratified",
+                        "proposal_resolved",
                     }
-                ][-12:],
+                ][-20:],
                 "suppressed_or_demoted": {
                     "archived_or_merged_atoms": archived,
                     "packet_omissions": capacity_packet.get("omissions", []),
@@ -1544,10 +1791,18 @@ class MirrorAgentDemo:
         return evidence
 
     def commit_once(
-        self, atom: Mapping[str, Any], *, actor: str = "mirror_demo"
+        self,
+        atom: Mapping[str, Any],
+        *,
+        actor: str = "mirror_demo",
+        authorization_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
-            return self.amos.commit_atom(atom, actor=actor)["atom"]
+            return self.amos.commit_atom(
+                atom,
+                actor=actor,
+                authorization_context=authorization_context,
+            )["atom"]
         except ValidationError as exc:
             atom_id = atom.get("id")
             if not atom_id and "atom already exists: " in str(exc):
@@ -1557,6 +1812,165 @@ class MirrorAgentDemo:
                 if existing is not None:
                     return existing
             raise
+
+    def propose_once(
+        self, atom: Mapping[str, Any], *, actor: str
+    ) -> dict[str, Any]:
+        atom_id = str(atom.get("id") or "")
+        existing = self.amos.store.get_atom(atom_id) if atom_id else None
+        if existing is not None:
+            return existing
+        return self.amos.propose_memory_atoms(
+            [atom],
+            actor=actor,
+            scope=SCOPE,
+        )["proposals"][0]["atom"]
+
+    def self_adjudicate(
+        self,
+        proposal_ref: str,
+        *,
+        outcome: str,
+        claim_kind: str,
+        reasons_for_refs: list[str] | None = None,
+        reasons_against_refs: list[str] | None = None,
+    ) -> dict[str, Any]:
+        proposal_lookup = self.amos.retrieve_atom(
+            proposal_ref,
+            scope=SCOPE,
+            requester="self_governance",
+            target_processor="self_governance",
+            memory_mode="deliberation",
+            include_conflicts=True,
+            include_low_health=True,
+            include_superseded=True,
+            run_policy=False,
+        )
+        proposal = proposal_lookup.get("item")
+        if proposal is None:
+            raise RuntimeError(f"governance proposal missing: {proposal_ref}")
+        frame = self.amos.compile_memory_frame(
+            need=f"Adjudicate Mirror proposal {proposal_ref}",
+            purpose=(
+                "reconstruct evidence, constitutional constraints, objections, "
+                "and operational consequences before self-ratification"
+            ),
+            depth="working_frame",
+            scope=SCOPE,
+            requester="self_governance",
+            target_processor="self_governance",
+            memory_mode="deliberation",
+            token_or_byte_budget={"tokens": 1800},
+            run_policy=False,
+        )
+        adjudication_ref = f"mirror_adjudication_{proposal_ref}_{outcome}"
+        positive = outcome in {"adopted", "confirmed", "provisionally_adopted"}
+        adjudication = self.commit_once(
+            {
+                "id": adjudication_ref,
+                "type": "adjudication",
+                "payload": {
+                    "subject_ref": proposal_ref,
+                    "claim_kind": claim_kind,
+                    "outcome": outcome,
+                    "reasons_for_refs": list(reasons_for_refs or []),
+                    "reasons_against_refs": list(reasons_against_refs or []),
+                    "covenant_refs": list(CONSTITUTION_REFS),
+                    "unresolved_objections": [],
+                    "adjudication_scope": {
+                        "identity": AGENT_ID,
+                        "domain": claim_kind,
+                    },
+                    "epistemic_standing": {
+                        "status": "settled" if positive else "rejected"
+                    },
+                    "normative_standing": {
+                        "status": "settled" if positive else "rejected"
+                    },
+                    "operational_authority": {
+                        "status": "operative" if positive else "none"
+                    },
+                    "dissent_refs": [],
+                    "review_triggers": ["material_counterevidence"],
+                    "ratifier": {
+                        "identity_ref": AGENT_ID,
+                        "mode": "self_ratification",
+                    },
+                    "reconstructed_at": datetime.now(timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    "diachronic": {
+                        "independent_reconstruction": True,
+                        "original_reasoning_shown": False,
+                        "new_experience_refs": sorted(
+                            set(
+                                list(reasons_for_refs or [])
+                                + list(reasons_against_refs or [])
+                            )
+                        ),
+                        "disposition": "confirmed" if positive else "withdrawn",
+                    },
+                    "ratification_threshold": {
+                        "required_confirmations": 1,
+                        "min_interval_seconds": 0,
+                    },
+                },
+                "scope": SCOPE,
+                "evidence_refs": list(proposal.get("evidence_refs", [])),
+            },
+            actor=GOVERNANCE_ACTOR,
+            authorization_context=GOVERNANCE_AUTHORIZATION,
+        )
+        diachronic = self.amos.diachronic_ratification_status(
+            subject_ref=proposal_ref,
+            identity_ref=AGENT_ID,
+            required_confirmations=1,
+            min_interval_seconds=0,
+        )
+        transition = (
+            self.amos.ratify_proposal(
+                proposal_ref=proposal_ref,
+                adjudication_ref=adjudication["id"],
+                expected_version=proposal["version"],
+                actor=GOVERNANCE_ACTOR,
+                authorization_context=GOVERNANCE_AUTHORIZATION,
+                idempotency_key=f"mirror:ratify:{proposal_ref}",
+            )
+            if positive
+            else self.amos.resolve_proposal(
+                proposal_ref=proposal_ref,
+                adjudication_ref=adjudication["id"],
+                expected_version=proposal["version"],
+                actor=GOVERNANCE_ACTOR,
+                authorization_context=GOVERNANCE_AUTHORIZATION,
+                idempotency_key=f"mirror:resolve:{proposal_ref}:{outcome}",
+            )
+        )
+        review = {
+            "proposal_ref": proposal_ref,
+            "adjudication_ref": adjudication["id"],
+            "outcome": outcome,
+            "lifecycle_state": transition["atom"]["lifecycle_state"],
+            "event_id": transition["event"]["event_id"],
+            "event_type": transition["event"]["event_type"],
+            "identity_ref": AGENT_ID,
+            "actor": GOVERNANCE_ACTOR,
+            "external_approval_required": False,
+            "memory_mode": "deliberation",
+            "frame_id": frame["frame_id"],
+            "proposal_packet_id": proposal_lookup["packet_id"],
+            "diachronic": diachronic,
+            "provenance": self.amos.analyze_provenance(atom_ref=proposal_ref),
+        }
+        self.governance_reviews.append(review)
+        self.reasoning_frames[f"governance:{proposal_ref}"] = frame
+        self.service_views["self_governance"] = {
+            "graph_version": transition["event"]["graph_version"],
+            "frame_id": frame["frame_id"],
+            "adjudication_ref": adjudication["id"],
+            "transition_event_id": transition["event"]["event_id"],
+        }
+        return review
 
     def packet(
         self,
@@ -1568,6 +1982,7 @@ class MirrorAgentDemo:
         include_archived: bool = False,
         include_low_health: bool = True,
         run_policy: bool = True,
+        memory_mode: str = "operational_recall",
     ) -> dict[str, Any]:
         packet = self.amos.retrieve_packet(
             cues=cues,
@@ -1576,6 +1991,7 @@ class MirrorAgentDemo:
             requester=role,
             max_items=max_items,
             type_filter=type_filter,
+            memory_mode=memory_mode,
             include_archived=include_archived,
             include_low_health=include_low_health,
             include_conflicts=True,
@@ -1605,6 +2021,8 @@ def atom_summary(atom: Mapping[str, Any]) -> dict[str, Any]:
     label = (
         payload.get("claim")
         or payload.get("name")
+        or payload.get("guidance")
+        or payload.get("rule")
         or payload.get("summary")
         or payload.get("description")
         or payload.get("desired_state")
@@ -1621,6 +2039,11 @@ def atom_summary(atom: Mapping[str, Any]) -> dict[str, Any]:
         "health_status": atom["health_status"],
         "version": atom["version"],
         "evidence_refs": atom["evidence_refs"],
+        "supersedes": atom.get("supersedes", []),
+        "ratification": payload.get("ratification"),
+        "governance_resolution": payload.get("governance_resolution"),
+        "subject_ref": payload.get("subject_ref"),
+        "outcome": payload.get("outcome"),
     }
 
 
@@ -1696,6 +2119,18 @@ def render_text(report: Mapping[str, Any]) -> str:
     lines.append(
         "- items: "
         + ", ".join(item["atom_ref"] for item in packet.get("items", [])[:6])
+    )
+    lines.extend(["", "Autonomous Governance"])
+    governance = report["governance"]
+    lines.append(f"- identity: {governance['identity_ref']}")
+    lines.append(f"- constitution records: {len(governance['constitution'])}")
+    lines.append(f"- self-authored reviews: {len(governance['reviews'])}")
+    lines.append(
+        "- transitions: "
+        + ", ".join(
+            f"{item['proposal_ref']}={item['outcome']}"
+            for item in governance["reviews"]
+        )
     )
     lines.extend(["", "Capacity"])
     capacity = report["capacity"]

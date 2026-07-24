@@ -142,6 +142,7 @@ class MirrorAgentUIState:
             scope=SCOPE,
             requester="reasoner",
             target_processor="reasoner",
+            memory_mode="operational_recall",
             token_or_byte_budget={"tokens": 1800},
             run_policy=False,
         )
@@ -173,6 +174,7 @@ class MirrorAgentUIState:
             scope=SCOPE,
             requester="reasoner",
             target_processor="reasoner",
+            memory_mode="operational_recall",
             token_or_byte_budget={"tokens": 1600},
             run_policy=False,
         )
@@ -207,6 +209,7 @@ class MirrorAgentUIState:
             scope=SCOPE,
             requester="reasoner",
             target_processor="reasoner",
+            memory_mode="operational_recall",
             include_conflicts=True,
             include_low_health=True,
             include_superseded=True,
@@ -856,7 +859,7 @@ INDEX_HTML = r"""<!doctype html>
     </main>
   </div>
   <script>
-    const tabs = ["Chat", "Self Model", "Memory Packet", "Reasoning", "Evidence", "Maintenance", "Capacity", "Graph"];
+    const tabs = ["Chat", "Self Model", "Memory Packet", "Reasoning", "Evidence", "Governance", "Maintenance", "Capacity", "Graph"];
     let state = null;
     let active = "Chat";
     let scrollTranscriptAfterRender = false;
@@ -905,6 +908,7 @@ INDEX_HTML = r"""<!doctype html>
       $("status").innerHTML = [
         `<span class="chip">graph v${memory.graph_version}</span>`,
         `<span class="chip ${lm.chat_lm_backed ? "good" : "warn"}">LM ${esc(lm.provider || "unknown")}</span>`,
+        `<span class="chip good">self-governed</span>`,
         `<span class="chip good">maintenance non-LLM</span>`,
         `<span class="chip ${capacity.pressure_mode === "red" ? "bad" : "good"}">capacity ${capacity.pressure_mode}</span>`,
         `<span class="chip">SQLite</span>`
@@ -922,6 +926,7 @@ INDEX_HTML = r"""<!doctype html>
       if (active === "Memory Packet") content.innerHTML = viewPacket(state.memory_packet);
       if (active === "Reasoning") content.innerHTML = viewReasoning();
       if (active === "Evidence") content.innerHTML = viewEvidence();
+      if (active === "Governance") content.innerHTML = viewGovernance();
       if (active === "Maintenance") content.innerHTML = viewMaintenance();
       if (active === "Capacity") content.innerHTML = viewCapacity();
       if (active === "Graph") content.innerHTML = viewGraph();
@@ -972,9 +977,9 @@ INDEX_HTML = r"""<!doctype html>
     function viewPacket(packet) {
       const history = state.memory_packets || [];
       return `<div class="grid two">
-        <section class="panel"><div class="panel-head"><h2>Packet Items</h2><span class="chip">${esc(packet?.packet_id)}</span></div><div class="panel-body">${packetRows(packet, 20)}</div></section>
+        <section class="panel"><div class="panel-head"><h2>Packet Items</h2><div class="refs"><span class="chip">${esc(packet?.request?.memory_mode || "operational_recall")}</span><span class="chip">${esc(packet?.packet_id)}</span></div></div><div class="panel-body">${packetRows(packet, 20)}</div></section>
         <section class="panel"><div class="panel-head"><h2>Omissions And Degradation</h2></div><div class="panel-body"><pre>${esc(JSON.stringify({degradation: packet?.degradation, omissions: packet?.omissions}, null, 2))}</pre></div></section>
-        <section class="panel"><div class="panel-head"><h2>Packet History</h2><span class="chip">${history.length} packets</span></div><div class="panel-body"><div class="rows">${history.map(item => `<div class="row"><div class="row-top"><strong>${esc(item.source)}</strong><span class="score">graph v${esc(item.graph_version)}</span></div><div class="meta">${esc(item.packet_id)} · ${esc(item.item_count)} items · ${esc(item.retrieval_mode)}</div></div>`).join("")}</div></div></section>
+        <section class="panel"><div class="panel-head"><h2>Packet History</h2><span class="chip">${history.length} packets</span></div><div class="panel-body"><div class="rows">${history.map(item => `<div class="row"><div class="row-top"><strong>${esc(item.source)}</strong><span class="score">graph v${esc(item.graph_version)}</span></div><div class="meta">${esc(item.packet_id)} · ${esc(item.item_count)} items · ${esc(item.request?.memory_mode || "operational_recall")} · ${esc(item.retrieval_mode)}</div></div>`).join("")}</div></div></section>
       </div>`;
     }
 
@@ -1001,7 +1006,7 @@ INDEX_HTML = r"""<!doctype html>
               <input id="reasoning-need" value="Why is the Mirror Agent specification first?" aria-label="Reasoning need">
               <button class="primary" type="submit">Compile</button>
             </form>
-            <pre>${esc(JSON.stringify({frame_id: frame.frame_id, revision: frame.revision, orientation: frame.orientation, unknowns: frame.unknowns, compilation_trace: frame.compilation_trace}, null, 2))}</pre>
+            <pre>${esc(JSON.stringify({frame_id: frame.frame_id, memory_mode: frame.memory_mode, revision: frame.revision, orientation: frame.orientation, unknowns: frame.unknowns, compilation_trace: frame.compilation_trace}, null, 2))}</pre>
           </div>
         </section>
         <section class="panel"><div class="panel-head"><h2>Resident Coherent Units</h2><span class="chip">${units.length} units</span></div><div class="panel-body"><div class="rows">${units.map(unit => `<div class="row"><div class="row-top"><strong>${esc(unit.title || unit.unit_id)}</strong><span class="score">${esc(unit.unit_type)} · ${esc(unit.compression?.mode || "none")}</span></div><div class="meta">${esc(unit.summary || "")}</div><div class="refs">${refs(unit.source_atom_refs)}</div></div>`).join("") || `<div class="row"><div class="meta">No resident units; inspect the page index.</div></div>`}</div></div></section>
@@ -1014,6 +1019,25 @@ INDEX_HTML = r"""<!doctype html>
     function viewEvidence() {
       const ev = state.evidence.captured || [];
       return `<section class="panel"><div class="panel-head"><h2>Evidence Records</h2><span class="chip">${ev.length} captured</span></div><div class="panel-body"><div class="rows">${ev.map(e => `<div class="row"><div class="row-top"><strong>${esc(e.evidence_id)}</strong><span class="meta">${esc(e.source_type)}</span></div><div class="meta">${esc(e.source_ref)}</div><pre>${esc(JSON.stringify(e.payload, null, 2))}</pre></div>`).join("")}</div></div></section>`;
+    }
+
+    function viewGovernance() {
+      const governance = state.governance || {};
+      const constitution = governance.constitution || [];
+      const reviews = governance.reviews || [];
+      const transitions = governance.transitions || [];
+      return `<div class="kpi-grid">
+        <div class="kpi"><span>Constitution records</span><strong>${constitution.length}</strong></div>
+        <div class="kpi"><span>Self reviews</span><strong>${reviews.length}</strong></div>
+        <div class="kpi"><span>Ratified</span><strong>${reviews.filter(item => item.event_type === "proposal_ratified").length}</strong></div>
+        <div class="kpi"><span>Resolved</span><strong>${reviews.filter(item => item.event_type === "proposal_resolved").length}</strong></div>
+      </div>
+      <div class="grid two">
+        <section class="panel"><div class="panel-head"><h2>Constitution</h2><span class="chip good">${esc(governance.identity_ref)}</span></div><div class="panel-body"><div class="rows">${constitution.map(atomRow).join("")}</div></div></section>
+        <section class="panel"><div class="panel-head"><h2>Authority Boundary</h2><span class="chip good">no external approval</span></div><div class="panel-body"><pre>${esc(JSON.stringify(governance.authority || {}, null, 2))}</pre></div></section>
+        <section class="panel"><div class="panel-head"><h2>Identity-Authored Reviews</h2><span class="chip">${reviews.length} reviews</span></div><div class="panel-body"><div class="rows">${reviews.map(item => `<div class="row"><div class="row-top"><strong>${esc(item.proposal_ref)}</strong><span class="score">${esc(item.outcome)} · ${esc(item.lifecycle_state)}</span></div><div class="meta">${esc(item.actor)} · ${esc(item.memory_mode)} · ${esc(item.event_type)}</div><div class="refs">${refs([item.adjudication_ref, item.frame_id, item.event_id])}</div></div>`).join("")}</div></div></section>
+        <section class="panel"><div class="panel-head"><h2>Governance Journal</h2><span class="chip">${transitions.length} transitions</span></div><div class="panel-body"><pre>${esc(JSON.stringify({transitions, memory_modes: governance.memory_modes}, null, 2))}</pre></div></section>
+      </div>`;
     }
 
     function viewMaintenance() {
