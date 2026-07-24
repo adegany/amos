@@ -1,166 +1,71 @@
 # AMOS Roadmap
 
-This document tracks planned work beyond the verified v1-local contract. It is
-not a statement of current implementation status. See
-[`v1-local-contract.md`](v1-local-contract.md) for checked-in behavior.
+This document tracks work beyond the verified v1-local profile. Checked-in
+behavior and partial gates are defined by the
+[`v1-local contract`](v1-local-contract.md) and mapped to evidence in the
+[`verification matrix`](v1-verification.md). The
+[`design spec`](design-spec.md) remains the long-term architecture.
 
-## Iteration 1: Design foundation
+## Shipped in v1-local
 
-- Define the Amos concept and its memory-kernel responsibilities.
-- Separate evidence, canonical memory, indexes, and rendered views.
-- Identify memory types, timescales, and maintenance needs.
+The original design and implementation iterations are now represented in the
+checked-in service:
 
-## Iteration 2: Canonical schema and atom storage format
+- Canonical typed atoms, evidence, associative edges, schemas, lifecycle
+  operations, access policy, and an append-only checksum journal.
+- A thin public facade over explicit mutation, retrieval, reasoning, view,
+  graph, indexing, stewardship, policy, capacity, and diagnostic services.
+- Exact atom lookup, associative packets, attention traces, retrieval feedback,
+  self-awareness, agentic recall, and shared views.
+- Revision-bound coherent reasoning frames and trusted demand-loaded pages.
+- Deterministic distillation, SMP analysis, canonical `semantic_facets` and
+  `graph_relations`, processor packs, governed proposals, and review gates.
+- Background policy scheduling, capacity pressure, retention, storage cleanup,
+  SQLite compaction, index refresh, and cache invalidation.
+- A dependency-free HTTP adapter, CLI, Mirror Agent reference integration,
+  schemas, migrations, tests, and a reproducible local benchmark.
 
-Design the minimal logical schema, canonical interchange encoding, and first physical storage mapping for:
+## Current hardening
 
-```text
-MemoryAtom envelope
-typed atom payloads
-Entity
-SourceEvent
-BeliefAtom
-PreferenceAtom
-Goal
-Commitment
-ProcedureAtom
-Episode
-EvidenceRecord
-AssociationEdge
-EventJournalEntry
-```
+- Extend scenario and scale pressure tests beyond the current local benchmark.
+- Establish CI-enforced latency, throughput, storage, and reasoning-budget
+  acceptance thresholds.
+- Continue retrieval, ranking, coherent-unit, and maintenance-policy evaluation
+  against larger and more varied agent histories.
+- Strengthen operational documentation for backup, restore, observability, and
+  production deployment.
 
-Deliverables:
+## Beyond v1-local
 
-```text
-strict JSON-compatible schemas for each atom type
-identifier conventions for entities, relations, concepts, and enums
-common envelope versus payload field boundaries
-example canonical records
-MVP table or document mapping
-serialization and versioning rules
-```
+### Production storage and concurrency
 
-## Iteration 3: Lifecycle and maintenance model
+- Implement and verify the Postgres runtime adapter described by the migration
+  contract.
+- Add a multi-process concurrency and consistency model, service-level cache
+  invalidation, and production connection management.
+- Define supported backup, restore, encryption-key, and external evidence-object
+  ownership contracts.
 
-Specify:
+### Journal recovery and retention
 
-```text
-capture
-atomize
-normalize
-reconcile
-link
-promote
-demote
-archive
-forget
-repair
-```
+- Add canonical graph snapshots and snapshot-plus-tail recovery.
+- Add journal segment compaction, checkpoint verification, and provenance
+  rollups without weakening replay auditability.
+- Define enforcement boundaries for external archives, backups, and
+  crypto-shredding.
 
-## Iteration 4: Retrieval and rendering contracts
+### Capacity and scale
 
-Define the MemoryPacket interface for:
+- Replace the single SQLite-file budget with per-tier and external-store
+  capacity accounting.
+- Add scoped budgets, production watermarks, expansion requests, and
+  multi-tenant shielding.
+- Establish production-scale latency and storage acceptance gates.
 
-```text
-reasoner
-planner
-executor
-critic
-steward
-```
+### Distributed service model
 
-## Iteration 5: Quality and health metrics
-
-Define metrics, maintenance thresholds, and audit requirements.
-
-## Iteration 6: Scenario pressure tests
-
-Pressure-test against:
-
-```text
-personal assistant over five years
-enterprise agent over millions of tasks
-coding agent learning repository conventions
-research agent maintaining hypotheses
-multi-agent operations team
-```
-
-## Iteration 7: Distributed service model
-
-Specify:
-
-```text
-shared Amos instance contract
-client identities and capabilities
-EventJournalEntry write path
-concurrency and consistency model
-pub/sub and cache invalidation
-scope isolation
-conflict resolution
-```
-
-## Iteration 8: Journal, compaction, and retention model
-
-Specify:
-
-```text
-Event Journal format
-snapshot/checkpoint strategy
-segment compaction
-provenance rollups
-telemetry aggregation
-edge pruning
-forgetting, deletion, tombstones, crypto-shredding
-```
-
-## Iteration 9: Capacity governance
-
-Specify:
-
-```text
-capacity contract
-capacity governor
-watermarks and pressure modes
-admin capacity extension requests
-survival policy under delayed/denied expansion
-retention classes
-scoped budgets
-agent shielding
-```
-
-## Iteration 10: Non-LLM semantic maintenance
-
-Specify:
-
-```text
-Semantic Maintenance Processor interface
-shape validation
-embedding/classifier/graph processor roles
-reason codes
-maintenance decision ladder
-optional LLM escalation policy
-```
-
-## Iteration 11: Implementation planning
-
-The v1-local repository now includes the first implementation slice. Remaining
-planning should track gaps between the verified SQLite service profile and later
-production deployment targets:
-
-```text
-SQLite service migration sequence
-future Postgres migration sequence
-JSON Schema artifact layout
-generated validator/client layout
-indexing strategy
-service API surface
-maintenance scheduler
-capacity governor
-semantic maintenance processor
-retrieval/ranking experiments
-external processor-pack packaging
-multi-instance/Postgres operational plan
-```
-
----
+- Specify multi-instance coordination, client capabilities, pub/sub, and
+  consistency guarantees.
+- Preserve scope isolation and deterministic conflict handling across replicas.
+- Keep authoritative application control outside AMOS while exposing auditable
+  memory and proposal contracts to integrations.

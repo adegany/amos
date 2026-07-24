@@ -21,35 +21,34 @@ The core thesis is that long-term agent memory should not be stored primarily as
 ## Architecture
 
 ```mermaid
-flowchart LR
+flowchart TB
     A[Agents and tools] -->|capture events, evidence, atoms| H[AMOS HTTP API]
-    H --> F[Thin Amos facade]
-    F --> MU[Mutation service]
-    F --> RE[Retrieval service]
-    F --> VW[Self-model and shared-view service]
-    F --> ST[Stewardship service]
-    F --> PO[Memory-policy service]
-    MU --> V[Schema validation and access policy]
-    V --> J[Append-only journal]
-    V --> M[Typed memory atoms]
-    V --> E[Evidence records]
-    V --> G[Associative graph edges]
-    J --> R[Replay and verification]
-    M --> P[Packet renderer]
-    E --> P
-    G --> P
-    PO --> W[Background memory policy worker]
-    W --> D[Deterministic distillation]
-    W --> SMP[Semantic Maintenance Processor]
-    W --> C[Capacity and cleanup]
-    D --> M
-    SMP --> G
-    C --> M
-    P --> AT[Attention policy and trace]
-    AT -->|bounded memory packets| A
-    MU --> DB[(SQLite v1-local\nPostgres planned)]
-    RE --> DB
-    ST --> DB
+    H --> F
+
+    subgraph AMOS[AMOS service]
+        direction TB
+        F[Thin compatibility facade]
+        W[Canonical write plane<br/>mutations · schema · access policy]
+        S[(Service-owned SQLite v1-local state<br/>canonical: atoms · evidence · edges · journal<br/>derived: token and latent indexes · packet cache)]
+        R[Read and reasoning plane<br/>exact lookup · associative packets · self and shared views<br/>revision-bound frames · demand-loaded pages]
+        O[Bounded packets, frames, pages,<br/>views, traces, and diagnostics]
+        M[Governed maintenance plane<br/>policy worker · stewardship · SMP · distillation<br/>semantic facets · graph relations · processor packs]
+        G{Proposal policy gate}
+        D[Deferred for review]
+        C[Capacity, cleanup,<br/>cache and index maintenance]
+
+        F --> W --> S
+        F --> R
+        S --> R --> O
+        F --> M
+        S --> M --> G
+        G -->|low risk| W
+        G -->|review required| D
+        M --> C --> S
+        S -->|health and replay| O
+    end
+
+    O -->|bounded responses| A
 ```
 
 AMOS exposes memory as a service boundary. Agents submit structured evidence
@@ -84,6 +83,10 @@ Use AMOS when you want:
 - A shared memory service for a coordinated group of agents.
 - Per-agent self-models, capabilities, limitations, commitments, and runtime-state overlays.
 - Retrieval packets that disclose provenance, omissions, conflicts, degradation, and scope filtering.
+- Revision-bound coherent reasoning frames with demand-loaded pages instead of
+  fixed independent memory slots.
+- Producer-supplied `semantic_facets` and `graph_relations` that become
+  provenance-bearing graph proposals under deterministic policy gates.
 - Deterministic cleanup and distillation paths that do not require an LLM.
 - Replayable state changes through an append-only event journal.
 
@@ -92,10 +95,11 @@ Use AMOS when you want:
 This repository now includes a dependency-free AMOS v1-local implementation
 alongside the design spec.
 
-The public `Amos` class is a compatibility facade over explicit mutation,
-retrieval, reasoning-frame, self-view, stewardship, policy, capacity, indexing,
-graph, and diagnostic components. Domain components depend on the store and named
-collaborators; they do not call back into the facade.
+The public `Amos` class is a compatibility facade over explicit access,
+mutation, indexing, graph, temporal, capacity, retrieval, reasoning-frame,
+self-view, stewardship, policy, and diagnostic components. Domain components
+depend on the store and named collaborators; they do not call back into the
+facade.
 
 The first usable deployment profile is an AMOS HTTP service that owns one
 in-process SQLite store and serializes access through the service boundary:
