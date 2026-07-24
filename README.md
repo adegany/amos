@@ -48,7 +48,6 @@ flowchart TB
         S -->|health and replay| O
     end
 
-    O -->|bounded responses| A
 ```
 
 AMOS exposes memory as a service boundary. Agents submit structured evidence
