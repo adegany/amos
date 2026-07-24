@@ -27,7 +27,7 @@ flowchart TB
 
     subgraph AMOS[AMOS service]
         direction TB
-        F[Thin compatibility facade]
+        F[Public service API<br/>and subsystem coordinator]
         W[Canonical write plane<br/>mutations · schema · access policy]
         S[(Service-owned SQLite v1-local state<br/>canonical: atoms · evidence · edges · journal<br/>derived: token and latent indexes · packet cache)]
         R[Read and reasoning plane<br/>exact lookup · associative packets · self and shared views<br/>revision-bound frames · demand-loaded pages]
@@ -95,11 +95,11 @@ Use AMOS when you want:
 This repository now includes a dependency-free AMOS v1-local implementation
 alongside the design spec.
 
-The public `Amos` class is a compatibility facade over explicit access,
-mutation, indexing, graph, temporal, capacity, retrieval, reasoning-frame,
-self-view, stewardship, policy, and diagnostic components. Domain components
-depend on the store and named collaborators; they do not call back into the
-facade.
+The public `Amos` class is the in-process service API and subsystem coordinator
+for explicit access, mutation, indexing, graph, temporal, capacity, retrieval,
+reasoning-frame, self-view, stewardship, policy, and diagnostic components.
+Domain components depend on the store and named collaborators; they do not call
+back into the public service object.
 
 The first usable deployment profile is an AMOS HTTP service that owns one
 in-process SQLite store and serializes access through the service boundary:
