@@ -367,27 +367,42 @@ AMOS includes a dependency-free local benchmark for the v1 SQLite service path:
 python benchmarks/benchmark_amos.py --markdown --run-policy
 ```
 
-The benchmark commits typed atoms through the in-process service API, retrieves
-planner packets, verifies replay, and optionally runs the automatic memory
-policy once. It measures the current v1-local SQLite baseline, not HTTP,
-network, or background-worker scheduling overhead.
+The benchmark commits typed atoms carrying canonical `semantic_facets` and
+`graph_relations`, measures exact lookup and paired cold/warm packet retrieval,
+compiles coherent reasoning frames, loads demand pages, optionally runs the
+automatic memory policy, and verifies the final replay state. Storage reports
+the complete SQLite DB, WAL, and SHM footprint. It measures the current
+in-process v1-local baseline, not HTTP, network, or background-worker scheduling
+overhead.
 
-Reference result from a local workstation run on 2026-07-14. These values are
-evidence for the 100-atom v1-local profile, not an enforced performance gate:
+Reference result from a local workstation run on 2026-07-23 with the forced
+memory policy enabled. These values are single-run evidence for the 100-atom
+v1-local profile, not an enforced performance gate:
 
 | Benchmark | Result |
 | --- | ---: |
 | Atoms committed | 100 |
-| Retrievals | 20 |
-| Commit throughput | 345.75 atoms/s |
-| Commit latency p50 / p95 | 2.778 ms / 3.977 ms |
-| Retrieval latency p50 / p95 | 0.344 ms / 22.078 ms |
-| Average packet items | 8.75 |
-| Replay verification | 29.108 ms (ok) |
-| Forced memory policy run | 21530.287 ms (completed) |
-| Final atoms / edges | 101 / 60 |
-| SQLite DB size | 1179648 bytes |
-| Environment | Python 3.12.2; 24 CPUs; Linux-6.17.0-35-generic-x86_64-with-glibc2.39 |
+| Atoms with semantic facets / graph relations | 100 / 25 |
+| Exact lookups | 20 (20 found) |
+| Exact lookup latency p50 / p95 | 0.526 ms / 0.655 ms |
+| Packet retrievals | 20 cold + 20 warm |
+| Commit throughput | 385.31 atoms/s |
+| Commit latency p50 / p95 | 2.467 ms / 3.254 ms |
+| Cold packet latency p50 / p95 | 29.56 ms / 31.999 ms |
+| Warm packet latency p50 / p95 | 0.362 ms / 0.422 ms |
+| Average packet items | 6.15 |
+| Reasoning frame compiles | 5 at 1600 tokens |
+| Reasoning frame latency p50 / p95 | 407.979 ms / 435.047 ms |
+| Average resident units / page descriptors | 0.8 / 1.4 |
+| Demand-page loads | 5 at 1800 tokens |
+| Demand-page latency p50 / p95 | 3.42 ms / 3.808 ms |
+| Forced memory policy run | 21102.086 ms (completed) |
+| Maintenance proposals / committed / deferred | 112 / 87 / 25 |
+| Replay verification after policy | 31.934 ms (ok) |
+| Edges before policy / final | 72 / 147 |
+| Final atoms / edges | 101 / 147 |
+| SQLite DB / WAL / SHM / total footprint | 1744896 / 399672 / 32768 / 2177336 bytes |
+| Environment | Python 3.12.2; 24 CPUs; Linux-7.0.0-28-generic-x86_64-with-glibc2.39 |
 
 ## Integration boundary
 

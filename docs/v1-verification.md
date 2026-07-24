@@ -50,7 +50,7 @@ Status terms:
 | Capacity | Partial | One SQLite-file byte budget produces one pressure mode and packet degradation. Per-tier and external-store budgets are planned. |
 | SMP and processor packs | Implemented | Deterministic proposal envelopes, review gates, low-risk auto-commit policy, and external processor loading are tested. |
 | Memory policy | Implemented | Background and forced deterministic maintenance, decay, cleanup, distillation, index refresh, cache invalidation, and journal summaries are tested. |
-| Performance | Evidence only | `benchmarks/benchmark_amos.py` is reproducible, but CI enforces no scale or latency threshold. |
+| Performance | Evidence only | `benchmarks/benchmark_amos.py` reproducibly measures canonical writes, exact lookup, cold/warm packet retrieval, coherent frames, demand-page loads, governed semantic/graph maintenance, final-state replay, and the complete SQLite DB/WAL/SHM footprint; CI enforces no scale or latency threshold. |
 | Observability | Implemented with declared constants | Health, capacity, index freshness, retrieval outcomes, and deletion residuals are reportable. Projection lag is fixed at zero for the transactional single-process profile. |
 | Procedure policy | Implemented | Procedures are advisory; autonomous execution is denied by default. |
 | LLM reviewer default | Implemented | Disabled and non-authoritative by default. |
