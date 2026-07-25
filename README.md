@@ -63,7 +63,7 @@ pressure reporting. Packet retrieval can include an attention context so AMOS
 can foreground task-relevant memory, inhibit distracting material, reserve space
 for counterevidence, and report the effective attention trace.
 
-## Why Amos?
+## Why AMOS?
 
 The agent-memory ecosystem is moving quickly. Projects such as
 [Mem0](https://arxiv.org/abs/2504.19413), [Zep/Graphiti](https://arxiv.org/abs/2501.13956),
@@ -82,7 +82,7 @@ agents.
 | Letta / MemGPT | Stateful agent runtime and virtual context management. | Memory substrate that can sit below multiple agents, including reasoners, planners, critics, and domain processors. |
 | MemOS | Research framing for memory as an operating-system resource across memory types. | A small Python implementation with concrete HTTP APIs, SQLite v1-local storage, schemas, tests, and maintenance workers. |
 
-Use AMOS when you want:
+### When to use AMOS
 
 - Canonical memory records instead of English-only summaries.
 - A shared memory service for a coordinated group of agents.
@@ -106,6 +106,8 @@ temporal, capacity, retrieval, reasoning-frame, self-view, stewardship, policy,
 and diagnostic components.
 Domain components depend on the store and named collaborators; they do not call
 back into the public service object.
+
+### Included capabilities
 
 The first usable deployment profile is an AMOS HTTP service that owns one
 in-process SQLite store and serializes access through the service boundary:
@@ -192,7 +194,7 @@ in-process SQLite store and serializes access through the service boundary:
   background worker instead of running maintenance inline.
 - CLI and tests.
 
-Start here:
+### Documentation
 
 - [Amos Design Spec](docs/design-spec.md)
 - [AMOS V1-Local Contract](docs/v1-local-contract.md)
@@ -203,19 +205,19 @@ Start here:
 
 ## Quick start
 
-Run the tests:
+### Run the test suite
 
 ```bash
 python -m pytest -q
 ```
 
-Initialize a local store:
+### Initialize a local store
 
 ```bash
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 init
 ```
 
-Commit and retrieve a memory atom:
+### Commit and retrieve a memory atom
 
 ```bash
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 commit-atom \
@@ -226,7 +228,7 @@ PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 retrieve \
   --cue "Codex outage fallback"
 ```
 
-Retrieve with an explicit attention context:
+### Retrieve with an attention context
 
 ```bash
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 retrieve \
@@ -290,13 +292,13 @@ confirmation are available through `provenance-analysis` and
 `diachronic-status` in the CLI, or `/v1/provenance:analyze` and
 `/v1/ratifications:diachronic-status` over HTTP.
 
-Run the Amos Mirror Agent integration demo:
+### Run the Mirror Agent integration demo
 
 ```bash
 PYTHONPATH=src python examples/mirror_agent_demo.py --format text
 ```
 
-Run the browser UI for conversational self-awareness and introspection:
+### Run the Mirror Agent browser UI
 
 ```bash
 PYTHONPATH=src python examples/mirror_agent_ui.py --host 127.0.0.1 --port 8787 --lm codex
@@ -327,7 +329,7 @@ explicit `graph_relations`, low-risk committed edges, review-gated relations,
 proposal retention/deduplication, edge provenance, and retrieval-feedback
 telemetry.
 
-Serve the V1 HTTP API:
+### Serve the V1 HTTP API
 
 ```bash
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 serve \
@@ -346,6 +348,8 @@ associative ranking and `POST /v1/packets:retrieve` performs associative recall.
 Both retrieval paths queue a policy tick and return immediately. Explicit
 `POST /v1/memory-policy:run` and the CLI
 `memory-policy --run` command remain synchronous operator paths.
+
+### Compile revision-bound reasoning frames
 
 Historical reasoning integrations can call `POST
 /v1/reasoning-frames:compile`, then load a descriptor returned in `page_index`
@@ -385,13 +389,13 @@ one SQLite store and serializes service calls for correctness. Reader/writer
 parallelism with SQLite WAL or a production database adapter is the scale path
 for heavier concurrent retrieval workloads.
 
-Verify journal replay:
+### Verify journal replay
 
 ```bash
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 verify
 ```
 
-Inspect or tune the automatic memory policy:
+### Configure the automatic memory policy
 
 ```bash
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy
@@ -403,7 +407,7 @@ PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 maintenance-processors
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 maintenance-distiller --domain generic --processor-id amos.maintenance.generic.v1
 ```
 
-Load an external maintenance processor pack from another package:
+### Load an external maintenance processor pack
 
 ```bash
 PYTHONPATH=src python -m amos.cli \
@@ -414,7 +418,7 @@ PYTHONPATH=src python -m amos.cli \
   --processor-id my.training.flight.v1
 ```
 
-Producers that already know their semantics can avoid a processor pack:
+### Supply producer-owned semantics
 
 ```json
 {
