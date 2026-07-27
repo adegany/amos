@@ -63,6 +63,24 @@ pressure reporting. Packet retrieval can include an attention context so AMOS
 can foreground task-relevant memory, inhibit distracting material, reserve space
 for counterevidence, and report the effective attention trace.
 
+### Typed client binding
+
+Applications can use AMOS over HTTP as their semantic-memory authority. AMOS
+returns revision-bound frames, pages, packets, atom references, provenance,
+conflicts, and omissions. A client runtime can then give model faculties
+bounded, request-local handles such as `memory:item:0`; it should not ask a
+model to copy AMOS atom IDs, frame IDs, revisions, scopes, actors, or
+authorization claims.
+
+A model-selected handle is advisory until the client runtime binds it back to
+the exact AMOS-owned reference and revision. Durable writes require a typed
+runtime operation, authenticated AMOS authority, provenance, and an actual AMOS
+acknowledgement. Generated prose, an auxiliary semantic-map candidate, or a
+model-authored identifier has no write authority. Operational scheduling,
+leases, model attempts, and artifact receipts belong in the client runtime's
+operational store and must not be committed to AMOS as though they were
+cognitive conclusions.
+
 ## Why AMOS?
 
 The agent-memory ecosystem is moving quickly. Projects such as
@@ -358,7 +376,7 @@ serialized `token_estimate`, preserve trusted scope and access filtering, and
 bind page descriptors to the exact `graph_version` and journal head. A changed
 revision returns HTTP 409 with `code: "stale_revision"`; the caller recompiles
 instead of combining memory states. Existing packet and exact-atom endpoints
-remain compatible. Application mode selection and rollback stay in the Cogito
+remain compatible. Application mode selection and rollback stay in the client
 runtime, not in AMOS.
 
 Reasoning-response budget fields use AMOS canonical JSON: compact separators,
