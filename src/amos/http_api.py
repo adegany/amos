@@ -215,6 +215,7 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                             atoms,
                             actor=actor,
                             authorization_context=context,
+                            idempotency_key=body.get("idempotency_key"),
                         )
                     )
                 return self._write_json(

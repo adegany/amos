@@ -369,19 +369,30 @@ def test_proposed_intrinsic_links_are_isolated_from_generic_promotion(amos):
 
 
 def test_batch_commit_uses_single_transaction_and_rejects_duplicate_batch(amos):
+    batch = [
+        {
+            "id": "batch_one",
+            "type": "belief",
+            "payload": {
+                "claim": "batch one",
+                "graph_relations": [
+                    {
+                        "source_ref": "$self",
+                        "target_ref": "batch_two",
+                        "relation": "rel:derived_from",
+                    }
+                ],
+            },
+        },
+        {
+            "id": "batch_two",
+            "type": "belief",
+            "payload": {"claim": "batch two"},
+        },
+    ]
     committed = amos.commit_memory_atoms(
-        [
-            {
-                "id": "batch_one",
-                "type": "belief",
-                "payload": {"claim": "batch one"},
-            },
-            {
-                "id": "batch_two",
-                "type": "belief",
-                "payload": {"claim": "batch two"},
-            },
-        ]
+        batch,
+        idempotency_key="batch-commit",
     )
 
     assert [item["atom"]["id"] for item in committed["committed"]] == [
@@ -389,6 +400,29 @@ def test_batch_commit_uses_single_transaction_and_rejects_duplicate_batch(amos):
         "batch_two",
     ]
     assert amos.store.graph_version() == 2
+    assert any(
+        edge["source_ref"] == "batch_one"
+        and edge["relation"] == "rel:derived_from"
+        and edge["target_ref"] == "batch_two"
+        for edge in amos.store.list_edges()
+    )
+    replayed = amos.commit_memory_atoms(
+        batch,
+        idempotency_key="batch-commit",
+    )
+    assert replayed == committed
+    assert amos.store.graph_version() == 2
+    with pytest.raises(IdempotencyConflict):
+        amos.commit_memory_atoms(
+            [
+                {
+                    **batch[0],
+                    "payload": {"claim": "changed batch one"},
+                },
+                batch[1],
+            ],
+            idempotency_key="batch-commit",
+        )
     with pytest.raises(ValidationError):
         amos.commit_memory_atoms(
             [
@@ -405,6 +439,112 @@ def test_batch_commit_uses_single_transaction_and_rejects_duplicate_batch(amos):
             ]
         )
     assert amos.store.get_atom("batch_duplicate") is None
+
+
+def test_batch_commit_rejects_empty_batch(amos):
+    with pytest.raises(ValidationError, match="must not be empty"):
+        amos.commit_memory_atoms([], idempotency_key="empty-batch")
+
+
+def test_batch_preflight_rejects_active_memory_derived_from_proposed_batch_atom(
+    amos,
+):
+    with pytest.raises(
+        ValidationError,
+        match="active derived memory cannot use proposed",
+    ):
+        amos.commit_memory_atoms(
+            [
+                {
+                    "id": "batch_active_derivative",
+                    "type": "semantic",
+                    "payload": {
+                        "summary": "Must not gain active standing.",
+                        "source_refs": ["batch_proposed_source"],
+                    },
+                },
+                {
+                    "id": "batch_proposed_source",
+                    "type": "belief",
+                    "payload": {"claim": "Still only a candidate."},
+                    "lifecycle_state": "proposed",
+                },
+            ],
+            idempotency_key="batch-proposed-source",
+        )
+
+    assert amos.store.get_atom("batch_active_derivative") is None
+    assert amos.store.get_atom("batch_proposed_source") is None
+    assert amos.store.graph_version() == 0
+
+
+def test_batch_replay_precedes_later_source_lifecycle_validation(amos):
+    source = amos.commit_atom(
+        {
+            "id": "batch_replay_source",
+            "type": "belief",
+            "payload": {"claim": "active during the original write"},
+        }
+    )["atom"]
+    batch = [
+        {
+            "id": "batch_replay_derived",
+            "type": "semantic",
+            "payload": {
+                "summary": "Derived while the source was active.",
+                "source_refs": [source["id"]],
+            },
+        }
+    ]
+    committed = amos.commit_memory_atoms(
+        batch,
+        idempotency_key="batch-replay-after-source-change",
+    )
+    amos.archive_atom(source["id"], reason="exercise stable operation replay")
+
+    replayed = amos.commit_memory_atoms(
+        batch,
+        idempotency_key="batch-replay-after-source-change",
+    )
+
+    assert replayed == committed
+    assert amos.store.get_atom("batch_replay_derived")["lifecycle_state"] == "active"
+
+
+def test_batch_commit_rolls_back_every_atom_after_mid_batch_storage_failure(
+    amos, monkeypatch
+):
+    insert_atom = amos.store.insert_atom
+    calls = 0
+
+    def fail_second_insert(conn, atom):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected batch storage failure")
+        return insert_atom(conn, atom)
+
+    monkeypatch.setattr(amos.store, "insert_atom", fail_second_insert)
+    with pytest.raises(RuntimeError, match="injected batch storage failure"):
+        amos.commit_memory_atoms(
+            [
+                {
+                    "id": "batch_rollback_one",
+                    "type": "belief",
+                    "payload": {"claim": "must roll back"},
+                },
+                {
+                    "id": "batch_rollback_two",
+                    "type": "belief",
+                    "payload": {"claim": "also must roll back"},
+                },
+            ],
+            idempotency_key="batch-rollback",
+        )
+
+    assert amos.store.get_atom("batch_rollback_one") is None
+    assert amos.store.get_atom("batch_rollback_two") is None
+    assert amos.store.graph_version() == 0
 
 
 def test_compare_and_swap_update_conflict(amos):

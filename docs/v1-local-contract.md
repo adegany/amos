@@ -90,6 +90,8 @@ connection profile:
 canonical write profile:
   strong mutations use explicit transactions
   batch atom commits preflight duplicate ids before writing
+  batch atom commits accept one operation-level idempotency key and replay the
+  original all-or-nothing response without duplicating atoms or journal events
   atom rows, edge rows, and journal entries commit atomically
   packet cache invalidation is performed once per successful mutation batch
 

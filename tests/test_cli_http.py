@@ -175,7 +175,29 @@ def test_http_v1_endpoints_smoke(tmp_path):
         )
         assert updated["status"] == "updated"
         assert updated["atom"]["payload"]["semantic_facets"][0]["subject"] == "http endpoint"
-        assert server.amos.health_memory()["atoms"] == 1
+        batch_body = {
+            "atoms": [
+                {
+                    "id": "http_batch_one",
+                    "type": "semantic",
+                    "payload": {"summary": "HTTP batch one"},
+                },
+                {
+                    "id": "http_batch_two",
+                    "type": "semantic",
+                    "payload": {"summary": "HTTP batch two"},
+                },
+            ],
+            "idempotency_key": "http-batch",
+        }
+        batch = http_json(f"{base}/v1/atoms:commit", batch_body)
+        replayed_batch = http_json(f"{base}/v1/atoms:commit", batch_body)
+        assert replayed_batch == batch
+        assert [item["atom"]["id"] for item in batch["committed"]] == [
+            "http_batch_one",
+            "http_batch_two",
+        ]
+        assert server.amos.health_memory()["atoms"] == 3
         exact = http_json(
             f"{base}/v1/atoms:get",
             {
@@ -194,7 +216,7 @@ def test_http_v1_endpoints_smoke(tmp_path):
         )
         assert "http_atom" in item_refs(packet)
         health = http_json(f"{base}/v1/health/memory")
-        assert health["atoms"] == 1
+        assert health["atoms"] == 3
         verify = http_json(f"{base}/v1/verify")
         assert verify["journal"]["status"] == "ok"
         assert verify["replay"]["status"] == "ok"

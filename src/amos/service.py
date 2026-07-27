@@ -311,11 +311,13 @@ class Amos:
         *,
         actor: str = "system",
         authorization_context: Mapping[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         return self.mutations.commit_memory_atoms(
             atoms,
             actor=actor,
             authorization_context=authorization_context,
+            idempotency_key=idempotency_key,
         )
 
     def update_atom(

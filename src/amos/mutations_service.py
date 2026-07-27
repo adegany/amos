@@ -32,7 +32,10 @@ class MutationService:
         self._edge = graph._edge
 
     def _assert_direct_commit_governance_safe(
-        self, atom: Mapping[str, Any]
+        self,
+        atom: Mapping[str, Any],
+        *,
+        candidate_atoms: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         payload = atom.get("payload") or {}
         if "ratification" in payload:
@@ -53,7 +56,9 @@ class MutationService:
             if str(ref)
         }
         for source_ref in source_refs:
-            source = self.store.get_atom(source_ref)
+            source = (candidate_atoms or {}).get(source_ref)
+            if source is None:
+                source = self.store.get_atom(source_ref)
             if source is None:
                 continue
             source_payload = source.get("payload") or {}
@@ -248,33 +253,46 @@ class MutationService:
         *,
         actor: str = "system",
         authorization_context: Mapping[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         self._mark_foreground_activity(actor)
-        prepared = [self._prepare_committed_atom(atom) for atom in atoms]
-        for atom in prepared:
-            self._assert_direct_commit_governance_safe(atom)
-            GovernanceService.assert_constitutional_capability(
-                str(atom["type"]), authorization_context, operation="create"
-            )
-            GovernanceService.assert_adjudication_capability(
-                atom,
-                authorization_context,
-                actor=actor,
-            )
-        seen_ids: set[str] = set()
-        for atom in prepared:
-            if atom["id"] in seen_ids:
-                raise ValidationError(f"duplicate atom in batch: {atom['id']}")
-            seen_ids.add(atom["id"])
-        committed = []
+        request_payload = {
+            "operation": "commit_memory_atoms",
+            "atoms": [dict(atom) for atom in atoms],
+        }
+        if not atoms:
+            raise ValidationError("atom batch must not be empty")
         with self.store.transaction() as conn:
+            prior = self._idempotency_hit(
+                conn,
+                actor,
+                idempotency_key,
+                request_payload,
+            )
+            if prior is not None:
+                return prior
+            prepared = [self._prepare_committed_atom(atom) for atom in atoms]
+            prepared_by_id: dict[str, dict[str, Any]] = {}
+            for atom in prepared:
+                if atom["id"] in prepared_by_id:
+                    raise ValidationError(f"duplicate atom in batch: {atom['id']}")
+                prepared_by_id[str(atom["id"])] = atom
+            for atom in prepared:
+                self._assert_direct_commit_governance_safe(
+                    atom,
+                    candidate_atoms=prepared_by_id,
+                )
+                GovernanceService.assert_constitutional_capability(
+                    str(atom["type"]), authorization_context, operation="create"
+                )
+                GovernanceService.assert_adjudication_capability(
+                    atom,
+                    authorization_context,
+                    actor=actor,
+                )
+            committed = []
+            last_event = None
             for normalized in prepared:
-                projected_edges = self._intrinsic_edges_for_atom(normalized)
-                op_payload = {
-                    "operation": "commit_atom",
-                    "atom": normalized,
-                    "projected_edges": projected_edges,
-                }
                 content_digest = self._memory_identity_digest(normalized)
                 tombstone = self.store.get_tombstone(
                     normalized["id"], content_digest=content_digest
@@ -285,6 +303,15 @@ class MutationService:
                     )
                 if self.store.get_atom(normalized["id"]) is not None:
                     raise ValidationError(f"atom already exists: {normalized['id']}")
+            for normalized in prepared:
+                self.store.insert_atom(conn, normalized)
+            for normalized in prepared:
+                projected_edges = self._intrinsic_edges_for_atom(normalized)
+                op_payload = {
+                    "operation": "commit_atom",
+                    "atom": normalized,
+                    "projected_edges": projected_edges,
+                }
                 event = self.store.append_event(
                     conn,
                     event_type="atom_committed",
@@ -292,11 +319,12 @@ class MutationService:
                     payload=op_payload,
                     target_refs=[normalized["id"]],
                     evidence_refs=normalized["evidence_refs"],
+                    idempotency_key=idempotency_key,
                     authorization_context=authorization_context,
                 )
-                self.store.insert_atom(conn, normalized)
                 for edge in projected_edges:
                     self.store.insert_edge(conn, edge)
+                last_event = event
                 committed.append(
                     {
                         "status": "committed",
@@ -307,11 +335,22 @@ class MutationService:
                 )
             if committed:
                 self.store.clear_packet_cache(conn)
-        return {
-            "status": "committed",
-            "committed": committed,
-            "graph_version": self.store.graph_version(),
-        }
+            if last_event is None:
+                raise RuntimeError("non-empty atom batch produced no journal event")
+            response = {
+                "status": "committed",
+                "committed": committed,
+                "graph_version": int(last_event["graph_version"]),
+            }
+            self._record_idempotency(
+                conn,
+                actor,
+                idempotency_key,
+                request_payload,
+                last_event,
+                response,
+            )
+            return response
 
 
     def update_atom(
