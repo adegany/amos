@@ -27,14 +27,21 @@ GENERIC_GRAPH_PROCESSOR_VERSION = "amos.graph.canonical.v1"
 
 LOW_RISK_EXPLICIT_RELATIONS = {
     "rel:attributed_to",
+    "rel:closes",
     "rel:constrained_by",
+    "rel:continues",
     "rel:corrected_by",
     "rel:derived_from",
+    "rel:follows",
     "rel:has_capability",
     "rel:has_limitation",
     "rel:made_commitment",
     "rel:part_of",
+    "rel:opens",
     "rel:produced_outcome",
+    "rel:reopens",
+    "rel:responds_to",
+    "rel:summarizes",
     "rel:supersedes",
     "rel:uses",
 }

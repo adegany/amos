@@ -30,8 +30,8 @@ flowchart TB
         F[Public service API<br/>and subsystem coordinator]
         W[Canonical write plane<br/>mutations · schema · access policy]
         S[(Service-owned SQLite v1-local state<br/>canonical: atoms · evidence · edges · journal<br/>derived: token and latent indexes · packet cache)]
-        R[Read and reasoning plane<br/>exact lookup · associative packets · self and shared views<br/>revision-bound frames · demand-loaded pages]
-        O[Bounded packets, frames, pages,<br/>views, traces, and diagnostics]
+        R[Read and reasoning plane<br/>exact lookup · associative packets · self and shared views<br/>cognitive workspaces · revision-bound frames and pages]
+        O[Bounded workspaces, packets, frames, pages,<br/>views, traces, and diagnostics]
         M[Governed maintenance plane<br/>policy worker · stewardship · SMP · distillation<br/>semantic facets · graph relations · processor packs]
         G{Proposal policy gate}
         K[Constitutional governance plane<br/>adjudications · covenants · primal guidance<br/>root provenance · diachronic status]
@@ -80,6 +80,41 @@ model-authored identifier has no write authority. Operational scheduling,
 leases, model attempts, and artifact receipts belong in the client runtime's
 operational store and must not be committed to AMOS as though they were
 cognitive conclusions.
+
+### Canonical interaction continuity
+
+Applications can keep short- and long-horizon conversational memory in the
+same canonical substrate. `interaction_event` atoms preserve exact immutable
+utterances; `discourse_thread` roots provide stable discussion identity; and
+append-only `discourse_state` revisions retain shared state, access-controlled
+private declarative state, unresolved items, attention, and lifecycle.
+
+`POST /v1/memory-transactions:commit` atomically appends evidence, atoms,
+relations, and compare-and-swap head advances under one idempotency key. The
+current-head table is a journal-derived index, not an independent memory
+authority, and can be rebuilt from the event journal.
+
+Every `interaction_event` transaction must advance exactly one
+`interaction_stream` head for that conversation. AMOS binds the event sequence
+to the next head version and its `in_reply_to` reference to the prior head.
+This produces one canonical total order without superseding immutable prior
+events. `discourse_thread` heads separately supersede interpreted state
+revisions.
+
+`POST /v1/cognitive-workspaces:compile` derives a bounded reasoner view anchored
+on one canonical interaction event. It protects the immediate reply chain and
+directly linked thread heads before adding associative long-term memory,
+visible canonical context, and revision-bound page descriptors. The caller
+chooses any semantic interpretation; AMOS enforces only schema, scope, access,
+head freshness, provenance, and resource bounds. Explicit canonical records
+retain cognitive payload and authority metadata while omitting rebuildable
+search vectors, indexes, decay bookkeeping, and revision-history internals from
+the model-facing projection.
+
+`POST /v1/memory-heads:get` returns an access-filtered head reference and
+version without exposing atom content. `POST
+/v1/interaction-projections:compile` returns an ordered, access-filtered event
+projection suitable for rebuilding a disposable transcript or delivery cache.
 
 ## Why AMOS?
 
@@ -154,6 +189,15 @@ in-process SQLite store and serializes access through the service boundary:
   common ancestors, ancestry depth, and circular support, plus diachronic
   reconstruction thresholds for repeated self-ratification.
 - Idempotent capture/commit operations and compare-and-swap update checks.
+- Atomic interaction-memory transactions with immutable events, discourse
+  roots, append-only state heads, explicit temporal/discourse relations, and a
+  journal-rebuildable current-head index. Interaction-stream CAS provides
+  canonical per-conversation sequence allocation while discourse-head CAS
+  versions interpreted state independently.
+- Bounded cognitive-workspace compilation with protected temporal/reply-chain
+  closure, multiple visible discourse heads, authorized private declarative
+  state, canonical context records, associative memory, omissions, and
+  revision-bound supporting pages.
 - Memory packets with scope isolation, access filtering, omissions, conflicts,
   provenance, and degradation metadata. `operational_recall` admits active
   memory only; `deliberation` also admits proposals and requires conflicts and

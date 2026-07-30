@@ -228,6 +228,20 @@ class SQLiteStore:
             CREATE INDEX IF NOT EXISTS idx_event_graph_version
                 ON amos_event_journal(graph_version);
 
+            CREATE TABLE IF NOT EXISTS amos_memory_heads (
+                scope_digest TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                series_kind TEXT NOT NULL,
+                series_id TEXT NOT NULL,
+                head_ref TEXT NOT NULL,
+                head_version INTEGER NOT NULL,
+                journal_event_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(scope_digest, series_kind, series_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_heads_ref
+                ON amos_memory_heads(head_ref);
+
             CREATE TABLE IF NOT EXISTS amos_idempotency (
                 actor TEXT NOT NULL,
                 idempotency_key TEXT NOT NULL,
@@ -282,6 +296,7 @@ class SQLiteStore:
                 self._set_meta(conn, "graph_version", "0")
             if self._get_meta(conn, "last_event_hash") is None:
                 self._set_meta(conn, "last_event_hash", "genesis")
+            self._restore_memory_heads_if_needed(conn)
             self._backfill_atom_text_index(conn)
 
     def _migrate_edge_derivation(self, conn: sqlite3.Connection) -> None:
@@ -343,6 +358,130 @@ class SQLiteStore:
             "graph_version": int(values.get("graph_version", "0") or 0),
             "journal_head": values.get("last_event_hash", "genesis") or "genesis",
         }
+
+    def _restore_memory_heads_if_needed(self, conn: sqlite3.Connection) -> None:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM amos_memory_heads"
+        ).fetchone()
+        if int(row["count"] or 0) > 0:
+            return
+        event = conn.execute(
+            """
+            SELECT 1
+            FROM amos_event_journal
+            WHERE event_type = 'memory_transaction_committed'
+            LIMIT 1
+            """
+        ).fetchone()
+        if event is not None:
+            self._rebuild_memory_heads(conn)
+
+    def get_memory_head(
+        self,
+        *,
+        scope: Mapping[str, Any],
+        series_kind: str,
+        series_id: str,
+        conn: sqlite3.Connection | None = None,
+    ) -> dict[str, Any] | None:
+        connection = conn or self.conn
+        row = connection.execute(
+            """
+            SELECT *
+            FROM amos_memory_heads
+            WHERE scope_digest = ? AND series_kind = ? AND series_id = ?
+            """,
+            (digest(dict(scope)), str(series_kind), str(series_id)),
+        ).fetchone()
+        return None if row is None else self._row_dict(row)
+
+    def list_memory_heads(
+        self,
+        *,
+        scope: Mapping[str, Any] | None = None,
+        series_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if scope is not None:
+            clauses.append("scope_digest = ?")
+            params.append(digest(dict(scope)))
+        if series_kind is not None:
+            clauses.append("series_kind = ?")
+            params.append(str(series_kind))
+        query = "SELECT * FROM amos_memory_heads"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY series_kind ASC, series_id ASC"
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [self._row_dict(row) for row in rows]
+
+    def put_memory_head(
+        self, conn: sqlite3.Connection, head: Mapping[str, Any]
+    ) -> None:
+        scope = dict(head.get("scope") or {})
+        conn.execute(
+            """
+            INSERT INTO amos_memory_heads(
+                scope_digest, scope, series_kind, series_id, head_ref,
+                head_version, journal_event_id, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scope_digest, series_kind, series_id) DO UPDATE SET
+                scope = excluded.scope,
+                head_ref = excluded.head_ref,
+                head_version = excluded.head_version,
+                journal_event_id = excluded.journal_event_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                digest(scope),
+                canonical_json(scope),
+                str(head["series_kind"]),
+                str(head["series_id"]),
+                str(head["head_ref"]),
+                int(head["head_version"]),
+                str(head["journal_event_id"]),
+                str(head["updated_at"]),
+            ),
+        )
+
+    def _rebuild_memory_heads(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        conn.execute("DELETE FROM amos_memory_heads")
+        rows = conn.execute(
+            """
+            SELECT event_id, accepted_at, payload
+            FROM amos_event_journal
+            WHERE event_type = 'memory_transaction_committed'
+            ORDER BY graph_version ASC
+            """
+        ).fetchall()
+        for row in rows:
+            payload = self._json(str(row["payload"]))
+            for raw in payload.get("projected_heads", []):
+                head = dict(raw)
+                head["journal_event_id"] = str(row["event_id"])
+                head["updated_at"] = str(
+                    head.get("updated_at") or row["accepted_at"]
+                )
+                self.put_memory_head(conn, head)
+        return self.list_memory_heads_from_connection(conn)
+
+    def list_memory_heads_from_connection(
+        self, conn: sqlite3.Connection
+    ) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM amos_memory_heads
+            ORDER BY series_kind ASC, series_id ASC
+            """
+        ).fetchall()
+        return [self._row_dict(row) for row in rows]
+
+    def rebuild_memory_heads(self) -> list[dict[str, Any]]:
+        with self.transaction() as conn:
+            return self._rebuild_memory_heads(conn)
 
     def get_meta(self, key: str) -> str | None:
         return self._get_meta(self.conn, key)
@@ -561,6 +700,13 @@ class SQLiteStore:
             "SELECT * FROM amos_evidence ORDER BY captured_at DESC"
         ).fetchall()
         return [self._row_dict(row) for row in rows]
+
+    def get_evidence(self, evidence_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM amos_evidence WHERE evidence_id = ?",
+            (str(evidence_id),),
+        ).fetchone()
+        return None if row is None else self._row_dict(row)
 
     def get_atom(self, atom_id: str) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM amos_atoms WHERE id = ?", (atom_id,)).fetchone()

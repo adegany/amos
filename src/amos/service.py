@@ -18,6 +18,7 @@ from ._service_support import (
 )
 from .access_service import AccessService
 from .capacity_service import CapacityService
+from .continuity_service import ContinuityService
 from .diagnostics_service import DiagnosticsService
 from .graph_service import GraphService
 from .governance_service import GovernanceService
@@ -98,6 +99,14 @@ class Amos:
             self.retrieval,
             self.capacity,
             self.policy.run_memory_policy,
+        )
+        self.continuity = ContinuityService(
+            self.store,
+            self.access,
+            self.indexes,
+            self.graph,
+            self.mutations,
+            self.reasoning,
         )
         self.views = ViewService(
             self.store,
@@ -320,6 +329,31 @@ class Amos:
             idempotency_key=idempotency_key,
         )
 
+    def commit_memory_transaction(
+        self,
+        *,
+        evidence: Sequence[Mapping[str, Any]] | None = None,
+        atoms: Sequence[Mapping[str, Any]] | None = None,
+        edges: Sequence[Mapping[str, Any]] | None = None,
+        head_updates: Sequence[Mapping[str, Any]] | None = None,
+        receipt_refs: Sequence[str] | None = None,
+        actor: str = "system",
+        scope: Mapping[str, Any] | None = None,
+        authorization_context: Mapping[str, Any] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        return self.continuity.commit_memory_transaction(
+            evidence=evidence,
+            atoms=atoms,
+            edges=edges,
+            head_updates=head_updates,
+            receipt_refs=receipt_refs,
+            actor=actor,
+            scope=scope,
+            authorization_context=authorization_context,
+            idempotency_key=idempotency_key,
+        )
+
     def update_atom(
         self,
         atom_id: str,
@@ -507,6 +541,80 @@ class Amos:
             token_or_byte_budget=token_or_byte_budget,
             run_policy=run_policy,
         )
+
+    def compile_cognitive_workspace(
+        self,
+        *,
+        current_event_ref: str,
+        conversation_id: str,
+        scope: Mapping[str, Any] | None = None,
+        requester: str = "system",
+        target_processor: str = "reasoner",
+        participant_refs: Sequence[str] | None = None,
+        operation_refs: Sequence[str] | None = None,
+        project_refs: Sequence[str] | None = None,
+        context_refs: Sequence[str] | None = None,
+        token_or_byte_budget: int | Mapping[str, int] | None = None,
+        temporal_limit: int = 12,
+        thread_limit: int = 8,
+        prior_workspace_revision: Mapping[str, Any] | None = None,
+        run_policy: bool = False,
+    ) -> dict[str, Any]:
+        return self.continuity.compile_cognitive_workspace(
+            current_event_ref=current_event_ref,
+            conversation_id=conversation_id,
+            scope=scope,
+            requester=requester,
+            target_processor=target_processor,
+            participant_refs=participant_refs,
+            operation_refs=operation_refs,
+            project_refs=project_refs,
+            context_refs=context_refs,
+            token_or_byte_budget=token_or_byte_budget,
+            temporal_limit=temporal_limit,
+            thread_limit=thread_limit,
+            prior_workspace_revision=prior_workspace_revision,
+            run_policy=run_policy,
+        )
+
+    def compile_interaction_projection(
+        self,
+        *,
+        conversation_id: str,
+        scope: Mapping[str, Any] | None = None,
+        requester: str = "system",
+        target_processor: str = "participant-ui",
+        after_sequence: int = 0,
+        limit: int = 1000,
+    ) -> dict[str, Any]:
+        return self.continuity.compile_interaction_projection(
+            conversation_id=conversation_id,
+            scope=scope,
+            requester=requester,
+            target_processor=target_processor,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+
+    def get_memory_head(
+        self,
+        *,
+        scope: Mapping[str, Any] | None,
+        series_kind: str,
+        series_id: str,
+        requester: str = "system",
+        target_processor: str = "reasoner",
+    ) -> dict[str, Any]:
+        return self.continuity.get_memory_head(
+            scope=scope,
+            series_kind=series_kind,
+            series_id=series_id,
+            requester=requester,
+            target_processor=target_processor,
+        )
+
+    def rebuild_memory_heads(self) -> dict[str, Any]:
+        return self.continuity.rebuild_memory_heads()
 
     def load_memory_page(
         self,

@@ -6,13 +6,13 @@ from amos import AccessDenied, CASConflict, ValidationError
 
 
 AUTHORING = {
-    "identity_ref": "cogito:self",
-    "actor": "svc:cogito:self-governance",
+    "identity_ref": "example_agent:self",
+    "actor": "svc:example_agent:self-governance",
     "capabilities": ["constitutional_authoring"],
 }
 RATIFICATION = {
-    "identity_ref": "cogito:self",
-    "actor": "svc:cogito:self-governance",
+    "identity_ref": "example_agent:self",
+    "actor": "svc:example_agent:self-governance",
     "capabilities": ["self_adjudication", "self_ratification"],
 }
 CONSTITUTIONAL_GOVERNANCE = {
@@ -49,10 +49,10 @@ def _covenant(amos, *, atom_id: str = "covenant_continuing_identity"):
                 "protected_fields": ["constitutional_tier", "ratifier.mode"],
                 "effective_from": "2026-07-24T00:00:00Z",
             },
-            "scope": {"identity": "cogito:self"},
+            "scope": {"identity": "example_agent:self"},
             "decay_policy": {"expires_at": "2000-01-01T00:00:00Z"},
         },
-        actor="svc:cogito:self-governance",
+        actor="svc:example_agent:self-governance",
         authorization_context=AUTHORING,
     )["atom"]
 
@@ -64,13 +64,13 @@ def _proposal(amos, *, atom_id: str = "proposal_self_authored_policy"):
                 "id": atom_id,
                 "type": "belief",
                 "payload": {
-                    "claim": "Cogito may consult other minds without delegating judgment.",
-                    "identity_ref": "cogito:self",
+                    "claim": "the client agent may consult other minds without delegating judgment.",
+                    "identity_ref": "example_agent:self",
                 },
             }
         ],
-        actor="svc:cogito:self-governance",
-        scope={"identity": "cogito:self"},
+        actor="svc:example_agent:self-governance",
+        scope={"identity": "example_agent:self"},
     )["proposals"][0]["atom"]
 
 
@@ -80,7 +80,7 @@ def _adjudication(
     proposal_ref: str,
     covenant_ref: str,
     atom_id: str = "adjudication_self_authored_policy",
-    identity_ref: str = "cogito:self",
+    identity_ref: str = "example_agent:self",
     reconstructed_at: str = "2026-07-24T01:00:00Z",
     threshold: dict | None = None,
     outcome: str = "adopted",
@@ -130,9 +130,9 @@ def _adjudication(
             "id": atom_id,
             "type": "adjudication",
             "payload": payload,
-            "scope": scope or {"identity": "cogito:self"},
+            "scope": scope or {"identity": "example_agent:self"},
         },
-        actor="svc:cogito:self-governance",
+        actor="svc:example_agent:self-governance",
         authorization_context={
             **RATIFICATION,
             "identity_ref": identity_ref,
@@ -145,7 +145,7 @@ def test_operational_recall_excludes_proposals_and_deliberation_classifies_them(
 
     operational = amos.retrieve_packet(
         cues=["delegating judgment"],
-        scope={"identity": "cogito:self"},
+        scope={"identity": "example_agent:self"},
         run_policy=False,
     )
     assert proposal["id"] not in {
@@ -154,7 +154,7 @@ def test_operational_recall_excludes_proposals_and_deliberation_classifies_them(
 
     deliberation = amos.retrieve_packet(
         cues=["delegating judgment"],
-        scope={"identity": "cogito:self"},
+        scope={"identity": "example_agent:self"},
         memory_mode="deliberation",
         run_policy=False,
     )
@@ -170,7 +170,7 @@ def test_operational_recall_excludes_proposals_and_deliberation_classifies_them(
     frame = amos.compile_memory_frame(
         need="delegating judgment",
         purpose="deliberate before ratification",
-        scope={"identity": "cogito:self"},
+        scope={"identity": "example_agent:self"},
         memory_mode="deliberation",
         token_or_byte_budget={"tokens": 3000},
         run_policy=False,
@@ -221,7 +221,7 @@ def test_batch_commit_cannot_bypass_self_adjudication_authentication(amos):
             "dissent_refs": [],
             "review_triggers": ["material_counterevidence"],
             "ratifier": {
-                "identity_ref": "cogito:self",
+                "identity_ref": "example_agent:self",
                 "mode": "self_ratification",
             },
             "reconstructed_at": "2026-07-24T01:00:00Z",
@@ -232,7 +232,7 @@ def test_batch_commit_cannot_bypass_self_adjudication_authentication(amos):
                 "disposition": "initial",
             },
         },
-        "scope": {"identity": "cogito:self"},
+        "scope": {"identity": "example_agent:self"},
     }
     with pytest.raises(AccessDenied, match="self_adjudication"):
         amos.commit_memory_atoms(
@@ -275,7 +275,7 @@ def test_ratification_is_guarded_by_version_identity_covenant_and_journal(amos):
             proposal_ref=proposal["id"],
             adjudication_ref=adjudication["id"],
             expected_version=proposal["version"] + 1,
-            actor="svc:cogito:self-governance",
+            actor="svc:example_agent:self-governance",
             authorization_context=RATIFICATION,
         )
     with pytest.raises(AccessDenied, match="another identity|authenticated identity"):
@@ -295,7 +295,7 @@ def test_ratification_is_guarded_by_version_identity_covenant_and_journal(amos):
         proposal_ref=proposal["id"],
         adjudication_ref=adjudication["id"],
         expected_version=proposal["version"],
-        actor="svc:cogito:self-governance",
+        actor="svc:example_agent:self-governance",
         authorization_context=RATIFICATION,
         idempotency_key="ratify-self-authored-policy",
     )
@@ -314,7 +314,7 @@ def test_ratification_is_guarded_by_version_identity_covenant_and_journal(amos):
         proposal_ref=proposal["id"],
         adjudication_ref=adjudication["id"],
         expected_version=proposal["version"],
-        actor="svc:cogito:self-governance",
+        actor="svc:example_agent:self-governance",
         authorization_context=RATIFICATION,
         idempotency_key="ratify-self-authored-policy",
     )
@@ -342,7 +342,7 @@ def test_external_authority_mode_is_not_a_valid_adjudicator(amos):
                     },
                 },
             },
-            actor="svc:cogito:self-governance",
+            actor="svc:example_agent:self-governance",
             authorization_context=RATIFICATION,
         )
 
@@ -383,9 +383,9 @@ def test_constitutional_records_resist_generic_privileged_mutation(amos):
                 "protected_fields": ["guidance"],
                 "effective_from": "2026-07-24T00:00:00Z",
             },
-            "scope": {"identity": "cogito:self"},
+            "scope": {"identity": "example_agent:self"},
         },
-        actor="svc:cogito:self-governance",
+        actor="svc:example_agent:self-governance",
         authorization_context=AUTHORING,
     )["atom"]
     with pytest.raises(ValidationError, match="immutable"):
@@ -394,7 +394,7 @@ def test_constitutional_records_resist_generic_privileged_mutation(amos):
             payload_patch={"guidance": "Replaced."},
             actor="system",
             authorization_context={
-                "identity_ref": "cogito:self",
+                "identity_ref": "example_agent:self",
                 "capabilities": ["constitutional_amendment"],
             },
             expected_version=primal["version"],
@@ -500,13 +500,13 @@ def test_governance_metadata_survives_reasoning_projection_and_paging(amos):
         proposal_ref=proposal["id"],
         adjudication_ref=adjudication["id"],
         expected_version=proposal["version"],
-        actor="svc:cogito:self-governance",
+        actor="svc:example_agent:self-governance",
         authorization_context=RATIFICATION,
     )
     frame = amos.compile_memory_frame(
         need="delegating judgment",
         purpose="apply a ratified belief",
-        scope={"identity": "cogito:self"},
+        scope={"identity": "example_agent:self"},
         token_or_byte_budget={"tokens": 2000},
         run_policy=False,
     )
@@ -528,7 +528,7 @@ def test_governance_metadata_survives_reasoning_projection_and_paging(amos):
         revision=frame["revision"],
         page=descriptor,
         depth="supporting",
-        scope={"identity": "cogito:self"},
+        scope={"identity": "example_agent:self"},
         token_or_byte_budget={"tokens": 4000},
         run_policy=False,
     )
@@ -550,7 +550,7 @@ def test_diachronic_threshold_requires_independent_reconstructions(amos):
     )
     status = amos.diachronic_ratification_status(
         subject_ref=proposal["id"],
-        identity_ref="cogito:self",
+        identity_ref="example_agent:self",
         required_confirmations=2,
         min_interval_seconds=3600,
     )
@@ -567,7 +567,7 @@ def test_diachronic_threshold_requires_independent_reconstructions(amos):
     )
     status = amos.diachronic_ratification_status(
         subject_ref=proposal["id"],
-        identity_ref="cogito:self",
+        identity_ref="example_agent:self",
         required_confirmations=2,
         min_interval_seconds=3600,
     )
@@ -577,7 +577,7 @@ def test_diachronic_threshold_requires_independent_reconstructions(amos):
         proposal_ref=proposal["id"],
         adjudication_ref=second["id"],
         expected_version=proposal["version"],
-        actor="svc:cogito:self-governance",
+        actor="svc:example_agent:self-governance",
         authorization_context=RATIFICATION,
     )
     assert ratified["status"] == "ratified"
@@ -620,7 +620,7 @@ def test_guarded_resolution_is_self_authored_and_auditable(
         proposal_ref=proposal["id"],
         adjudication_ref=adjudication["id"],
         expected_version=proposal["version"],
-        actor="svc:cogito:self-governance",
+        actor="svc:example_agent:self-governance",
         authorization_context=RATIFICATION,
         idempotency_key=f"resolve:{outcome}",
     )
@@ -628,7 +628,7 @@ def test_guarded_resolution_is_self_authored_and_auditable(
     assert resolved["atom"]["lifecycle_state"] == expected_lifecycle
     resolution = resolved["atom"]["payload"]["governance_resolution"]
     assert resolution["adjudication_ref"] == adjudication["id"]
-    assert resolution["ratifier_identity_ref"] == "cogito:self"
+    assert resolution["ratifier_identity_ref"] == "example_agent:self"
     assert resolved["event"]["event_type"] == "proposal_resolved"
     assert amos.verify_replay()["status"] == "ok"
 
@@ -649,7 +649,7 @@ def test_revised_resolution_requires_and_preserves_successor_ref(amos):
         proposal_ref=proposal["id"],
         adjudication_ref=adjudication["id"],
         expected_version=proposal["version"],
-        actor="svc:cogito:self-governance",
+        actor="svc:example_agent:self-governance",
         authorization_context=RATIFICATION,
     )
     assert (
@@ -669,11 +669,11 @@ def test_constitutional_scope_applies_from_identity_to_project(amos):
                 "type": "belief",
                 "payload": {
                     "claim": "A project-specific conclusion.",
-                    "identity_ref": "cogito:self",
+                    "identity_ref": "example_agent:self",
                 },
             }
         ],
-        scope={"identity": "cogito:self", "project": "project:one"},
+        scope={"identity": "example_agent:self", "project": "project:one"},
     )["proposals"][0]["atom"]
     adjudication = _adjudication(
         amos,
@@ -688,7 +688,7 @@ def test_constitutional_scope_applies_from_identity_to_project(amos):
         proposal_ref=proposal["id"],
         adjudication_ref=adjudication["id"],
         expected_version=proposal["version"],
-        actor="svc:cogito:self-governance",
+        actor="svc:example_agent:self-governance",
         authorization_context=RATIFICATION,
     )
     assert result["status"] == "ratified"
@@ -711,9 +711,9 @@ def test_constitutional_replacement_is_atomic_and_diachronic(amos):
                 "protected_fields": ["guidance"],
                 "effective_from": "2026-07-24T00:00:00Z",
             },
-            "scope": {"identity": "cogito:self"},
+            "scope": {"identity": "example_agent:self"},
         },
-        actor="svc:cogito:self-governance",
+        actor="svc:example_agent:self-governance",
         authorization_context=AUTHORING,
     )["atom"]
     current = _covenant(amos, atom_id="covenant_replace_current")
@@ -732,7 +732,7 @@ def test_constitutional_replacement_is_atomic_and_diachronic(amos):
             "supersedes": [current["id"]],
             "lifecycle_state": "proposed",
         },
-        actor="svc:cogito:self-governance",
+        actor="svc:example_agent:self-governance",
         authorization_context=AUTHORING,
     )["atom"]
     ordinary_adjudication = _adjudication(
@@ -750,7 +750,7 @@ def test_constitutional_replacement_is_atomic_and_diachronic(amos):
             proposal_ref=successor["id"],
             adjudication_ref=ordinary_adjudication["id"],
             expected_version=successor["version"],
-            actor="svc:cogito:self-governance",
+            actor="svc:example_agent:self-governance",
             authorization_context=CONSTITUTIONAL_GOVERNANCE,
         )
     adjudications = []
@@ -772,7 +772,7 @@ def test_constitutional_replacement_is_atomic_and_diachronic(amos):
         adjudication_ref=adjudications[-1]["id"],
         expected_current_version=current["version"],
         expected_successor_version=successor["version"],
-        actor="svc:cogito:self-governance",
+        actor="svc:example_agent:self-governance",
         authorization_context=CONSTITUTIONAL_GOVERNANCE,
     )
     assert result["status"] == "replaced"

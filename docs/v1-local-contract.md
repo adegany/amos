@@ -809,11 +809,11 @@ reference summaries, to reference-only form while retaining active-conclusion,
 constraint, commitment, conflict, supersession, temporal-sequence, and source
 references.
 
-The packet endpoints remain the v1 compatibility path for associative recall,
-and `/v1/atoms:get` remains the exact-ID path. AMOS does not select a Cogito
-memory mode on its own: it enforces the mode explicitly selected by Cogito.
-Cogito retains the active working-memory set, enforces total-cycle budgets, and
-can return to its legacy packet integration independently. `X-Request-ID` is
+The packet endpoints remain available for associative recall, and
+`/v1/atoms:get` remains the exact-ID path. AMOS does not select an application
+memory mode on its own: it enforces the mode explicitly selected by the caller.
+The client runtime retains its active working-memory set and enforces total-cycle
+budgets. `X-Request-ID` is
 echoed on JSON responses for cross-service tracing without logging request
 bodies.
 
@@ -1182,6 +1182,11 @@ storage artifacts:
 
 service artifacts:
   capture_event endpoint
+  atomic memory-transaction endpoint
+  access-filtered memory-head lookup endpoint
+  cognitive-workspace compilation endpoint
+  ordered interaction-projection endpoint
+  journal-derived memory-head rebuild endpoint
   propose_memory_atoms endpoint
   commit_memory_atoms endpoint
   archive_atom and merge_atoms endpoints
@@ -1238,6 +1243,7 @@ Acceptance status:
 | Schema | Implemented | Envelope fields are excluded from payloads; required fields, JSON Schema property types, and score bounds are enforced by dependency-free runtime validators and tests. |
 | Journal | Implemented | Canonical graph mutations append checksummed `EventJournalEntry` records with authorization and expected-version context. |
 | Projection | Implemented | Strong mutations append their event and project graph changes in one SQLite transaction. |
+| Interaction continuity | Implemented | Per-conversation interaction-stream CAS binds immutable event order; discourse-state heads advance independently; both indexes rebuild from the retained journal. |
 | Replay | Partial | The graph is reconstructable from the full retained journal. Snapshot-plus-tail recovery and journal segment compaction are planned. |
 | Retrieval and attention | Implemented | Packets expose graph version, provenance, omissions, degradation, score components, attention trace, bounded candidate selection, and scoped edge activation. |
 | Self-awareness and agentic recall | Implemented | Structural self views, responsibility attribution, counterevidence, and generated self-narrative expiry are tested. |

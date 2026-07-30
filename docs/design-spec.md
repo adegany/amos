@@ -1841,7 +1841,7 @@ Constitutional evolution uses
 `replace_constitutional_record(current_ref, successor_ref, adjudication_ref,
 expected_current_version, expected_successor_version, ...)`. AMOS verifies the
 predecessor link, higher-precedence guidance, protected fields, successor
-classification, Cogito-authored amendment adjudication, and diachronic
+classification, agent-authored amendment adjudication, and diachronic
 threshold, then atomically supersedes the old head and activates the successor.
 Global or identity-scoped constitutional guidance applies to deterministically
 compatible narrower proposal scopes.
@@ -4863,14 +4863,59 @@ utility scoring. Generative LLM calls are optional escalation paths only.
 
 ---
 
-## 29. Verified v1-local contract and roadmap
+## 29. Canonical Interaction Continuity
+
+AMOS may retain interaction history and interpreted discourse state in the
+same canonical graph without becoming an application-specific conversation
+runtime.
+
+```text
+interaction_event:
+  immutable source event with conversation, sequence, actor, role, content,
+  visibility, reply pointer, and optional discourse-thread references
+
+interaction_stream head:
+  per-scope, per-conversation compare-and-swap pointer
+  head version equals the latest event sequence
+  advancing the stream never supersedes prior events
+
+discourse_thread:
+  stable identity for one bounded discussion
+
+discourse_state head:
+  append-only interpreted state revision
+  advancing this head supersedes only its previous state revision
+```
+
+Every transaction that adds an interaction event must advance the matching
+interaction-stream head. AMOS validates the next sequence, prior reply pointer,
+scope, access, and idempotency atomically. Applications choose conversational
+meaning; AMOS does not classify topics or infer which discourse thread is
+active.
+
+A cognitive workspace is a generated, revision-bound view. It protects the
+current event, immediate reply chain, and directly linked visible discourse
+heads before adding bounded canonical and associative context. An interaction
+projection is an ordered, access-filtered read model for reconstructing
+disposable delivery caches. Explicit canonical context includes source content
+and authority metadata but excludes rebuildable search indexes, vectors,
+decay bookkeeping, and revision-history internals. Neither view becomes
+canonical memory.
+
+The head table is derived from committed journal transactions and must remain
+fully rebuildable. Access-filtered head lookup exposes a reference and version,
+not private atom content.
+
+---
+
+## 30. Verified v1-local contract and roadmap
 
 The implementation-specific defaults, repository artifacts, acceptance status,
 and known partial gates are maintained in
 [`v1-local-contract.md`](v1-local-contract.md). Future implementation work is
 maintained separately in [`roadmap.md`](roadmap.md).
 
-This separation is intentional: sections 1-28 define the longer-term AMOS
+This separation is intentional: sections 1-29 define the longer-term AMOS
 architecture. They are not claims that every distributed, archival, snapshot,
 capacity-tier, or deletion-policy feature exists in the v1-local SQLite
 profile. The checked-in profile is one HTTP service process with one
@@ -4878,7 +4923,7 @@ service-owned SQLite store and explicitly identified partial gates.
 
 ---
 
-## 30. Current design principle
+## 31. Current design principle
 
 Amos should provide a shared, layered, associative, self-maintaining memory operating plane for agentic AI systems.
 

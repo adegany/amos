@@ -10,7 +10,13 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Mapping, cast
 
-from .errors import AccessDenied, AmosError, StaleFrameError, ValidationError
+from .errors import (
+    AccessDenied,
+    AmosError,
+    CASConflict,
+    StaleFrameError,
+    ValidationError,
+)
 from .schemas import CONSTITUTIONAL_ATOM_TYPES
 from .service import Amos
 from .workers import BackgroundMemoryPolicyWorker
@@ -103,6 +109,16 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                     },
                     status=HTTPStatus.CONFLICT,
                 )
+            except CASConflict as exc:
+                self._write_json(
+                    {
+                        "status": "error",
+                        "error": str(exc),
+                        "code": "compare_and_swap_conflict",
+                        "retryable": False,
+                    },
+                    status=HTTPStatus.CONFLICT,
+                )
             except AccessDenied as exc:
                 self._write_json(
                     {"status": "error", "error": str(exc)},
@@ -180,6 +196,53 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
 
             if path == "/v1/events:capture":
                 return self._write_json(amos.capture_event(**body))
+            if path == "/v1/memory-transactions:commit":
+                request = dict(body)
+                profile = request.pop("profile", None)
+                if profile not in {None, "amos.memory-transaction.v1"}:
+                    raise ValidationError(
+                        "memory transaction profile must be "
+                        "'amos.memory-transaction.v1'"
+                    )
+                return self._write_json(
+                    amos.commit_memory_transaction(**request)
+                )
+            if path == "/v1/cognitive-workspaces:compile":
+                request = dict(body)
+                profile = request.pop("profile", None)
+                if profile not in {None, "amos.cognitive-workspace-request.v1"}:
+                    raise ValidationError(
+                        "cognitive workspace request profile must be "
+                        "'amos.cognitive-workspace-request.v1'"
+                    )
+                return self._write_json(
+                    amos.compile_cognitive_workspace(**request)
+                )
+            if path == "/v1/interaction-projections:compile":
+                request = dict(body)
+                profile = request.pop("profile", None)
+                if profile not in {
+                    None,
+                    "amos.interaction-projection-request.v1",
+                }:
+                    raise ValidationError(
+                        "interaction projection request profile must be "
+                        "'amos.interaction-projection-request.v1'"
+                    )
+                return self._write_json(
+                    amos.compile_interaction_projection(**request)
+                )
+            if path == "/v1/memory-heads:get":
+                request = dict(body)
+                profile = request.pop("profile", None)
+                if profile not in {None, "amos.memory-head-request.v1"}:
+                    raise ValidationError(
+                        "memory head request profile must be "
+                        "'amos.memory-head-request.v1'"
+                    )
+                return self._write_json(amos.get_memory_head(**request))
+            if path == "/v1/memory-heads:rebuild":
+                return self._write_json(amos.rebuild_memory_heads())
             if path == "/v1/atoms:propose":
                 return self._write_json(
                     amos.propose_memory_atoms(

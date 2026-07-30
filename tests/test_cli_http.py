@@ -94,7 +94,7 @@ def test_cli_constitutional_governance_commands(tmp_path, capsys):
                 "--expected-version",
                 str(proposal["version"]),
                     "--actor",
-                    "svc:cogito:self-governance",
+                    "svc:example_agent:self-governance",
                 "--authorization-context",
                 json.dumps(RATIFICATION),
             ]
@@ -122,7 +122,7 @@ def test_cli_constitutional_governance_commands(tmp_path, capsys):
                 "--subject-ref",
                 proposal["id"],
                 "--identity-ref",
-                "cogito:self",
+                "example_agent:self",
                 "--required-confirmations",
                 "1",
             ]
@@ -272,7 +272,7 @@ def test_http_constitutional_governance_endpoints(tmp_path):
                         **adjudication,
                         "id": "http_forged_adjudication",
                     },
-                    "actor": "svc:cogito:self-governance",
+                    "actor": "svc:example_agent:self-governance",
                     "authorization_context": RATIFICATION,
                 },
             )
@@ -296,7 +296,7 @@ def test_http_constitutional_governance_endpoints(tmp_path):
             f"{base}/v1/ratifications:diachronic-status",
             {
                 "subject_ref": proposal["id"],
-                "identity_ref": "cogito:self",
+                "identity_ref": "example_agent:self",
                 "required_confirmations": 1,
             },
         )

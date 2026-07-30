@@ -32,6 +32,7 @@ Status terms:
 | HTTP and CLI adapters | `src/amos/http_api.py`, `src/amos/cli.py` | `tests/test_cli_http.py` |
 | Mirror Agent reference integration | `examples/mirror_agent_demo.py`, `examples/mirror_agent_ui.py` | `tests/test_mirror_agent_demo.py` (packets, frames/pages, exact lookup, canonical graph metadata, governed proposals, truthful feedback, browser endpoints) |
 | JSON Schema artifacts | `schemas/*.schema.json`, dependency-free runtime mirror in `src/amos/schemas.py` | `tests/test_schema_and_mutations.py::test_runtime_enforces_typed_payload_contracts`, `tests/test_schema_and_mutations.py::test_runtime_enforces_json_schema_property_types_and_score_bounds` |
+| Canonical interaction continuity | `src/amos/continuity_service.py`, `schemas/memory_transaction.schema.json`, `schemas/memory_head.schema.json`, `schemas/cognitive_workspace.schema.json`, `schemas/interaction_projection.schema.json` | `tests/test_continuity.py` |
 | SQLite migration | `migrations/sqlite/001_initial.sql` | Migration smoke command below |
 | Postgres target contract | `migrations/postgres/001_initial.sql` | Artifact only; runtime verification is intentionally absent |
 

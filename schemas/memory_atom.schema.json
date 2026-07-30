@@ -18,6 +18,8 @@
         "capability",
         "commitment",
         "covenant",
+        "discourse_state",
+        "discourse_thread",
         "episode",
         "goal",
         "limitation",
@@ -29,6 +31,7 @@
         "self_assessment",
         "self_model",
         "self_narrative",
+        "interaction_event",
         "semantic"
       ]
     },
@@ -107,6 +110,36 @@
     }
   },
   "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "interaction_event" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "discourse_memory.schema.json#/$defs/InteractionEvent"
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "discourse_thread" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "discourse_memory.schema.json#/$defs/DiscourseThread"
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "discourse_state" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "discourse_memory.schema.json#/$defs/DiscourseState"
+          }
+        }
+      }
+    },
     {
       "if": { "properties": { "type": { "const": "adjudication" } } },
       "then": {

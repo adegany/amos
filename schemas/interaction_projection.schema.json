@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/interaction_projection.schema.json",
+  "title": "AMOS interaction projection",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "profile",
+        "conversation_id",
+        "scope",
+        "requester",
+        "target_processor"
+      ],
+      "properties": {
+        "profile": {
+          "const": "amos.interaction-projection-request.v1"
+        },
+        "conversation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope": {
+          "type": "object"
+        },
+        "requester": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target_processor": {
+          "type": "string",
+          "minLength": 1
+        },
+        "after_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5000
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "status",
+        "profile",
+        "schema_version",
+        "conversation_id",
+        "events",
+        "after_sequence",
+        "next_after_sequence",
+        "has_more",
+        "revision",
+        "generated_at"
+      ],
+      "properties": {
+        "status": {
+          "const": "compiled"
+        },
+        "profile": {
+          "const": "amos.interaction-projection.v1"
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "conversation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "alias",
+              "atom_ref",
+              "conversation_id",
+              "sequence",
+              "actor_ref",
+              "role",
+              "content",
+              "occurred_at",
+              "visibility",
+              "thread_refs",
+              "source_ref"
+            ],
+            "properties": {
+              "alias": {
+                "type": "string"
+              },
+              "atom_ref": {
+                "type": "string"
+              },
+              "conversation_id": {
+                "type": "string"
+              },
+              "sequence": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "actor_ref": {
+                "type": "string"
+              },
+              "role": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string"
+              },
+              "occurred_at": {
+                "type": "string"
+              },
+              "in_reply_to": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "visibility": {
+                "type": "string"
+              },
+              "thread_refs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "source_ref": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "after_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "next_after_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "has_more": {
+          "type": "boolean"
+        },
+        "revision": {
+          "type": "object"
+        },
+        "generated_at": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

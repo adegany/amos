@@ -382,7 +382,7 @@ def test_generic_semantic_facets_do_not_mix_context_domains():
                 intent="practice bounded skill",
                 outcome="observed",
                 semantic_context_key="project:pen-art",
-                scope={"tenant": "cogito"},
+                scope={"tenant": "example_agent"},
             ),
             SemanticFacet(
                 atom_ref="trading_activity",
@@ -390,7 +390,7 @@ def test_generic_semantic_facets_do_not_mix_context_domains():
                 intent="practice bounded skill",
                 outcome="observed",
                 semantic_context_key="project:trading",
-                scope={"tenant": "cogito"},
+                scope={"tenant": "example_agent"},
             ),
         ]
     )

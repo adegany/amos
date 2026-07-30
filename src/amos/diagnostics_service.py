@@ -33,6 +33,7 @@ class DiagnosticsService:
         return {
             "graph_version": self.store.graph_version(),
             "journal_events": self.store.event_count(),
+            "memory_heads": len(self.store.list_memory_heads()),
             "atoms": self.store.atom_count(),
             "by_type": by_type,
             "by_health": by_health,
@@ -117,6 +118,7 @@ class DiagnosticsService:
     def replay_graph(self) -> dict[str, Any]:
         atoms: dict[str, dict[str, Any]] = {}
         edges: dict[str, dict[str, Any]] = {}
+        heads: dict[str, dict[str, Any]] = {}
         tombstones: dict[str, dict[str, Any]] = {}
 
         def replay_edge_projection(edge: dict[str, Any]) -> dict[str, Any]:
@@ -216,6 +218,28 @@ class DiagnosticsService:
                         edges.pop(edge["edge_id"], None)
                     else:
                         edges[edge["edge_id"]] = replay_edge_projection(edge)
+            elif event_type == "memory_transaction_committed":
+                for atom in payload.get("projected_atoms", []):
+                    if atom.get("deleted"):
+                        atoms.pop(atom["id"], None)
+                    else:
+                        atoms[atom["id"]] = atom
+                for edge in payload.get("projected_edges", []):
+                    if edge.get("deleted"):
+                        edges.pop(edge["edge_id"], None)
+                    else:
+                        edges[edge["edge_id"]] = replay_edge_projection(edge)
+                for head in payload.get("projected_heads", []):
+                    key = (
+                        f"{digest(head.get('scope') or {})}:"
+                        f"{head.get('series_kind')}:{head.get('series_id')}"
+                    )
+                    heads[key] = {
+                        **dict(head),
+                        "scope_digest": digest(head.get("scope") or {}),
+                        "journal_event_id": event["event_id"],
+                        "updated_at": event["accepted_at"],
+                    }
             elif event_type in {
                 "atom_merged",
                 "proposal_ratified",
@@ -244,6 +268,7 @@ class DiagnosticsService:
             "graph_version": self.store.graph_version(),
             "atoms": atoms,
             "edges": edges,
+            "heads": heads,
             "tombstones": tombstones,
         }
 
@@ -257,6 +282,7 @@ class DiagnosticsService:
         }
         replayed_atoms = replayed["atoms"]
         replayed_edges = replayed["edges"]
+        replayed_heads = replayed["heads"]
         missing = sorted(set(stored_atoms) - set(replayed_atoms))
         unexpected = sorted(set(replayed_atoms) - set(stored_atoms))
         mismatched = []
@@ -276,6 +302,20 @@ class DiagnosticsService:
         for edge_id in sorted(set(stored_edges).intersection(replayed_edges)):
             if digest(stored_edges[edge_id]) != digest(replayed_edges[edge_id]):
                 mismatched_edges.append(edge_id)
+        stored_heads = {
+            (
+                f"{digest(head.get('scope') or {})}:"
+                f"{head.get('series_kind')}:{head.get('series_id')}"
+            ): head
+            for head in self.store.list_memory_heads()
+        }
+        missing_heads = sorted(set(stored_heads) - set(replayed_heads))
+        unexpected_heads = sorted(set(replayed_heads) - set(stored_heads))
+        mismatched_heads = [
+            key
+            for key in sorted(set(stored_heads).intersection(replayed_heads))
+            if digest(stored_heads[key]) != digest(replayed_heads[key])
+        ]
         return {
             "status": "ok"
             if not missing
@@ -284,6 +324,9 @@ class DiagnosticsService:
             and not missing_edges
             and not unexpected_edges
             and not mismatched_edges
+            and not missing_heads
+            and not unexpected_heads
+            and not mismatched_heads
             else "failed",
             "graph_version": self.store.graph_version(),
             "missing_in_replay": missing,
@@ -292,8 +335,13 @@ class DiagnosticsService:
             "missing_edges_in_replay": missing_edges,
             "unexpected_edges_in_replay": unexpected_edges,
             "mismatched_edges": mismatched_edges,
+            "missing_heads_in_replay": missing_heads,
+            "unexpected_heads_in_replay": unexpected_heads,
+            "mismatched_heads": mismatched_heads,
             "replayed_atom_count": len(replayed_atoms),
             "stored_atom_count": len(stored_atoms),
             "replayed_edge_count": len(replayed_edges),
             "stored_edge_count": len(stored_edges),
+            "replayed_head_count": len(replayed_heads),
+            "stored_head_count": len(stored_heads),
         }

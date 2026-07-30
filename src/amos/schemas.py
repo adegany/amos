@@ -25,6 +25,8 @@ ATOM_TYPES = {
     "capability",
     "commitment",
     "covenant",
+    "discourse_state",
+    "discourse_thread",
     "episode",
     "goal",
     "limitation",
@@ -36,6 +38,7 @@ ATOM_TYPES = {
     "self_assessment",
     "self_model",
     "self_narrative",
+    "interaction_event",
     "semantic",
 }
 
@@ -289,6 +292,315 @@ def _require_payload_string_list(
         )
 
 
+def _require_exact_profile(
+    atom_type: str, payload: Mapping[str, Any], profile: str
+) -> None:
+    if payload.get("profile") != profile:
+        raise ValidationError(f"{atom_type} payload profile must be {profile!r}")
+
+
+def _require_non_empty_string(
+    atom_type: str, payload: Mapping[str, Any], field: str
+) -> None:
+    value = payload.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(
+            f"{atom_type} payload field {field} must be a non-empty string"
+        )
+
+
+def _validate_state_entries(
+    atom_type: str,
+    payload: Mapping[str, Any],
+    field: str,
+    *,
+    max_items: int = 64,
+) -> None:
+    entries = payload.get(field)
+    if not isinstance(entries, list):
+        raise ValidationError(f"{atom_type} payload field {field} must be a list")
+    if len(entries) > max_items:
+        raise ValidationError(
+            f"{atom_type} payload field {field} may contain at most {max_items} items"
+        )
+    seen: set[str] = set()
+    for index, raw in enumerate(entries):
+        if not isinstance(raw, Mapping):
+            raise ValidationError(
+                f"{atom_type} payload field {field}[{index}] must be an object"
+            )
+        if set(raw) != {"key", "value", "basis_refs"}:
+            raise ValidationError(
+                f"{atom_type} payload field {field}[{index}] fields do not "
+                "match the profile"
+            )
+        key = raw.get("key")
+        if not isinstance(key, str) or not key.strip():
+            raise ValidationError(
+                f"{atom_type} payload field {field}[{index}].key must be "
+                "a non-empty string"
+            )
+        if key in seen:
+            raise ValidationError(
+                f"{atom_type} payload field {field} contains duplicate key {key!r}"
+            )
+        seen.add(key)
+        if len(key) > 128:
+            raise ValidationError(
+                f"{atom_type} payload field {field}[{index}].key is too long"
+            )
+        if "value" not in raw:
+            raise ValidationError(
+                f"{atom_type} payload field {field}[{index}].value is required"
+            )
+        ensure_jsonable(raw["value"])
+        refs = raw.get("basis_refs", [])
+        if (
+            not isinstance(refs, list)
+            or not all(isinstance(ref, str) and ref for ref in refs)
+            or len(refs) > 64
+            or len(refs) != len(set(refs))
+        ):
+            raise ValidationError(
+                f"{atom_type} payload field {field}[{index}].basis_refs must be "
+                "a unique list of at most 64 non-empty strings"
+            )
+
+
+def _validate_unresolved_items(
+    atom_type: str, payload: Mapping[str, Any]
+) -> None:
+    items = payload.get("unresolved_items")
+    if not isinstance(items, list):
+        raise ValidationError(
+            f"{atom_type} payload field unresolved_items must be a list"
+        )
+    if len(items) > 64:
+        raise ValidationError(
+            f"{atom_type} payload field unresolved_items may contain at most 64 items"
+        )
+    for index, raw in enumerate(items):
+        if not isinstance(raw, Mapping):
+            raise ValidationError(
+                f"{atom_type} payload field unresolved_items[{index}] must be "
+                "an object"
+            )
+        if set(raw) != {"kind", "description", "basis_refs"}:
+            raise ValidationError(
+                f"{atom_type} payload field unresolved_items[{index}] fields "
+                "do not match the profile"
+            )
+        for field in ("kind", "description"):
+            value = raw.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValidationError(
+                    f"{atom_type} payload field unresolved_items[{index}].{field} "
+                    "must be a non-empty string"
+                )
+        refs = raw.get("basis_refs", [])
+        if (
+            not isinstance(refs, list)
+            or not all(isinstance(ref, str) and ref for ref in refs)
+            or len(refs) > 64
+            or len(refs) != len(set(refs))
+        ):
+            raise ValidationError(
+                f"{atom_type} payload field unresolved_items[{index}].basis_refs "
+                "must be a unique list of at most 64 non-empty strings"
+            )
+
+
+def _validate_interaction_event_payload(payload: Mapping[str, Any]) -> None:
+    atom_type = "interaction_event"
+    _require_exact_profile(atom_type, payload, "amos.interaction-event.v1")
+    _require_payload_fields(
+        atom_type,
+        payload,
+        (
+            "conversation_id",
+            "sequence",
+            "actor_ref",
+            "role",
+            "content",
+            "occurred_at",
+            "visibility",
+            "source_ref",
+        ),
+    )
+    for field in ("conversation_id", "actor_ref", "occurred_at", "source_ref"):
+        _require_non_empty_string(atom_type, payload, field)
+    if not isinstance(payload.get("content"), str):
+        raise ValidationError(
+            "interaction_event payload field content must be a string"
+        )
+    sequence = payload.get("sequence")
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+        raise ValidationError(
+            "interaction_event payload field sequence must be a positive integer"
+        )
+    if payload.get("role") not in {"human", "agent", "system", "tool"}:
+        raise ValidationError("unsupported interaction_event role")
+    if payload.get("visibility") not in {"shared", "private"}:
+        raise ValidationError("unsupported interaction_event visibility")
+    in_reply_to = payload.get("in_reply_to")
+    if in_reply_to is not None and (
+        not isinstance(in_reply_to, str) or not in_reply_to
+    ):
+        raise ValidationError(
+            "interaction_event payload field in_reply_to must be null or "
+            "a non-empty string"
+        )
+    thread_refs = payload.get("thread_refs", [])
+    if (
+        not isinstance(thread_refs, list)
+        or not all(isinstance(ref, str) and ref for ref in thread_refs)
+        or len(thread_refs) > 16
+        or len(thread_refs) != len(set(thread_refs))
+    ):
+        raise ValidationError(
+            "interaction_event payload field thread_refs must be a unique "
+            "list of at most 16 non-empty strings"
+        )
+
+
+def _validate_discourse_thread_payload(payload: Mapping[str, Any]) -> None:
+    atom_type = "discourse_thread"
+    _require_exact_profile(atom_type, payload, "amos.discourse-thread.v1")
+    _require_payload_fields(
+        atom_type,
+        payload,
+        ("thread_id", "conversation_id", "opened_by_event_ref", "participants"),
+    )
+    for field in ("thread_id", "conversation_id", "opened_by_event_ref"):
+        _require_non_empty_string(atom_type, payload, field)
+    _require_payload_string_list(atom_type, payload, "participants")
+    if not payload.get("participants"):
+        raise ValidationError(
+            "discourse_thread payload field participants must not be empty"
+        )
+    if len(payload["participants"]) > 32:
+        raise ValidationError(
+            "discourse_thread payload field participants may contain at most "
+            "32 items"
+        )
+    if len(payload["participants"]) != len(set(payload["participants"])):
+        raise ValidationError(
+            "discourse_thread payload field participants must be unique"
+        )
+
+
+def _validate_discourse_state_payload(payload: Mapping[str, Any]) -> None:
+    atom_type = "discourse_state"
+    _require_exact_profile(atom_type, payload, "amos.discourse-thread-state.v1")
+    _require_payload_fields(
+        atom_type,
+        payload,
+        (
+            "thread_id",
+            "revision",
+            "lifecycle",
+            "attention_state",
+            "summary",
+            "participants",
+            "head_event_refs",
+            "source_event_refs",
+            "shared_state",
+            "private_state",
+            "unresolved_items",
+        ),
+    )
+    _require_non_empty_string(atom_type, payload, "thread_id")
+    if not isinstance(payload.get("summary"), str):
+        raise ValidationError(
+            "discourse_state payload field summary must be a string"
+        )
+    revision = payload.get("revision")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise ValidationError(
+            "discourse_state payload field revision must be a positive integer"
+        )
+    if payload.get("lifecycle") not in {"open", "closed"}:
+        raise ValidationError("unsupported discourse_state lifecycle")
+    if payload.get("attention_state") not in {
+        "foreground",
+        "background",
+        "dormant",
+    }:
+        raise ValidationError("unsupported discourse_state attention_state")
+    for field in ("participants", "head_event_refs", "source_event_refs"):
+        _require_payload_string_list(atom_type, payload, field)
+    if not payload.get("participants"):
+        raise ValidationError(
+            "discourse_state payload field participants must not be empty"
+        )
+    if not payload.get("source_event_refs"):
+        raise ValidationError(
+            "discourse_state payload field source_event_refs must not be empty"
+        )
+    bounds = {
+        "participants": 32,
+        "head_event_refs": 16,
+        "source_event_refs": 64,
+    }
+    for field, maximum in bounds.items():
+        values = payload.get(field) or []
+        if len(values) > maximum:
+            raise ValidationError(
+                f"discourse_state payload field {field} may contain at most "
+                f"{maximum} items"
+            )
+        if len(values) != len(set(values)):
+            raise ValidationError(
+                f"discourse_state payload field {field} must be unique"
+            )
+    _validate_state_entries(atom_type, payload, "shared_state")
+    _validate_state_entries(atom_type, payload, "private_state")
+    _validate_unresolved_items(atom_type, payload)
+
+
+def _validate_discourse_segment_payload(payload: Mapping[str, Any]) -> None:
+    if payload.get("profile") != "amos.discourse-segment.v1":
+        return
+    atom_type = "semantic"
+    _require_payload_fields(
+        atom_type,
+        payload,
+        (
+            "profile",
+            "summary",
+            "source_event_refs",
+            "generated_from_graph_version",
+            "standing",
+        ),
+    )
+    if not isinstance(payload.get("summary"), str):
+        raise ValidationError(
+            "semantic discourse-segment payload field summary must be a string"
+        )
+    _require_payload_string_list(atom_type, payload, "source_event_refs")
+    if not payload.get("source_event_refs"):
+        raise ValidationError(
+            "semantic discourse-segment source_event_refs must not be empty"
+        )
+    graph_version = payload.get("generated_from_graph_version")
+    if (
+        isinstance(graph_version, bool)
+        or not isinstance(graph_version, int)
+        or graph_version < 0
+    ):
+        raise ValidationError(
+            "semantic discourse-segment generated_from_graph_version must be "
+            "a non-negative integer"
+        )
+    if payload.get("standing") not in {
+        "testimony",
+        "interpretation",
+        "proposed",
+        "source_summary",
+    }:
+        raise ValidationError("unsupported semantic discourse-segment standing")
+
+
 def _require_agent_identity_types(atom_type: str, payload: Mapping[str, Any]) -> None:
     _require_payload_types(
         atom_type,
@@ -470,6 +782,15 @@ def validate_atom_payload(atom_type: str, payload: Mapping[str, Any]) -> None:
     if atom_type in {"covenant", "primal_guidance"}:
         _validate_constitutional_payload(atom_type, payload)
         return
+    if atom_type == "interaction_event":
+        _validate_interaction_event_payload(payload)
+        return
+    if atom_type == "discourse_thread":
+        _validate_discourse_thread_payload(payload)
+        return
+    if atom_type == "discourse_state":
+        _validate_discourse_state_payload(payload)
+        return
 
     if atom_type == "belief":
         _require_payload_alternative(
@@ -648,6 +969,7 @@ def validate_atom_payload(atom_type: str, payload: Mapping[str, Any]) -> None:
             )
         return
     if atom_type == "semantic":
+        _validate_discourse_segment_payload(payload)
         _require_payload_alternative(
             atom_type,
             payload,

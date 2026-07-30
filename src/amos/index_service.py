@@ -24,7 +24,7 @@ _RETRIEVAL_STOPWORDS = {
 }
 _REFERENCE_TOKEN = re.compile(
     r"^(?:atom|evt|evd|thread|cycle|repisode|curriculum|endogenous_work|"
-    r"kproject|cogito_project)_[a-z0-9_-]{8,}$"
+    r"kproject|agent_project)_[a-z0-9_-]{8,}$"
 )
 
 

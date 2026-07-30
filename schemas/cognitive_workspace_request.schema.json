@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/cognitive_workspace_request.schema.json",
+  "title": "AMOS cognitive workspace request",
+  "type": "object",
+  "required": [
+    "current_event_ref",
+    "conversation_id",
+    "requester",
+    "target_processor"
+  ],
+  "properties": {
+    "profile": { "const": "amos.cognitive-workspace-request.v1" },
+    "current_event_ref": { "type": "string", "minLength": 1 },
+    "conversation_id": { "type": "string", "minLength": 1 },
+    "scope": { "$ref": "scope.schema.json" },
+    "requester": { "type": "string", "minLength": 1 },
+    "target_processor": { "type": "string", "minLength": 1 },
+    "participant_refs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "operation_refs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "project_refs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "context_refs": {
+      "description": "Canonical records that must be projected exactly when visible to the requesting processor.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "token_or_byte_budget": {
+      "oneOf": [
+        { "type": "integer", "minimum": 1 },
+        { "type": "object" }
+      ]
+    },
+    "temporal_limit": { "type": "integer", "minimum": 2, "maximum": 64 },
+    "thread_limit": { "type": "integer", "minimum": 1, "maximum": 32 },
+    "prior_workspace_revision": { "type": ["object", "null"] },
+    "run_policy": { "type": "boolean" }
+  },
+  "additionalProperties": false
+}

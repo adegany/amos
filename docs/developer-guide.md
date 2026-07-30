@@ -86,6 +86,58 @@ POST /v1/atoms:commit
 Use stable idempotency keys for retried writes. Use `scope` to isolate projects,
 missions, tenants, runs, or agents.
 
+### Preserve interaction continuity in one canonical stream
+
+Append each visible or authorized private interaction with
+`POST /v1/memory-transactions:commit`. A transaction containing an
+`interaction_event` must include one matching `interaction_stream` head update:
+
+```json
+{
+  "profile": "amos.memory-transaction.v1",
+  "scope": {"tenant": "example", "conversation": "main"},
+  "actor": "service:interaction-gateway",
+  "idempotency_key": "interaction:message-42",
+  "atoms": [{
+    "id": "interaction:message-42",
+    "type": "interaction_event",
+    "payload": {
+      "profile": "amos.interaction-event.v1",
+      "conversation_id": "main",
+      "sequence": 42,
+      "actor_ref": "participant:human",
+      "role": "human",
+      "content": "Continue the earlier discussion.",
+      "occurred_at": "2026-07-29T12:00:00Z",
+      "in_reply_to": "interaction:message-41",
+      "visibility": "shared",
+      "source_ref": "evidence:message-42",
+      "thread_refs": []
+    }
+  }],
+  "head_updates": [{
+    "series_kind": "interaction_stream",
+    "series_id": "main",
+    "expected_head_ref": "interaction:message-41",
+    "expected_head_version": 41,
+    "new_head_ref": "interaction:message-42"
+  }]
+}
+```
+
+Read the current reference and version with `POST /v1/memory-heads:get`.
+Treat HTTP 409 as a stale append: refresh the head and rebuild a new
+transaction, unless replaying the exact idempotent request. Interaction events
+remain immutable and active; advancing the stream does not supersede history.
+
+Compile a bounded reasoner view with
+`POST /v1/cognitive-workspaces:compile`. Rebuild a disposable transcript with
+cursor-based `POST /v1/interaction-projections:compile`. Neither generated view
+is a second memory authority. Cognitive-workspace canonical records omit
+rebuildable index/vector and storage-maintenance fields; use exact atom APIs
+when those operational details, rather than cognitive content and authority,
+are the subject of inspection.
+
 ## 3. Capture Evidence Before Conclusions
 
 When possible, capture source events and evidence records before committing
@@ -138,7 +190,7 @@ POST /v1/proposals:ratify
   "proposal_ref": "atom_candidate",
   "adjudication_ref": "atom_adjudication",
   "expected_version": 1,
-  "idempotency_key": "cogito:ratify:atom_candidate:v1"
+  "idempotency_key": "example_agent:ratify:atom_candidate:v1"
 }
 ```
 
@@ -214,17 +266,17 @@ X-Request-ID: reasoning-cycle-42
 
 ```json
 {
-  "need": "continue the Cogito memory integration",
+  "need": "continue the agent memory integration",
   "purpose": "apply prior decisions and active constraints",
   "depth": "working_frame",
   "task_context": {
     "human_id": "human-42",
-    "project_id": "cogito",
+    "project_id": "memory-demo",
     "project_thread_id": "thread-17",
     "phase": "implementation"
   },
   "scope": {"tenant": "local"},
-  "requester": "agent:cogito",
+  "requester": "agent:example",
   "target_processor": "reasoner",
   "memory_mode": "operational_recall",
   "token_or_byte_budget": {"tokens": 1600}
@@ -272,8 +324,8 @@ X-Request-ID: reasoning-cycle-42-page-1
   "need": "the decision rationale",
   "purpose": "verify the active conclusion",
   "depth": "supporting",
-  "scope": {"project": "cogito"},
-  "requester": "agent:cogito",
+  "scope": {"project": "memory-demo"},
+  "requester": "agent:example",
   "target_processor": "reasoner",
   "token_or_byte_budget": {"tokens": 1200}
 }
@@ -290,11 +342,10 @@ scope, and access checks again while loading. An exact revision mismatch is a JS
 active frame and compile a new one. Do not silently append a page from a changed
 graph.
 
-Packet retrieval remains available for existing callers. Choosing between that
-legacy integration and demand-paged reasoning, maintaining the cycle-wide
-working-memory budget, replacing summaries with loaded detail, and rolling back
-application behavior are Cogito responsibilities. AMOS exposes both transport
-paths but does not switch application modes.
+Packet retrieval and demand-paged reasoning are independent caller-selected
+interfaces. Maintaining a cycle-wide working-memory budget and replacing
+summaries with loaded detail are client-runtime responsibilities. AMOS exposes
+both transport paths but does not switch application modes.
 
 ## 5. Use Attention Deliberately
 

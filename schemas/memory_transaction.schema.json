@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amos.local/schemas/memory_transaction.schema.json",
+  "title": "AMOS atomic memory evolution transaction",
+  "type": "object",
+  "properties": {
+    "profile": { "const": "amos.memory-transaction.v1" },
+    "actor": { "type": "string", "minLength": 1 },
+    "idempotency_key": { "type": "string", "minLength": 1 },
+    "scope": { "$ref": "scope.schema.json" },
+    "evidence": {
+      "type": "array",
+      "items": { "$ref": "source_event.schema.json" }
+    },
+    "atoms": {
+      "type": "array",
+      "items": { "$ref": "memory_atom.schema.json" }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["source_ref", "target_ref", "relation"],
+        "properties": {
+          "edge_id": { "type": "string", "minLength": 1 },
+          "source_ref": { "type": "string", "minLength": 1 },
+          "target_ref": { "type": "string", "minLength": 1 },
+          "relation": { "type": "string", "minLength": 1 },
+          "evidence_refs": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "uniqueItems": true
+          },
+          "confidence": {
+            "oneOf": [
+              { "type": "number", "minimum": 0, "maximum": 1 },
+              { "type": "object" }
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "head_updates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "series_kind",
+          "series_id",
+          "new_head_ref",
+          "expected_head_ref",
+          "expected_head_version"
+        ],
+        "properties": {
+          "series_kind": {
+            "enum": ["discourse_thread", "interaction_stream"]
+          },
+          "series_id": { "type": "string", "minLength": 1 },
+          "new_head_ref": { "type": "string", "minLength": 1 },
+          "expected_head_ref": { "type": ["string", "null"] },
+          "expected_head_version": { "type": "integer", "minimum": 0 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "receipt_refs": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "authorization_context": { "type": "object" }
+  },
+  "additionalProperties": false
+}

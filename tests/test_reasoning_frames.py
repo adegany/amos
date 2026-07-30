@@ -195,7 +195,7 @@ def test_commitment_history_does_not_absorb_the_actor_identity_graph(amos):
             "id": "commitment_actor_hub",
             "type": "self_model",
             "payload": {
-                "subject_agent": "ent:agent:cogito",
+                "subject_agent": "ent:agent:example_agent",
                 "statement": "The actor identity hub owns many unrelated memories.",
             },
         }

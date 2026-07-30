@@ -458,7 +458,7 @@ class GovernanceService:
         authorization_context: Mapping[str, Any],
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Apply Cogito's guarded non-positive or unresolved disposition."""
+        """Apply the client agent's guarded non-positive or unresolved disposition."""
 
         proposal_ref = str(proposal_ref or "").strip()
         adjudication_ref = str(adjudication_ref or "").strip()
