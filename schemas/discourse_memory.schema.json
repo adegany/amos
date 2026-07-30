@@ -5,10 +5,26 @@
   "$defs": {
     "StateEntry": {
       "type": "object",
-      "required": ["key", "value", "basis_refs"],
+      "required": [
+        "key",
+        "value",
+        "state_class",
+        "authority",
+        "basis_refs"
+      ],
       "properties": {
         "key": { "type": "string", "minLength": 1, "maxLength": 128 },
         "value": {},
+        "state_class": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "authority": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
         "basis_refs": {
           "type": "array",
           "maxItems": 64,
@@ -107,7 +123,7 @@
         "unresolved_items"
       ],
       "properties": {
-        "profile": { "const": "amos.discourse-thread-state.v1" },
+        "profile": { "const": "amos.discourse-thread-state.v2" },
         "thread_id": { "type": "string", "minLength": 1 },
         "revision": { "type": "integer", "minimum": 1 },
         "lifecycle": { "enum": ["open", "closed"] },

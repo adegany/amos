@@ -1243,7 +1243,7 @@ Acceptance status:
 | Schema | Implemented | Envelope fields are excluded from payloads; required fields, JSON Schema property types, and score bounds are enforced by dependency-free runtime validators and tests. |
 | Journal | Implemented | Canonical graph mutations append checksummed `EventJournalEntry` records with authorization and expected-version context. |
 | Projection | Implemented | Strong mutations append their event and project graph changes in one SQLite transaction. |
-| Interaction continuity | Implemented | Per-conversation interaction-stream CAS binds immutable event order; discourse-state heads advance independently; both indexes rebuild from the retained journal. |
+| Interaction continuity | Implemented | Per-conversation interaction-stream CAS binds immutable event order; v2 discourse-state entries retain caller-defined class/authority provenance; heads advance independently; both indexes rebuild from the retained journal; v2 interaction projections can include bounded access-filtered typed linked lineage without semantic interpretation. |
 | Replay | Partial | The graph is reconstructable from the full retained journal. Snapshot-plus-tail recovery and journal segment compaction are planned. |
 | Retrieval and attention | Implemented | Packets expose graph version, provenance, omissions, degradation, score components, attention trace, bounded candidate selection, and scoped edge activation. |
 | Self-awareness and agentic recall | Implemented | Structural self views, responsibility attribution, counterevidence, and generated self-narrative expiry are tested. |

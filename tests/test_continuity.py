@@ -87,7 +87,7 @@ def thread_state(
         "id": atom_id,
         "type": "discourse_state",
         "payload": {
-            "profile": "amos.discourse-thread-state.v1",
+            "profile": "amos.discourse-thread-state.v2",
             "thread_id": thread_id,
             "revision": revision,
             "lifecycle": "open",
@@ -100,6 +100,8 @@ def thread_state(
                 {
                     "key": "protocol",
                     "value": "The participant supplies bounded questions",
+                    "state_class": "reported_fact",
+                    "authority": "discourse",
                     "basis_refs": [event_refs[0]],
                 }
             ],
@@ -107,6 +109,8 @@ def thread_state(
                 {
                     "key": "concealed_value",
                     "value": secret,
+                    "state_class": "private_secret",
+                    "authority": "discourse",
                     "basis_refs": [event_refs[-1]],
                 }
             ],
@@ -313,7 +317,7 @@ def test_atomic_interaction_thread_head_and_workspace_visibility(amos):
         requester="human:participant",
         target_processor="participant-ui",
     )
-    assert projection["profile"] == "amos.interaction-projection.v1"
+    assert projection["profile"] == "amos.interaction-projection.v2"
     assert [item["content"] for item in projection["events"]] == [
         r"Let \(x \in \mathbb{R}\) and begin.",
         "Ready.",
@@ -584,6 +588,104 @@ def test_interaction_stream_head_enforces_total_order_without_supersession(amos)
     assert final_page["has_more"] is False
 
 
+def test_interaction_projection_can_include_typed_linked_lineage(amos):
+    response = interaction(
+        "event_linked_response",
+        sequence=1,
+        role="agent",
+        content="I am initiating the selected operation.",
+    )
+    commitment = {
+        "id": "commitment_linked",
+        "type": "commitment",
+        "payload": {
+            "agent_id": "agent:participant",
+            "description": "A typed caller operation",
+            "promised_action": {
+                "profile": "example.operation.v1",
+                "kind": "example",
+            },
+            "commitment_status": "pending_authorized_execution",
+            "source_event_ref": "event_linked_response",
+        },
+    }
+    outcome = {
+        "id": "outcome_linked",
+        "type": "action_outcome",
+        "payload": {
+            "agent_id": "agent:participant",
+            "action_ref": "commitment_linked",
+            "status": "completed",
+            "correction": None,
+            "limitation": None,
+        },
+    }
+    amos.commit_memory_transaction(
+        scope=SCOPE,
+        idempotency_key="linked-operation-lineage",
+        atoms=[response, commitment, outcome],
+        edges=[
+            {
+                "source_ref": "event_linked_response",
+                "target_ref": "commitment_linked",
+                "relation": "rel:supports",
+            },
+            {
+                "source_ref": "commitment_linked",
+                "target_ref": "outcome_linked",
+                "relation": "rel:produced_outcome",
+            },
+        ],
+        head_updates=[
+            interaction_stream_head(
+                "event_linked_response",
+                expected_head_ref=None,
+                expected_head_version=0,
+            )
+        ],
+    )
+
+    projection = amos.compile_interaction_projection(
+        conversation_id="main",
+        scope=SCOPE,
+        requester="human:participant",
+        target_processor="participant-ui",
+        linked_atom_types=["commitment", "action_outcome"],
+        linked_depth=2,
+    )
+
+    linked = projection["events"][0]["linked_records"]
+    assert [
+        (
+            item["depth"],
+            item["relation"],
+            item["record"]["id"],
+            item["record"]["type"],
+        )
+        for item in linked
+    ] == [
+        (1, "rel:supports", "commitment_linked", "commitment"),
+        (
+            2,
+            "rel:produced_outcome",
+            "outcome_linked",
+            "action_outcome",
+        ),
+    ]
+
+
+def test_interaction_projection_rejects_half_bound_link_requests(amos):
+    with pytest.raises(
+        ValidationError,
+        match="linked_atom_types and linked_depth must be supplied together",
+    ):
+        amos.compile_interaction_projection(
+            conversation_id="main",
+            scope=SCOPE,
+            linked_atom_types=["commitment"],
+        )
+
+
 def test_private_state_requires_restricted_visibility(amos):
     with pytest.raises(ValidationError, match="restricted access_policy"):
         amos.commit_memory_transaction(
@@ -679,7 +781,7 @@ def test_http_memory_transaction_workspace_and_cas_conflict(tmp_path):
         projection = post(
             "/v1/interaction-projections:compile",
             {
-                "profile": "amos.interaction-projection-request.v1",
+                "profile": "amos.interaction-projection-request.v2",
                 "conversation_id": "main",
                 "scope": SCOPE,
                 "requester": "human:participant",

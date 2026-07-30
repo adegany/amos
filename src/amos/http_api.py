@@ -223,11 +223,11 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 profile = request.pop("profile", None)
                 if profile not in {
                     None,
-                    "amos.interaction-projection-request.v1",
+                    "amos.interaction-projection-request.v2",
                 }:
                     raise ValidationError(
                         "interaction projection request profile must be "
-                        "'amos.interaction-projection-request.v1'"
+                        "'amos.interaction-projection-request.v2'"
                     )
                 return self._write_json(
                     amos.compile_interaction_projection(**request)

@@ -329,7 +329,13 @@ def _validate_state_entries(
             raise ValidationError(
                 f"{atom_type} payload field {field}[{index}] must be an object"
             )
-        if set(raw) != {"key", "value", "basis_refs"}:
+        if set(raw) != {
+            "key",
+            "value",
+            "state_class",
+            "authority",
+            "basis_refs",
+        }:
             raise ValidationError(
                 f"{atom_type} payload field {field}[{index}] fields do not "
                 "match the profile"
@@ -354,6 +360,18 @@ def _validate_state_entries(
                 f"{atom_type} payload field {field}[{index}].value is required"
             )
         ensure_jsonable(raw["value"])
+        for metadata_field in ("state_class", "authority"):
+            metadata_value = raw.get(metadata_field)
+            if not isinstance(metadata_value, str) or not metadata_value.strip():
+                raise ValidationError(
+                    f"{atom_type} payload field {field}[{index}]."
+                    f"{metadata_field} must be a non-empty string"
+                )
+            if len(metadata_value) > 128:
+                raise ValidationError(
+                    f"{atom_type} payload field {field}[{index}]."
+                    f"{metadata_field} is too long"
+                )
         refs = raw.get("basis_refs", [])
         if (
             not isinstance(refs, list)
@@ -491,7 +509,7 @@ def _validate_discourse_thread_payload(payload: Mapping[str, Any]) -> None:
 
 def _validate_discourse_state_payload(payload: Mapping[str, Any]) -> None:
     atom_type = "discourse_state"
-    _require_exact_profile(atom_type, payload, "amos.discourse-thread-state.v1")
+    _require_exact_profile(atom_type, payload, "amos.discourse-thread-state.v2")
     _require_payload_fields(
         atom_type,
         payload,

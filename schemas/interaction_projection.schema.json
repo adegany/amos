@@ -14,7 +14,7 @@
       ],
       "properties": {
         "profile": {
-          "const": "amos.interaction-projection-request.v1"
+          "const": "amos.interaction-projection-request.v2"
         },
         "conversation_id": {
           "type": "string",
@@ -39,6 +39,25 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 5000
+        },
+        "linked_atom_types": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "linked_depth": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "linked_limit_per_event": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 128
         }
       },
       "additionalProperties": false
@@ -62,7 +81,7 @@
           "const": "compiled"
         },
         "profile": {
-          "const": "amos.interaction-projection.v1"
+          "const": "amos.interaction-projection.v2"
         },
         "schema_version": {
           "type": "string"
@@ -86,7 +105,8 @@
               "occurred_at",
               "visibility",
               "thread_refs",
-              "source_ref"
+              "source_ref",
+              "linked_records"
             ],
             "properties": {
               "alias": {
@@ -131,6 +151,37 @@
               },
               "source_ref": {
                 "type": "string"
+              },
+              "linked_records": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "depth",
+                    "source_ref",
+                    "relation",
+                    "record"
+                  ],
+                  "properties": {
+                    "depth": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 2
+                    },
+                    "source_ref": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "relation": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "record": {
+                      "type": "object"
+                    }
+                  },
+                  "additionalProperties": false
+                }
               }
             },
             "additionalProperties": false

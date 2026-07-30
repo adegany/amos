@@ -586,6 +586,9 @@ class Amos:
         target_processor: str = "participant-ui",
         after_sequence: int = 0,
         limit: int = 1000,
+        linked_atom_types: Sequence[str] | None = None,
+        linked_depth: int = 0,
+        linked_limit_per_event: int = 32,
     ) -> dict[str, Any]:
         return self.continuity.compile_interaction_projection(
             conversation_id=conversation_id,
@@ -594,6 +597,9 @@ class Amos:
             target_processor=target_processor,
             after_sequence=after_sequence,
             limit=limit,
+            linked_atom_types=linked_atom_types,
+            linked_depth=linked_depth,
+            linked_limit_per_event=linked_limit_per_event,
         )
 
     def get_memory_head(

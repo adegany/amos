@@ -138,6 +138,18 @@ rebuildable index/vector and storage-maintenance fields; use exact atom APIs
 when those operational details, rather than cognitive content and authority,
 are the subject of inspection.
 
+`amos.discourse-thread-state.v2` requires every shared/private state entry to
+carry `state_class`, `authority`, and `basis_refs`. The first two values are
+caller-defined bounded labels; AMOS preserves and exposes them without
+assigning domain semantics.
+
+`amos.interaction-projection-request.v2` may include
+`linked_atom_types`, `linked_depth`, and `linked_limit_per_event`. The type list
+and depth must be supplied together, depth is at most two, and all returned
+records pass ordinary scope and access checks. Use this only to rebuild a
+client's disposable typed projections from canonical graph lineage. The API
+does not infer which links or record types matter to the application.
+
 ## 3. Capture Evidence Before Conclusions
 
 When possible, capture source events and evidence records before committing

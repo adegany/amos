@@ -33,7 +33,7 @@ class ContinuityService:
 
     TRANSACTION_PROFILE = "amos.memory-transaction.v1"
     WORKSPACE_PROFILE = "amos.cognitive-workspace.v1"
-    INTERACTION_PROJECTION_PROFILE = "amos.interaction-projection.v1"
+    INTERACTION_PROJECTION_PROFILE = "amos.interaction-projection.v2"
     MEMORY_HEAD_PROFILE = "amos.memory-head.v1"
     SUPPORTED_HEAD_KINDS: ClassVar[frozenset[str]] = frozenset(
         {"discourse_thread", "interaction_stream"}
@@ -1236,6 +1236,9 @@ class ContinuityService:
         target_processor: str = "participant-ui",
         after_sequence: int = 0,
         limit: int = 1000,
+        linked_atom_types: Sequence[str] | None = None,
+        linked_depth: int = 0,
+        linked_limit_per_event: int = 32,
     ) -> dict[str, Any]:
         """Project canonical interaction history for a disposable read model.
 
@@ -1263,6 +1266,32 @@ class ContinuityService:
             or not 1 <= limit <= 5000
         ):
             raise ValidationError("limit must be an integer in [1, 5000]")
+        requested_linked_types: tuple[str, ...] = tuple(
+            dict.fromkeys(
+                self._required_text(value, "linked_atom_types item")
+                for value in (linked_atom_types or ())
+            )
+        )
+        if len(requested_linked_types) > 16:
+            raise ValidationError("linked_atom_types may contain at most 16 items")
+        if (
+            isinstance(linked_depth, bool)
+            or not isinstance(linked_depth, int)
+            or not 0 <= linked_depth <= 2
+        ):
+            raise ValidationError("linked_depth must be an integer in [0, 2]")
+        if bool(requested_linked_types) != bool(linked_depth):
+            raise ValidationError(
+                "linked_atom_types and linked_depth must be supplied together"
+            )
+        if (
+            isinstance(linked_limit_per_event, bool)
+            or not isinstance(linked_limit_per_event, int)
+            or not 1 <= linked_limit_per_event <= 128
+        ):
+            raise ValidationError(
+                "linked_limit_per_event must be an integer in [1, 128]"
+            )
         request_scope = normalize_scope(scope)
         self._mark_foreground_activity(requester)
         selected = [
@@ -1278,15 +1307,27 @@ class ContinuityService:
         ][: limit + 1]
         has_more = len(selected) > limit
         events = selected[:limit]
+        projected_events: list[dict[str, Any]] = []
+        for index, atom in enumerate(events):
+            projected = self._event_projection(
+                atom, alias=f"event_{index + 1}"
+            )
+            projected["linked_records"] = self._linked_record_projection(
+                event_ref=str(atom["id"]),
+                scope=request_scope,
+                requester=requester,
+                target_processor=target_processor,
+                atom_types=set(requested_linked_types),
+                depth=linked_depth,
+                limit=linked_limit_per_event,
+            )
+            projected_events.append(projected)
         return {
             "status": "compiled",
             "profile": self.INTERACTION_PROJECTION_PROFILE,
             "schema_version": SCHEMA_VERSION,
             "conversation_id": conversation_id,
-            "events": [
-                self._event_projection(atom, alias=f"event_{index + 1}")
-                for index, atom in enumerate(events)
-            ],
+            "events": projected_events,
             "after_sequence": after_sequence,
             "next_after_sequence": (
                 int((events[-1].get("payload") or {}).get("sequence", 0))
@@ -1297,6 +1338,79 @@ class ContinuityService:
             "revision": self.store.memory_revision(),
             "generated_at": utc_now(),
         }
+
+    def _linked_record_projection(
+        self,
+        *,
+        event_ref: str,
+        scope: Mapping[str, Any],
+        requester: str,
+        target_processor: str,
+        atom_types: set[str],
+        depth: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Return explicitly requested, access-filtered graph descendants.
+
+        The traversal follows only outgoing canonical edges and only through
+        atom types named by the caller. It performs no ranking, semantic
+        classification, or operation-specific interpretation.
+        """
+
+        if not atom_types or depth < 1:
+            return []
+        frontier = [event_ref]
+        seen = {event_ref}
+        projected: list[dict[str, Any]] = []
+        for hop in range(1, depth + 1):
+            next_frontier: list[str] = []
+            edges = sorted(
+                self.store.list_edges_for_refs(frontier),
+                key=lambda item: (
+                    str(item.get("source_ref") or ""),
+                    str(item.get("relation") or ""),
+                    str(item.get("target_ref") or ""),
+                ),
+            )
+            frontier_set = set(frontier)
+            for edge in edges:
+                source_ref = str(edge.get("source_ref") or "")
+                target_ref = str(edge.get("target_ref") or "")
+                if (
+                    source_ref not in frontier_set
+                    or not target_ref
+                    or target_ref in seen
+                ):
+                    continue
+                target = self.store.get_atom(target_ref)
+                if (
+                    target is None
+                    or target.get("deleted")
+                    or str(target.get("type") or "") not in atom_types
+                    or not scope_visible(target.get("scope") or {}, scope)
+                    or not access_visible(
+                        target.get("access_policy") or {},
+                        requester,
+                        target_processor,
+                    )
+                ):
+                    continue
+                seen.add(target_ref)
+                next_frontier.append(target_ref)
+                projected.append(
+                    {
+                        "depth": hop,
+                        "source_ref": source_ref,
+                        "relation": str(edge.get("relation") or ""),
+                        "record": self._canonical_context_projection(target),
+                    }
+                )
+                if len(projected) >= limit:
+                    return projected
+            frontier = next_frontier
+            if not frontier:
+                break
+        return projected
 
     def get_memory_head(
         self,

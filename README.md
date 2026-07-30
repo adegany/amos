@@ -87,7 +87,10 @@ Applications can keep short- and long-horizon conversational memory in the
 same canonical substrate. `interaction_event` atoms preserve exact immutable
 utterances; `discourse_thread` roots provide stable discussion identity; and
 append-only `discourse_state` revisions retain shared state, access-controlled
-private declarative state, unresolved items, attention, and lifecycle.
+private declarative state, unresolved items, attention, and lifecycle. The v2
+state profile requires each state entry to carry caller-defined `state_class`
+and `authority` strings plus exact basis refs. AMOS validates these as bounded
+provenance metadata but does not interpret their application semantics.
 
 `POST /v1/memory-transactions:commit` atomically appends evidence, atoms,
 relations, and compare-and-swap head advances under one idempotency key. The
@@ -115,6 +118,10 @@ the model-facing projection.
 version without exposing atom content. `POST
 /v1/interaction-projections:compile` returns an ordered, access-filtered event
 projection suitable for rebuilding a disposable transcript or delivery cache.
+The v2 request may additionally name a bounded set of atom types and an
+outgoing traversal depth of one or two. AMOS then includes only visible linked
+canonical records of those types. This is typed graph projection, not ranking
+or application-specific semantic classification.
 
 ## Why AMOS?
 

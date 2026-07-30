@@ -4884,6 +4884,8 @@ discourse_thread:
 
 discourse_state head:
   append-only interpreted state revision
+  each state entry carries caller-defined state class and authority metadata
+  plus exact basis references
   advancing this head supersedes only its previous state revision
 ```
 
@@ -4897,10 +4899,13 @@ A cognitive workspace is a generated, revision-bound view. It protects the
 current event, immediate reply chain, and directly linked visible discourse
 heads before adding bounded canonical and associative context. An interaction
 projection is an ordered, access-filtered read model for reconstructing
-disposable delivery caches. Explicit canonical context includes source content
-and authority metadata but excludes rebuildable search indexes, vectors,
-decay bookkeeping, and revision-history internals. Neither view becomes
-canonical memory.
+disposable delivery caches. Its v2 contract can optionally include bounded,
+access-filtered outgoing linked records of atom types explicitly named by the
+caller. The traversal performs no ranking or application-specific semantic
+classification. Explicit canonical context includes source content and
+authority metadata but excludes rebuildable search indexes, vectors, decay
+bookkeeping, and revision-history internals. Neither view becomes canonical
+memory.
 
 The head table is derived from committed journal transactions and must remain
 fully rebuildable. Access-filtered head lookup exposes a reference and version,
