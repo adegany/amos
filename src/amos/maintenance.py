@@ -476,6 +476,23 @@ def derived_memory_proposal(
     )
 
 
+def context_compaction_source_digest(
+    atoms: Sequence[Mapping[str, Any]],
+) -> str:
+    """Bind a compact projection to immutable source content and evidence."""
+
+    return digest(
+        [
+            {
+                "id": str(atom.get("id") or ""),
+                "payload": dict(atom.get("payload") or {}),
+                "evidence_refs": list(atom.get("evidence_refs") or []),
+            }
+            for atom in atoms
+        ]
+    )
+
+
 class GenericMaintenanceProcessor:
     """Proposal adapter around the built-in deterministic SMP."""
 

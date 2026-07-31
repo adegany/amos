@@ -7,7 +7,12 @@ import urllib.request
 
 import pytest
 
-from amos import CASConflict, ValidationError
+from amos import (
+    CASConflict,
+    CONTEXT_COMPACTION_PROFILE,
+    ValidationError,
+    context_compaction_source_digest,
+)
 from amos.http_api import AmosHTTPServer
 
 SCOPE = {"tenant": "continuity-test", "conversation": "main"}
@@ -254,7 +259,7 @@ def test_atomic_interaction_thread_head_and_workspace_visibility(amos):
         requester="agent:participant",
         target_processor="primary-reasoner",
         participant_refs=["human:participant", "agent:participant"],
-        token_or_byte_budget={"bytes": 48_000},
+        token_or_byte_budget={"bytes": 48_000, "items": 512},
     )
     assert workspace["profile"] == "amos.cognitive-workspace.v1"
     assert [item["atom_ref"] for item in workspace["temporal_context"]] == [
@@ -264,6 +269,22 @@ def test_atomic_interaction_thread_head_and_workspace_visibility(amos):
     ]
     assert workspace["thread_heads"][0]["thread_id"] == "thread_open_1"
     assert workspace["thread_heads"][0]["private_state"][0]["value"] == "orchid"
+    assert workspace["budget"]["limit_items"] == 512
+    assert workspace["budget"]["used_items"] <= 512
+
+    with pytest.raises(
+        ValidationError,
+        match="too small for protected cognitive workspace context",
+    ):
+        amos.compile_cognitive_workspace(
+            current_event_ref="event_human_3",
+            conversation_id="main",
+            scope=SCOPE,
+            requester="agent:participant",
+            target_processor="primary-reasoner",
+            participant_refs=["human:participant", "agent:participant"],
+            token_or_byte_budget={"bytes": 48_000, "items": 1},
+        )
 
     contextual = amos.compile_cognitive_workspace(
         current_event_ref="event_human_3",
@@ -335,6 +356,155 @@ def test_atomic_interaction_thread_head_and_workspace_visibility(amos):
     assert [item["atom_ref"] for item in tail["events"]] == [
         "event_human_3"
     ]
+
+
+def test_workspace_uses_verified_rolling_compaction_before_optional_shedding(amos):
+    interactions = []
+    previous = None
+    for sequence in range(1, 13):
+        atom = interaction(
+            f"compact_event_{sequence}",
+            sequence=sequence,
+            role="human" if sequence % 2 else "agent",
+            content=f"Canonical interaction {sequence} " + ("detail " * 12),
+            in_reply_to=previous,
+        )
+        atom["scope"] = dict(SCOPE)
+        committed = amos.commit_atom(
+            atom,
+            actor="continuity-test",
+            idempotency_key=f"compact-event-{sequence}",
+        )["atom"]
+        interactions.append(committed)
+        previous = committed["id"]
+
+    covered = interactions[:8]
+    source_refs = [str(atom["id"]) for atom in covered]
+    summary = amos.commit_atom(
+        {
+            "id": "compact_rolling_summary",
+            "type": "semantic",
+            "payload": {
+                "summary": "The first eight exchanges established the durable context.",
+                "epistemic_status": "derived_summary_not_adopted_truth",
+                "maintenance_source_refs": source_refs,
+                "context_compaction": {
+                    "profile": CONTEXT_COMPACTION_PROFILE,
+                    "mode": "rolling",
+                    "partition": {
+                        "kind": "interaction_stream",
+                        "key": "main",
+                    },
+                    "coverage": {
+                        "from_sequence": 1,
+                        "through_sequence": 8,
+                        "through_ref": "compact_event_8",
+                        "source_count": 8,
+                        "source_digest": context_compaction_source_digest(
+                            covered
+                        ),
+                        "raw_sources_retained": True,
+                    },
+                    "source_refs": source_refs,
+                    "facets": {
+                        "open_questions": ["What follows from the established context?"]
+                    },
+                },
+            },
+            "scope": dict(SCOPE),
+        },
+        actor="continuity-test",
+        idempotency_key="compact-rolling-summary",
+    )["atom"]
+    invalid_source_refs = [
+        str(atom["id"]) for atom in interactions[:9]
+    ]
+    amos.commit_atom(
+        {
+            "id": "compact_rolling_summary_invalid",
+            "type": "semantic",
+            "payload": {
+                "summary": "This newer projection has an invalid source binding.",
+                "maintenance_source_refs": invalid_source_refs,
+                "context_compaction": {
+                    "profile": CONTEXT_COMPACTION_PROFILE,
+                    "mode": "rolling",
+                    "partition": {
+                        "kind": "interaction_stream",
+                        "key": "main",
+                    },
+                    "coverage": {
+                        "from_sequence": 1,
+                        "through_sequence": 9,
+                        "through_ref": "compact_event_9",
+                        "source_count": 9,
+                        "source_digest": "invalid-source-digest",
+                        "raw_sources_retained": True,
+                    },
+                    "source_refs": invalid_source_refs,
+                    "facets": {},
+                },
+            },
+            "scope": dict(SCOPE),
+        },
+        actor="continuity-test",
+        idempotency_key="compact-rolling-summary-invalid",
+    )
+
+    full = amos.compile_cognitive_workspace(
+        current_event_ref="compact_event_12",
+        conversation_id="main",
+        scope=SCOPE,
+        requester="agent:participant",
+        target_processor="primary-reasoner",
+        token_or_byte_budget={"bytes": 48_000, "items": 512},
+        temporal_limit=12,
+        recent_event_floor=4,
+    )
+    assert full["compacted_context"][0]["atom_ref"] == summary["id"]
+    assert full["compacted_context"][0]["epistemic_status"] == (
+        "derived_summary_not_adopted_truth"
+    )
+    assert full["compacted_context"][0]["coverage"]["through_sequence"] == 8
+    assert any(
+        item["reason"] == "compaction_source_digest_mismatch"
+        for item in full["omissions"]
+    )
+
+    tight = amos.compile_cognitive_workspace(
+        current_event_ref="compact_event_12",
+        conversation_id="main",
+        scope=SCOPE,
+        requester="agent:participant",
+        target_processor="primary-reasoner",
+        token_or_byte_budget={"bytes": 48_000, "items": 80},
+        temporal_limit=12,
+        recent_event_floor=4,
+    )
+    assert [item["atom_ref"] for item in tight["temporal_context"]] == [
+        "compact_event_9",
+        "compact_event_10",
+        "compact_event_11",
+        "compact_event_12",
+    ]
+    assert tight["current_event"]["atom_ref"] == "compact_event_12"
+    assert tight["compacted_context"][0]["atom_ref"] == summary["id"]
+    assert tight["budget"]["used_items"] <= 80
+    assert any(
+        item["reason"] == "covered_temporal_context_compacted"
+        for item in tight["omissions"]
+    )
+    assert all(
+        amos.store.get_atom(ref)["lifecycle_state"] == "active"
+        for ref in source_refs
+    )
+    summarizes = [
+        edge
+        for edge in amos.store.list_edges_for_refs([summary["id"], *source_refs])
+        if edge["source_ref"] == summary["id"]
+        and edge["relation"] == "rel:summarizes"
+    ]
+    assert {edge["target_ref"] for edge in summarizes} == set(source_refs)
 
 
 def test_head_cas_is_atomic_idempotent_and_rebuildable(amos):

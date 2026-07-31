@@ -319,6 +319,13 @@ class GraphService:
         for ref in _structured_ref_list(payload.get("source_refs")):
             add(atom_id, ref, "rel:derived_from")
 
+        context_compaction = payload.get("context_compaction")
+        if isinstance(context_compaction, Mapping):
+            for ref in _structured_ref_list(
+                context_compaction.get("source_refs")
+            ):
+                add(atom_id, ref, "rel:summarizes")
+
         for ref in _structured_ref_list(payload.get("memory_references")):
             add(atom_id, ref, "rel:uses")
 

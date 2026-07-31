@@ -433,6 +433,16 @@ def test_page_descriptor_is_bound_to_frame_revision_and_budget(amos):
     assert frame["budget"]["used_bytes"] == _canonical_size(frame)
     assert frame["budget"]["used_bytes"] <= frame["budget"]["limit_bytes"]
 
+    item_bounded = amos.compile_memory_frame(
+        need="paged memory history active conclusion",
+        purpose="inspect the complete decision history",
+        token_or_byte_budget={"tokens": 4000, "items": 64},
+        run_policy=False,
+    )
+    assert item_bounded["budget"]["limit_items"] == 64
+    assert item_bounded["budget"]["used_items"] <= 64
+    assert item_bounded["budget"]["used_bytes"] <= item_bounded["budget"]["limit_bytes"]
+
     page = amos.load_memory_page(
         frame_id=frame["frame_id"],
         revision=frame["revision"],

@@ -177,6 +177,7 @@ class ReasoningFrameService:
                 target_processor=target_processor,
                 memory_mode=memory_mode,
                 byte_budget=budget["bytes"],
+                item_budget=budget.get("items"),
                 revision=revision,
             )
             current = self.store.memory_revision()
@@ -313,6 +314,7 @@ class ReasoningFrameService:
                 budget_omitted=budget_omitted,
                 byte_budget=budget["bytes"],
                 token_limit=budget.get("tokens"),
+                item_limit=budget.get("items"),
             )
 
         empty_page = self._page_payload(
@@ -328,14 +330,26 @@ class ReasoningFrameService:
             budget_omitted=len(units),
             byte_budget=budget["bytes"],
             token_limit=budget.get("tokens"),
+            item_limit=budget.get("items"),
         )
-        if self._json_bytes(self._finalize_token_estimate(empty_page)) > budget["bytes"]:
+        if not self._fits_budget(
+            self._finalize_token_estimate(empty_page),
+            byte_budget=budget["bytes"],
+            item_budget=budget.get("items"),
+        ):
             raise ValidationError(
                 "token_or_byte_budget is too small for the reasoning page envelope"
             )
 
         page = self._finalize_token_estimate(build_page())
-        while self._json_bytes(page) > budget["bytes"] and selected_units:
+        while (
+            not self._fits_budget(
+                page,
+                byte_budget=budget["bytes"],
+                item_budget=budget.get("items"),
+            )
+            and selected_units
+        ):
             current = selected_units[-1]
             mode = str((current.get("compression") or {}).get("mode") or "none")
             if mode == "none":
@@ -348,7 +362,11 @@ class ReasoningFrameService:
                 selected_units.pop()
                 budget_omitted += 1
             page = self._finalize_token_estimate(build_page())
-        if self._json_bytes(page) > budget["bytes"]:
+        if not self._fits_budget(
+            page,
+            byte_budget=budget["bytes"],
+            item_budget=budget.get("items"),
+        ):
             raise ValidationError(
                 "token_or_byte_budget is too small for the reasoning page envelope"
             )
@@ -373,6 +391,7 @@ class ReasoningFrameService:
         budget_omitted: int,
         byte_budget: int,
         token_limit: int | None,
+        item_limit: int | None,
     ) -> dict[str, Any]:
         sequence = sorted(
             [step for unit in units for step in unit.get("sequence", [])],
@@ -444,8 +463,10 @@ class ReasoningFrameService:
             "budget": {
                 "limit_bytes": byte_budget,
                 "limit_tokens": token_limit,
+                "limit_items": item_limit,
                 "used_bytes": 0,
                 "estimated_tokens": 0,
+                "used_items": 0,
             },
             "provenance": {
                 "store": getattr(self.store, "backend_name", "unknown"),
@@ -469,6 +490,7 @@ class ReasoningFrameService:
         target_processor: str,
         memory_mode: str,
         byte_budget: int,
+        item_budget: int | None,
         revision: Mapping[str, Any],
     ) -> dict[str, Any]:
         work_budget = self._reasoning_work_budget(byte_budget)
@@ -525,7 +547,10 @@ class ReasoningFrameService:
             "requester": requester,
             "target_processor": target_processor,
             "memory_mode": memory_mode,
-            "token_or_byte_budget": {"bytes": byte_budget},
+            "token_or_byte_budget": {
+                "bytes": byte_budget,
+                **({"items": item_budget} if item_budget is not None else {}),
+            },
         }
         # The complete request participates in the stable frame identity, but
         # echoing it into the response spends the caller's reasoning-context
@@ -538,7 +563,10 @@ class ReasoningFrameService:
             "depth": depth,
             "requester": requester,
             "target_processor": target_processor,
-            "token_or_byte_budget": {"bytes": byte_budget},
+            "token_or_byte_budget": {
+                "bytes": byte_budget,
+                **({"items": item_budget} if item_budget is not None else {}),
+            },
         }
         frame_id = stable_id(
             "frame",
@@ -596,9 +624,14 @@ class ReasoningFrameService:
                 seed_count=len(seeds),
                 coherent_unit_count=len(units),
                 byte_budget=byte_budget,
+                item_budget=item_budget,
             )
 
-        if self._json_bytes(self._finalize_token_estimate(build_frame())) > byte_budget:
+        if not self._fits_budget(
+            self._finalize_token_estimate(build_frame()),
+            byte_budget=byte_budget,
+            item_budget=item_budget,
+        ):
             raise ValidationError(
                 "token_or_byte_budget is too small for the reasoning frame envelope"
             )
@@ -649,11 +682,10 @@ class ReasoningFrameService:
                     ):
                         page_index.append(reserve_descriptor)
                         reserved = True
-                    fits = (
-                        self._json_bytes(
-                            self._finalize_token_estimate(build_frame())
-                        )
-                        <= byte_budget
+                    fits = self._fits_budget(
+                        self._finalize_token_estimate(build_frame()),
+                        byte_budget=byte_budget,
+                        item_budget=item_budget,
                     )
                     if reserved:
                         page_index.pop()
@@ -670,7 +702,11 @@ class ReasoningFrameService:
 
             omitted_unit_count += 1
             page_index.append(descriptor)
-            if self._json_bytes(self._finalize_token_estimate(build_frame())) <= byte_budget:
+            if self._fits_budget(
+                self._finalize_token_estimate(build_frame()),
+                byte_budget=byte_budget,
+                item_budget=item_budget,
+            ):
                 continue
             page_index.pop()
             omitted_descriptor_count += 1
@@ -690,7 +726,11 @@ class ReasoningFrameService:
             str(descriptor.get("unit_ref") or ""): descriptor
             for descriptor in descriptors
         }
-        while self._json_bytes(frame) > byte_budget:
+        while not self._fits_budget(
+            frame,
+            byte_budget=byte_budget,
+            item_budget=item_budget,
+        ):
             selected_unit_refs = {
                 str(unit.get("unit_id") or "") for unit in selected_units
             }
@@ -794,6 +834,7 @@ class ReasoningFrameService:
         seed_count: int,
         coherent_unit_count: int,
         byte_budget: int,
+        item_budget: int | None,
     ) -> dict[str, Any]:
         sections = self._sections(selected_units)
         source_refs = sorted(
@@ -921,8 +962,10 @@ class ReasoningFrameService:
             "budget": {
                 "limit_bytes": byte_budget,
                 "limit_tokens": (byte_budget + 3) // 4,
+                "limit_items": item_budget,
                 "used_bytes": 0,
                 "estimated_tokens": 0,
+                "used_items": 0,
             },
             "compilation_trace": {
                 "eligible_atom_count": discovery["eligible_atom_count"],
@@ -994,23 +1037,53 @@ class ReasoningFrameService:
         for _attempt in range(12):
             used_bytes = self._json_bytes(payload)
             token_estimate = (used_bytes + 3) // 4
+            used_items = self._recursive_list_items(payload)
             budget = payload["budget"]
             if (
                 payload.get("token_estimate") == token_estimate
                 and budget.get("used_bytes") == used_bytes
                 and budget.get("estimated_tokens") == token_estimate
+                and budget.get("used_items") == used_items
             ):
                 return payload
             payload["token_estimate"] = token_estimate
             budget["used_bytes"] = used_bytes
             budget["estimated_tokens"] = token_estimate
+            budget["used_items"] = used_items
         # Decimal widths converge very quickly; this final assignment keeps the
         # public values consistent even on an unusually shaped response.
         used_bytes = self._json_bytes(payload)
         payload["token_estimate"] = (used_bytes + 3) // 4
         payload["budget"]["used_bytes"] = used_bytes
         payload["budget"]["estimated_tokens"] = payload["token_estimate"]
+        payload["budget"]["used_items"] = self._recursive_list_items(payload)
         return payload
+
+    @staticmethod
+    def _recursive_list_items(node: Any) -> int:
+        if isinstance(node, Mapping):
+            return sum(
+                ReasoningFrameService._recursive_list_items(item)
+                for item in node.values()
+            )
+        if isinstance(node, list):
+            return len(node) + sum(
+                ReasoningFrameService._recursive_list_items(item)
+                for item in node
+            )
+        return 0
+
+    def _fits_budget(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        byte_budget: int,
+        item_budget: int | None,
+    ) -> bool:
+        return self._json_bytes(payload) <= byte_budget and (
+            item_budget is None
+            or self._recursive_list_items(payload) <= item_budget
+        )
 
     def _reasoning_work_budget(self, byte_budget: int) -> dict[str, int]:
         """Derive internal traversal work from the caller's context budget.
@@ -2595,17 +2668,27 @@ class ReasoningFrameService:
         value: int | Mapping[str, int] | None,
         *,
         default_tokens: int,
-    ) -> dict[str, int]:
+    ) -> dict[str, int | None]:
         if value is None:
-            return {"tokens": default_tokens, "bytes": default_tokens * 4}
+            return {
+                "tokens": default_tokens,
+                "bytes": default_tokens * 4,
+                "items": None,
+            }
         if isinstance(value, bool):
             raise ValidationError("token_or_byte_budget must not be boolean")
         if isinstance(value, int):
             if value <= 0:
                 raise ValidationError("token_or_byte_budget must be positive")
-            return {"bytes": value}
+            return {"bytes": value, "tokens": None, "items": None}
         if not isinstance(value, Mapping):
             raise ValidationError("token_or_byte_budget must be an integer or object")
+        unknown = sorted(set(value) - {"tokens", "bytes", "items"})
+        if unknown:
+            raise ValidationError(
+                "token_or_byte_budget contains unknown field(s): "
+                + ", ".join(unknown)
+            )
         has_tokens = "tokens" in value
         has_bytes = "bytes" in value
         if has_tokens == has_bytes:
@@ -2616,7 +2699,20 @@ class ReasoningFrameService:
         raw = value[key]
         if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
             raise ValidationError(f"token_or_byte_budget.{key} must be a positive integer")
-        return {key: raw, "bytes": raw * 4 if key == "tokens" else raw}
+        item_limit = value.get("items")
+        if item_limit is not None and (
+            isinstance(item_limit, bool)
+            or not isinstance(item_limit, int)
+            or item_limit <= 0
+        ):
+            raise ValidationError(
+                "token_or_byte_budget.items must be a positive integer"
+            )
+        return {
+            "tokens": raw if key == "tokens" else None,
+            "bytes": raw * 4 if key == "tokens" else raw,
+            "items": item_limit,
+        }
 
     def _revision(self, value: Any) -> dict[str, Any]:
         if not isinstance(value, Mapping):

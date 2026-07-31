@@ -28,6 +28,11 @@
     },
     "current_event": { "type": "object" },
     "temporal_context": { "type": "array", "items": { "type": "object" } },
+    "compacted_context": {
+      "type": "array",
+      "items": { "type": "object" },
+      "maxItems": 1
+    },
     "thread_heads": { "type": "array", "items": { "type": "object" } },
     "canonical_context": {
       "type": "array",
@@ -41,7 +46,16 @@
     "associative_memory": { "type": ["object", "null"] },
     "page_aliases": {
       "type": "array",
-      "items": { "type": "object" }
+      "items": {
+        "type": "object",
+        "required": ["alias", "page_id", "descriptor_digest"],
+        "properties": {
+          "alias": { "type": "string", "minLength": 1 },
+          "page_id": { "type": "string", "minLength": 1 },
+          "descriptor_digest": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
     },
     "bound_refs": { "type": "object" },
     "protected_refs": {

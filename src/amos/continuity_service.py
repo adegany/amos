@@ -15,7 +15,9 @@ from typing import Any, ClassVar
 from ._service_support import access_visible, scope_visible
 from .errors import CASConflict, StaleFrameError, ValidationError
 from .governance_service import GovernanceService
+from .maintenance import context_compaction_source_digest
 from .schemas import (
+    CONTEXT_COMPACTION_PROFILE,
     SCHEMA_VERSION,
     canonical_json,
     digest,
@@ -739,7 +741,7 @@ class ContinuityService:
         token_or_byte_budget: int | Mapping[str, int] | None,
     ) -> dict[str, int | None]:
         if token_or_byte_budget is None:
-            return {"bytes": 48_000, "tokens": 12_000}
+            return {"bytes": 48_000, "tokens": 12_000, "items": None}
         if isinstance(token_or_byte_budget, bool):
             raise ValidationError("token_or_byte_budget must be positive")
         if isinstance(token_or_byte_budget, int):
@@ -748,11 +750,13 @@ class ContinuityService:
             return {
                 "bytes": int(token_or_byte_budget) * 4,
                 "tokens": int(token_or_byte_budget),
+                "items": None,
             }
         if not isinstance(token_or_byte_budget, Mapping):
             raise ValidationError("token_or_byte_budget must be an integer or object")
         tokens = token_or_byte_budget.get("tokens")
         byte_limit = token_or_byte_budget.get("bytes")
+        item_limit = token_or_byte_budget.get("items")
         if tokens is not None and (
             isinstance(tokens, bool) or not isinstance(tokens, int) or tokens <= 0
         ):
@@ -763,6 +767,12 @@ class ContinuityService:
             or byte_limit <= 0
         ):
             raise ValidationError("token_or_byte_budget.bytes must be positive")
+        if item_limit is not None and (
+            isinstance(item_limit, bool)
+            or not isinstance(item_limit, int)
+            or item_limit <= 0
+        ):
+            raise ValidationError("token_or_byte_budget.items must be positive")
         if tokens is None and byte_limit is None:
             raise ValidationError(
                 "token_or_byte_budget requires tokens or bytes"
@@ -770,7 +780,181 @@ class ContinuityService:
         resolved_bytes = int(byte_limit or int(tokens) * 4)
         if tokens is not None:
             resolved_bytes = min(resolved_bytes, int(tokens) * 4)
-        return {"bytes": resolved_bytes, "tokens": int(tokens) if tokens else None}
+        return {
+            "bytes": resolved_bytes,
+            "tokens": int(tokens) if tokens else None,
+            "items": int(item_limit) if item_limit else None,
+        }
+
+    @staticmethod
+    def _workspace_item_count(node: Any) -> int:
+        """Count nested list members without interpreting their content."""
+
+        if isinstance(node, Mapping):
+            return sum(
+                ContinuityService._workspace_item_count(item)
+                for item in node.values()
+            )
+        if isinstance(node, list):
+            return len(node) + sum(
+                ContinuityService._workspace_item_count(item)
+                for item in node
+            )
+        return 0
+
+    def _context_compaction_projection(
+        self,
+        *,
+        conversation_id: str,
+        current_sequence: int,
+        scope: Mapping[str, Any],
+        requester: str,
+        target_processor: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Select the newest verified rolling projection for one stream."""
+
+        candidates: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        omissions: list[dict[str, Any]] = []
+        for atom in self.store.list_atoms():
+            if (
+                atom.get("type") != "semantic"
+                or atom.get("deleted")
+                or atom.get("lifecycle_state") != "active"
+                or atom.get("health_status") == "contradicted"
+                or not scope_visible(atom.get("scope") or {}, scope)
+                or not access_visible(
+                    atom.get("access_policy") or {},
+                    requester,
+                    target_processor,
+                )
+            ):
+                continue
+            payload = atom.get("payload")
+            payload = payload if isinstance(payload, Mapping) else {}
+            compaction = payload.get("context_compaction")
+            if not isinstance(compaction, Mapping):
+                continue
+            partition = compaction.get("partition")
+            coverage = compaction.get("coverage")
+            if (
+                compaction.get("profile") != CONTEXT_COMPACTION_PROFILE
+                or compaction.get("mode") != "rolling"
+                or not isinstance(partition, Mapping)
+                or partition.get("kind") != "interaction_stream"
+                or partition.get("key") != conversation_id
+                or not isinstance(coverage, Mapping)
+            ):
+                continue
+            through_sequence = coverage.get("through_sequence")
+            if (
+                isinstance(through_sequence, bool)
+                or not isinstance(through_sequence, int)
+                or through_sequence <= 0
+                or through_sequence > current_sequence
+            ):
+                continue
+            source_refs = compaction.get("source_refs")
+            if not isinstance(source_refs, list) or not source_refs:
+                continue
+            sources: list[dict[str, Any]] = []
+            source_visible = True
+            for ref in source_refs:
+                source = self.store.get_atom(str(ref))
+                if (
+                    source is None
+                    or source.get("deleted")
+                    or not scope_visible(source.get("scope") or {}, scope)
+                    or not access_visible(
+                        source.get("access_policy") or {},
+                        requester,
+                        target_processor,
+                    )
+                ):
+                    source_visible = False
+                    break
+                sources.append(source)
+            atom_ref = str(atom.get("id") or "")
+            if not source_visible:
+                omissions.append(
+                    {
+                        "ref": atom_ref,
+                        "reason": "compaction_source_unavailable",
+                    }
+                )
+                continue
+            through_ref = str(coverage.get("through_ref") or "")
+            through_source = next(
+                (
+                    source
+                    for source in sources
+                    if str(source.get("id") or "") == through_ref
+                ),
+                None,
+            )
+            through_payload = (
+                through_source.get("payload")
+                if isinstance(through_source, Mapping)
+                else {}
+            )
+            through_payload = (
+                through_payload if isinstance(through_payload, Mapping) else {}
+            )
+            if (
+                through_source is None
+                or through_source.get("type") != "interaction_event"
+                or through_payload.get("conversation_id") != conversation_id
+                or through_payload.get("sequence") != through_sequence
+            ):
+                omissions.append(
+                    {
+                        "ref": atom_ref,
+                        "reason": "compaction_frontier_invalid",
+                    }
+                )
+                continue
+            if coverage.get("source_digest") != context_compaction_source_digest(
+                sources
+            ):
+                omissions.append(
+                    {
+                        "ref": atom_ref,
+                        "reason": "compaction_source_digest_mismatch",
+                    }
+                )
+                continue
+            projection = {
+                "alias": "compacted_context_1",
+                "atom_ref": atom_ref,
+                "atom_type": "semantic",
+                "profile": CONTEXT_COMPACTION_PROFILE,
+                "mode": "rolling",
+                "partition": dict(partition),
+                "summary": str(payload.get("summary") or ""),
+                "facets": dict(compaction.get("facets") or {}),
+                "coverage": dict(coverage),
+                "source_refs": [str(ref) for ref in source_refs],
+                "evidence_refs": list(atom.get("evidence_refs") or []),
+                "confidence": dict(atom.get("confidence") or {}),
+                "epistemic_status": str(
+                    payload.get("epistemic_status")
+                    or "derived_summary_not_adopted_truth"
+                ),
+            }
+            candidates.append(
+                (
+                    (
+                        through_sequence,
+                        int(coverage.get("source_count") or 0),
+                        str(atom.get("updated_at") or atom.get("created_at") or ""),
+                        atom_ref,
+                    ),
+                    projection,
+                )
+            )
+        if not candidates:
+            return [], omissions
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return [candidates[0][1]], omissions
 
     def compile_cognitive_workspace(
         self,
@@ -787,6 +971,7 @@ class ContinuityService:
         token_or_byte_budget: int | Mapping[str, int] | None = None,
         temporal_limit: int = 12,
         thread_limit: int = 8,
+        recent_event_floor: int = 4,
         prior_workspace_revision: Mapping[str, Any] | None = None,
         run_policy: bool = False,
     ) -> dict[str, Any]:
@@ -804,6 +989,9 @@ class ContinuityService:
         budget = self._workspace_budget(token_or_byte_budget)
         temporal_limit = max(2, min(64, int(temporal_limit)))
         thread_limit = max(1, min(32, int(thread_limit)))
+        recent_event_floor = max(
+            2, min(temporal_limit, int(recent_event_floor))
+        )
         participants = [
             self._required_text(ref, "participant_ref")
             for ref in self._sequence(participant_refs, "participant_refs")
@@ -835,6 +1023,7 @@ class ContinuityService:
                 "current_event_ref must identify an interaction_event atom"
             )
         current_payload = current.get("payload") or {}
+        current_sequence = int(current_payload.get("sequence") or 0)
         if current_payload.get("conversation_id") != conversation_id:
             raise ValidationError(
                 "current event conversation_id does not match request"
@@ -915,6 +1104,17 @@ class ContinuityService:
                 start = max(0, position - min(3, temporal_limit - 1))
                 temporal = interactions[start : position + 1]
                 temporal_refs = {str(atom["id"]) for atom in temporal}
+
+        compacted_context, compaction_omissions = (
+            self._context_compaction_projection(
+                conversation_id=conversation_id,
+                current_sequence=current_sequence,
+                scope=request_scope,
+                requester=requester,
+                target_processor=target_processor,
+            )
+        )
+        omissions.extend(compaction_omissions)
 
         roots = self._thread_roots(
             conversation_id=conversation_id,
@@ -1047,6 +1247,44 @@ class ContinuityService:
         associative: dict[str, Any] | None = None
         associative_error: str | None = None
         associative_budget = max(4_096, min(16_000, int(budget["bytes"]) // 3))
+        associative_request_budget: dict[str, int] = {
+            "bytes": associative_budget
+        }
+        if budget["items"] is not None:
+            fixed_projection_items = self._workspace_item_count(
+                {
+                    "current_event": next(
+                        item
+                        for item in temporal_projection
+                        if item["atom_ref"] == current_event_ref
+                    ),
+                    "temporal_context": temporal_projection,
+                    "compacted_context": compacted_context,
+                    "thread_heads": thread_projection,
+                    "canonical_context": canonical_context,
+                    "available_new_thread_aliases": [
+                        f"new_thread_{index}" for index in range(1, 5)
+                    ],
+                    "bound_refs": {
+                        "participant_refs": participants,
+                        "operation_refs": operation_refs,
+                        "project_refs": project_refs,
+                        "context_refs": context_refs,
+                    },
+                    "protected_refs": [
+                        *[item["atom_ref"] for item in temporal_projection],
+                        *[item["atom_ref"] for item in compacted_context],
+                        *[item["root_ref"] for item in thread_projection],
+                        *[item["state_ref"] for item in thread_projection],
+                        *[item["atom_ref"] for item in canonical_context],
+                    ],
+                    "omissions": omissions,
+                }
+            )
+            associative_request_budget["items"] = max(
+                64,
+                int(budget["items"]) - fixed_projection_items - 16,
+            )
         need = str(current_payload.get("content") or "").strip() or "current interaction"
         try:
             associative = self.reasoning.compile_memory_frame(
@@ -1069,7 +1307,7 @@ class ContinuityService:
                 requester=requester,
                 target_processor=target_processor,
                 memory_mode="operational_recall",
-                token_or_byte_budget={"bytes": associative_budget},
+                token_or_byte_budget=associative_request_budget,
                 run_policy=False,
             )
         except ValidationError as exc:
@@ -1090,7 +1328,10 @@ class ContinuityService:
         page_aliases = [
             {
                 "alias": f"memory_page_{index + 1}",
-                "descriptor": dict(page),
+                "page_id": str(page.get("page_id") or ""),
+                "descriptor_digest": str(
+                    page.get("descriptor_digest") or ""
+                ),
             }
             for index, page in enumerate(
                 (
@@ -1121,6 +1362,7 @@ class ContinuityService:
                 if item["atom_ref"] == current_event_ref
             ),
             "temporal_context": temporal_projection,
+            "compacted_context": compacted_context,
             "thread_heads": thread_projection,
             "canonical_context": canonical_context,
             "available_new_thread_aliases": [
@@ -1136,6 +1378,7 @@ class ContinuityService:
             },
             "protected_refs": [
                 *[item["atom_ref"] for item in temporal_projection],
+                *[item["atom_ref"] for item in compacted_context],
                 *[item["root_ref"] for item in thread_projection],
                 *[item["state_ref"] for item in thread_projection],
                 *[item["atom_ref"] for item in canonical_context],
@@ -1166,8 +1409,10 @@ class ContinuityService:
             "budget": {
                 "limit_bytes": int(budget["bytes"]),
                 "limit_tokens": budget["tokens"],
+                "limit_items": budget["items"],
                 "used_bytes": 0,
                 "estimated_tokens": 0,
+                "used_items": 0,
             },
         }
 
@@ -1178,38 +1423,80 @@ class ContinuityService:
                 encoded = canonical_json(value).encode("utf-8")
                 used_bytes = len(encoded)
                 estimated_tokens = (used_bytes + 3) // 4
+                used_items = self._workspace_item_count(value)
                 if (
                     value["budget"]["used_bytes"] == used_bytes
                     and value["budget"]["estimated_tokens"]
                     == estimated_tokens
+                    and value["budget"]["used_items"] == used_items
                 ):
                     break
                 value["budget"]["used_bytes"] = used_bytes
                 value["budget"]["estimated_tokens"] = estimated_tokens
+                value["budget"]["used_items"] = used_items
             return value
 
-        workspace = finalize(workspace)
-        while (
-            int(workspace["budget"]["used_bytes"]) > int(budget["bytes"])
-            and associative is not None
-        ):
-            units = associative.get("units")
-            if isinstance(units, list) and units:
-                units.pop()
-            else:
-                workspace["associative_memory"] = None
-                workspace["page_aliases"] = []
-                associative = None
-                workspace["omissions"].append(
-                    {"reason": "workspace_budget_associative_memory_omitted"}
+        def exceeds_budget(value: Mapping[str, Any]) -> bool:
+            return (
+                int(value["budget"]["used_bytes"]) > int(budget["bytes"])
+                or (
+                    budget["items"] is not None
+                    and int(value["budget"]["used_items"])
+                    > int(budget["items"])
                 )
-            workspace = finalize(workspace)
+            )
+
+        workspace = finalize(workspace)
+        if exceeds_budget(workspace) and compacted_context:
+            through_sequence = int(
+                compacted_context[0]["coverage"]["through_sequence"]
+            )
+            preserved_temporal_refs = {
+                str(item["atom_ref"])
+                for item in temporal_projection[-recent_event_floor:]
+            }
+            preserved_temporal_refs.add(current_event_ref)
+            removable = [
+                item
+                for item in workspace["temporal_context"]
+                if str(item["atom_ref"]) not in preserved_temporal_refs
+                and int(item.get("sequence") or 0) <= through_sequence
+            ]
+            if removable:
+                removed_refs = {
+                    str(item["atom_ref"]) for item in removable
+                }
+                workspace["temporal_context"] = [
+                    item
+                    for item in workspace["temporal_context"]
+                    if str(item["atom_ref"]) not in removed_refs
+                ]
+                workspace["protected_refs"] = [
+                    ref
+                    for ref in workspace["protected_refs"]
+                    if ref not in removed_refs
+                ]
+                workspace["omissions"].append(
+                    {
+                        "reason": "covered_temporal_context_compacted",
+                        "count": len(removed_refs),
+                        "compaction_ref": compacted_context[0]["atom_ref"],
+                        "covered_through_sequence": through_sequence,
+                    }
+                )
+                workspace = finalize(workspace)
         while (
-            int(workspace["budget"]["used_bytes"]) > int(budget["bytes"])
+            exceeds_budget(workspace)
             and len(workspace["thread_heads"]) > 1
             and not workspace["thread_heads"][-1]["directly_linked"]
         ):
             removed = workspace["thread_heads"].pop()
+            removed_refs = {removed["root_ref"], removed["state_ref"]}
+            workspace["protected_refs"] = [
+                ref
+                for ref in workspace["protected_refs"]
+                if ref not in removed_refs
+            ]
             workspace["omissions"].append(
                 {
                     "reason": "workspace_budget_thread_omitted",
@@ -1217,7 +1504,15 @@ class ContinuityService:
                 }
             )
             workspace = finalize(workspace)
-        if int(workspace["budget"]["used_bytes"]) > int(budget["bytes"]):
+        if exceeds_budget(workspace) and associative is not None:
+            workspace["associative_memory"] = None
+            workspace["page_aliases"] = []
+            associative = None
+            workspace["omissions"].append(
+                {"reason": "workspace_budget_associative_memory_omitted"}
+            )
+            workspace = finalize(workspace)
+        if exceeds_budget(workspace):
             raise ValidationError(
                 "token_or_byte_budget is too small for protected cognitive "
                 "workspace context"

@@ -16,6 +16,7 @@ from .errors import ValidationError
 from .ontology import SEED_RELATION_IDS
 
 SCHEMA_VERSION = "amos.v1"
+CONTEXT_COMPACTION_PROFILE = "amos.context-compaction.v1"
 
 ATOM_TYPES = {
     "action_outcome",
@@ -619,6 +620,118 @@ def _validate_discourse_segment_payload(payload: Mapping[str, Any]) -> None:
         raise ValidationError("unsupported semantic discourse-segment standing")
 
 
+def _validate_context_compaction_payload(payload: Mapping[str, Any]) -> None:
+    raw = payload.get("context_compaction")
+    if raw is None:
+        return
+    if not isinstance(raw, Mapping):
+        raise ValidationError(
+            "semantic payload field context_compaction must be an object"
+        )
+    compaction = dict(raw)
+    if compaction.get("profile") != CONTEXT_COMPACTION_PROFILE:
+        raise ValidationError(
+            "semantic context_compaction profile must be "
+            f"{CONTEXT_COMPACTION_PROFILE!r}"
+        )
+    if compaction.get("mode") not in {"segment", "rolling"}:
+        raise ValidationError(
+            "semantic context_compaction mode must be 'segment' or 'rolling'"
+        )
+    partition = compaction.get("partition")
+    if not isinstance(partition, Mapping):
+        raise ValidationError(
+            "semantic context_compaction partition must be an object"
+        )
+    if partition.get("kind") != "interaction_stream":
+        raise ValidationError(
+            "semantic context_compaction partition.kind must be "
+            "'interaction_stream'"
+        )
+    partition_key = partition.get("key")
+    if not isinstance(partition_key, str) or not partition_key.strip():
+        raise ValidationError(
+            "semantic context_compaction partition.key must be a non-empty string"
+        )
+    coverage = compaction.get("coverage")
+    if not isinstance(coverage, Mapping):
+        raise ValidationError(
+            "semantic context_compaction coverage must be an object"
+        )
+    required_coverage = {
+        "from_sequence",
+        "through_sequence",
+        "through_ref",
+        "source_count",
+        "source_digest",
+        "raw_sources_retained",
+    }
+    missing_coverage = sorted(required_coverage - set(coverage))
+    if missing_coverage:
+        raise ValidationError(
+            "semantic context_compaction coverage missing field(s): "
+            + ", ".join(missing_coverage)
+        )
+    from_sequence = coverage.get("from_sequence")
+    through_sequence = coverage.get("through_sequence")
+    source_count = coverage.get("source_count")
+    for field, value in (
+        ("from_sequence", from_sequence),
+        ("through_sequence", through_sequence),
+        ("source_count", source_count),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValidationError(
+                f"semantic context_compaction coverage.{field} must be a "
+                "positive integer"
+            )
+    if int(through_sequence) < int(from_sequence):
+        raise ValidationError(
+            "semantic context_compaction coverage.through_sequence must not "
+            "precede from_sequence"
+        )
+    for field in ("through_ref", "source_digest"):
+        value = coverage.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValidationError(
+                f"semantic context_compaction coverage.{field} must be a "
+                "non-empty string"
+            )
+    if coverage.get("raw_sources_retained") is not True:
+        raise ValidationError(
+            "semantic context_compaction coverage.raw_sources_retained must be true"
+        )
+    source_refs = compaction.get("source_refs")
+    if (
+        not isinstance(source_refs, list)
+        or not source_refs
+        or not all(isinstance(ref, str) and ref.strip() for ref in source_refs)
+    ):
+        raise ValidationError(
+            "semantic context_compaction source_refs must be a non-empty "
+            "string list"
+        )
+    if len(source_refs) != len(set(source_refs)):
+        raise ValidationError(
+            "semantic context_compaction source_refs must be unique"
+        )
+    if coverage["through_ref"] not in source_refs:
+        raise ValidationError(
+            "semantic context_compaction coverage.through_ref must be a source ref"
+        )
+    maintenance_refs = payload.get("maintenance_source_refs")
+    if maintenance_refs != source_refs:
+        raise ValidationError(
+            "semantic context_compaction source_refs must exactly match "
+            "maintenance_source_refs"
+        )
+    summary = payload.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        raise ValidationError(
+            "semantic context_compaction summary must be a non-empty string"
+        )
+
+
 def _require_agent_identity_types(atom_type: str, payload: Mapping[str, Any]) -> None:
     _require_payload_types(
         atom_type,
@@ -988,6 +1101,7 @@ def validate_atom_payload(atom_type: str, payload: Mapping[str, Any]) -> None:
         return
     if atom_type == "semantic":
         _validate_discourse_segment_payload(payload)
+        _validate_context_compaction_payload(payload)
         _require_payload_alternative(
             atom_type,
             payload,

@@ -45,6 +45,60 @@
         "graph_relations": {
           "type": "array",
           "items": { "$ref": "core_payloads.schema.json#/$defs/GraphRelation" }
+        },
+        "context_compaction": {
+          "type": "object",
+          "required": [
+            "profile",
+            "mode",
+            "partition",
+            "coverage",
+            "source_refs"
+          ],
+          "properties": {
+            "profile": { "const": "amos.context-compaction.v1" },
+            "mode": { "enum": ["segment", "rolling"] },
+            "partition": {
+              "type": "object",
+              "required": ["kind", "key"],
+              "properties": {
+                "kind": { "const": "interaction_stream" },
+                "key": { "type": "string", "minLength": 1 }
+              },
+              "additionalProperties": false
+            },
+            "coverage": {
+              "type": "object",
+              "required": [
+                "from_sequence",
+                "through_sequence",
+                "through_ref",
+                "source_count",
+                "source_digest",
+                "raw_sources_retained"
+              ],
+              "properties": {
+                "from_sequence": { "type": "integer", "minimum": 1 },
+                "through_sequence": { "type": "integer", "minimum": 1 },
+                "through_ref": { "type": "string", "minLength": 1 },
+                "source_count": { "type": "integer", "minimum": 1 },
+                "source_digest": { "type": "string", "minLength": 1 },
+                "raw_sources_retained": { "const": true }
+              },
+              "additionalProperties": false
+            },
+            "source_refs": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "facets": { "type": "object" },
+            "previous_compaction_ref": {
+              "type": ["string", "null"]
+            }
+          },
+          "additionalProperties": false
         }
       },
       "not": {

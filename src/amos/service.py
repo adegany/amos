@@ -557,6 +557,7 @@ class Amos:
         token_or_byte_budget: int | Mapping[str, int] | None = None,
         temporal_limit: int = 12,
         thread_limit: int = 8,
+        recent_event_floor: int = 4,
         prior_workspace_revision: Mapping[str, Any] | None = None,
         run_policy: bool = False,
     ) -> dict[str, Any]:
@@ -573,6 +574,7 @@ class Amos:
             token_or_byte_budget=token_or_byte_budget,
             temporal_limit=temporal_limit,
             thread_limit=thread_limit,
+            recent_event_floor=recent_event_floor,
             prior_workspace_revision=prior_workspace_revision,
             run_policy=run_policy,
         )

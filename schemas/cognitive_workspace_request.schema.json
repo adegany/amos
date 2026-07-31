@@ -44,6 +44,7 @@
       ]
     },
     "temporal_limit": { "type": "integer", "minimum": 2, "maximum": 64 },
+    "recent_event_floor": { "type": "integer", "minimum": 2, "maximum": 64 },
     "thread_limit": { "type": "integer", "minimum": 1, "maximum": 32 },
     "prior_workspace_revision": { "type": ["object", "null"] },
     "run_policy": { "type": "boolean" }

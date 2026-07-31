@@ -4897,15 +4897,36 @@ active.
 
 A cognitive workspace is a generated, revision-bound view. It protects the
 current event, immediate reply chain, and directly linked visible discourse
-heads before adding bounded canonical and associative context. An interaction
-projection is an ordered, access-filtered read model for reconstructing
-disposable delivery caches. Its v2 contract can optionally include bounded,
-access-filtered outgoing linked records of atom types explicitly named by the
-caller. The traversal performs no ranking or application-specific semantic
-classification. Explicit canonical context includes source content and
-authority metadata but excludes rebuildable search indexes, vectors, decay
-bookkeeping, and revision-history internals. Neither view becomes canonical
-memory.
+heads before adding bounded canonical and associative context. Callers may
+bound it independently by serialized bytes/tokens and by recursive collection
+item count.
+
+An application-owned maintenance processor may commit a semantic atom carrying
+the application-neutral `amos.context-compaction.v1` envelope. The envelope
+binds a segment or rolling summary to an interaction-stream partition, exact
+direct source refs, a source-content digest, a sequence frontier, and a
+declaration that raw sources remain canonical. AMOS assigns intrinsic
+`rel:summarizes` edges and exposes only the newest rolling projection whose
+source digest, access, partition, and frontier still verify. Summary text
+remains derived context rather than adopted truth.
+
+Capacity reduction is progressive. The associative reasoning frame first uses
+its full, essential, reference-summary, bare-reference, and loadable-page
+representations under both byte and recursive-item limits. A verified rolling
+projection may then replace older covered temporal records while the current
+event and caller-selected recent-event floor remain inline. Non-direct
+discourse heads and optional associative context are shed only as final safety
+fallbacks before rejecting a workspace whose protected context cannot satisfy
+the bound. The returned budget receipts report every limit and actual usage.
+
+An interaction projection is an ordered, access-filtered read model for
+reconstructing disposable delivery caches. Its v2 contract can optionally
+include bounded, access-filtered outgoing linked records of atom types
+explicitly named by the caller. The traversal performs no ranking or
+application-specific semantic classification. Explicit canonical context
+includes source content and authority metadata but excludes rebuildable search
+indexes, vectors, decay bookkeeping, and revision-history internals. Neither
+view becomes canonical memory.
 
 The head table is derived from committed journal transactions and must remain
 fully rebuildable. Access-filtered head lookup exposes a reference and version,

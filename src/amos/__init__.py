@@ -21,6 +21,7 @@ from .maintenance import (
     SemanticFacet,
     load_maintenance_processor,
     coerce_window_request,
+    context_compaction_source_digest,
     covered_source_refs,
     derived_memory_proposal,
     evidence_diversity,
@@ -31,6 +32,7 @@ from .maintenance import (
     semantic_facets_from_atoms,
 )
 from .smp import SemanticMaintenanceProcessor
+from .schemas import CONTEXT_COMPACTION_PROFILE
 from .store import SQLiteStore
 from .workers import (
     AgenticRecallAuditor,
@@ -54,6 +56,7 @@ __all__ = [
     "BackgroundMemoryPolicyWorker",
     "CASConflict",
     "CapacityGovernor",
+    "CONTEXT_COMPACTION_PROFILE",
     "canonical_relation_proposals_from_atoms",
     "DistillerMaintenanceWorker",
     "EvidenceWindow",
@@ -77,6 +80,7 @@ __all__ = [
     "ValidationError",
     "load_maintenance_processor",
     "coerce_window_request",
+    "context_compaction_source_digest",
     "covered_source_refs",
     "derived_memory_proposal",
     "evidence_diversity",
