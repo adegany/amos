@@ -9,6 +9,7 @@ import pytest
 
 from amos import (
     CASConflict,
+    CognitiveWorkspaceBudgetExceeded,
     CONTEXT_COMPACTION_PROFILE,
     ValidationError,
     context_compaction_source_digest,
@@ -273,9 +274,9 @@ def test_atomic_interaction_thread_head_and_workspace_visibility(amos):
     assert workspace["budget"]["used_items"] <= 512
 
     with pytest.raises(
-        ValidationError,
+        CognitiveWorkspaceBudgetExceeded,
         match="too small for protected cognitive workspace context",
-    ):
+    ) as overflow:
         amos.compile_cognitive_workspace(
             current_event_ref="event_human_3",
             conversation_id="main",
@@ -285,6 +286,9 @@ def test_atomic_interaction_thread_head_and_workspace_visibility(amos):
             participant_refs=["human:participant", "agent:participant"],
             token_or_byte_budget={"bytes": 48_000, "items": 1},
         )
+    assert overflow.value.exceeded_dimensions == ["items"]
+    assert overflow.value.budget["limit_items"] == 1
+    assert overflow.value.minimum_budget["items"] > 1
 
     contextual = amos.compile_cognitive_workspace(
         current_event_ref="event_human_3",

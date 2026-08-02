@@ -138,6 +138,12 @@ rebuildable index/vector and storage-maintenance fields; use exact atom APIs
 when those operational details, rather than cognitive content and authority,
 are the subject of inspection.
 
+If protected workspace context exceeds the supplied bound, HTTP 400 carries
+`code=cognitive_workspace_budget_exceeded`, `budget`, `minimum_budget`, and
+`exceeded_dimensions`. Treat these typed fields as capacity telemetry; do not
+parse the human-readable error string. A caller may retry with a larger bound
+only when its own processor and transport ceilings permit it.
+
 `amos.discourse-thread-state.v2` requires every shared/private state entry to
 carry `state_class`, `authority`, and `basis_refs`. The first two values are
 caller-defined bounded labels; AMOS preserves and exposes them without

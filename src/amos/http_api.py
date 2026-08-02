@@ -14,6 +14,7 @@ from .errors import (
     AccessDenied,
     AmosError,
     CASConflict,
+    CognitiveWorkspaceBudgetExceeded,
     StaleFrameError,
     ValidationError,
 )
@@ -123,6 +124,19 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 self._write_json(
                     {"status": "error", "error": str(exc)},
                     status=HTTPStatus.FORBIDDEN,
+                )
+            except CognitiveWorkspaceBudgetExceeded as exc:
+                self._write_json(
+                    {
+                        "status": "error",
+                        "error": str(exc),
+                        "code": "cognitive_workspace_budget_exceeded",
+                        "retryable": False,
+                        "budget": exc.budget,
+                        "minimum_budget": exc.minimum_budget,
+                        "exceeded_dimensions": exc.exceeded_dimensions,
+                    },
+                    status=HTTPStatus.BAD_REQUEST,
                 )
             except AmosError as exc:
                 self._write_json(

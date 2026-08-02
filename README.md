@@ -114,6 +114,12 @@ retain cognitive payload and authority metadata while omitting rebuildable
 search vectors, indexes, decay bookkeeping, and revision-history internals from
 the model-facing projection.
 
+If caller-protected context cannot fit after optional context is removed, the
+HTTP API returns `cognitive_workspace_budget_exceeded` with the actual budget,
+the minimum byte/token/item budget, and the exceeded dimensions. This is a
+typed capacity receipt; callers need not parse error prose and may choose one
+bounded recompilation under their own processor ceiling.
+
 `POST /v1/memory-heads:get` returns an access-filtered head reference and
 version without exposing atom content. `POST
 /v1/interaction-projections:compile` returns an ordered, access-filtered event

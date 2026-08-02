@@ -9,6 +9,51 @@ class ValidationError(AmosError):
     """Raised when a memory object violates the AMOS schema contract."""
 
 
+class CognitiveWorkspaceBudgetExceeded(ValidationError):
+    """A workspace's non-sheddable projection exceeds the caller's budget."""
+
+    def __init__(
+        self,
+        *,
+        limit_bytes: int,
+        limit_tokens: int | None,
+        limit_items: int | None,
+        used_bytes: int,
+        estimated_tokens: int,
+        used_items: int,
+    ) -> None:
+        self.budget = {
+            "limit_bytes": int(limit_bytes),
+            "limit_tokens": (
+                int(limit_tokens) if limit_tokens is not None else None
+            ),
+            "limit_items": (
+                int(limit_items) if limit_items is not None else None
+            ),
+            "used_bytes": int(used_bytes),
+            "estimated_tokens": int(estimated_tokens),
+            "used_items": int(used_items),
+        }
+        self.minimum_budget = {
+            "bytes": int(used_bytes),
+            "tokens": int(estimated_tokens),
+            "items": int(used_items),
+        }
+        self.exceeded_dimensions = [
+            *(["bytes"] if int(used_bytes) > int(limit_bytes) else []),
+            *(
+                ["items"]
+                if limit_items is not None
+                and int(used_items) > int(limit_items)
+                else []
+            ),
+        ]
+        super().__init__(
+            "token_or_byte_budget is too small for protected cognitive "
+            "workspace context"
+        )
+
+
 class IdempotencyConflict(AmosError):
     """Raised when an idempotency key is reused with a different payload."""
 

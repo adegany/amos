@@ -13,7 +13,12 @@ from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
 from ._service_support import access_visible, scope_visible
-from .errors import CASConflict, StaleFrameError, ValidationError
+from .errors import (
+    CASConflict,
+    CognitiveWorkspaceBudgetExceeded,
+    StaleFrameError,
+    ValidationError,
+)
 from .governance_service import GovernanceService
 from .maintenance import context_compaction_source_digest
 from .schemas import (
@@ -1487,7 +1492,7 @@ class ContinuityService:
                 workspace = finalize(workspace)
         while (
             exceeds_budget(workspace)
-            and len(workspace["thread_heads"]) > 1
+            and workspace["thread_heads"]
             and not workspace["thread_heads"][-1]["directly_linked"]
         ):
             removed = workspace["thread_heads"].pop()
@@ -1513,9 +1518,13 @@ class ContinuityService:
             )
             workspace = finalize(workspace)
         if exceeds_budget(workspace):
-            raise ValidationError(
-                "token_or_byte_budget is too small for protected cognitive "
-                "workspace context"
+            raise CognitiveWorkspaceBudgetExceeded(
+                limit_bytes=workspace["budget"]["limit_bytes"],
+                limit_tokens=workspace["budget"]["limit_tokens"],
+                limit_items=workspace["budget"]["limit_items"],
+                used_bytes=workspace["budget"]["used_bytes"],
+                estimated_tokens=workspace["budget"]["estimated_tokens"],
+                used_items=workspace["budget"]["used_items"],
             )
         current_revision = self.store.memory_revision()
         if current_revision != revision:

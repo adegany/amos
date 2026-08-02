@@ -18,6 +18,7 @@ from amos import (
     BackgroundMemoryPolicyWorker,
     CASConflict,
     CapacityGovernor,
+    CognitiveWorkspaceBudgetExceeded,
     DistillerMaintenanceWorker,
     IdempotencyConflict,
     IndexMaintainer,
@@ -338,6 +339,56 @@ def test_http_sqlite_lock_returns_retryable_json(tmp_path):
         assert payload["status"] == "error"
         assert payload["retryable"] is True
         assert "database is locked" in payload["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_workspace_budget_error_is_structured_and_nonretryable(tmp_path):
+    db_path = str(tmp_path / "http_workspace_budget.sqlite3")
+    try:
+        server = AmosHTTPServer(("127.0.0.1", 0), db_path)
+    except PermissionError as exc:
+        pytest.skip(f"loopback sockets unavailable in this sandbox: {exc}")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def overflow(**_request):
+        raise CognitiveWorkspaceBudgetExceeded(
+            limit_bytes=48_000,
+            limit_tokens=12_000,
+            limit_items=768,
+            used_bytes=52_004,
+            estimated_tokens=13_001,
+            used_items=312,
+        )
+
+    server.amos.compile_cognitive_workspace = overflow
+    try:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            http_json(
+                f"{base}/v1/cognitive-workspaces:compile",
+                {
+                    "current_event_ref": "event-current",
+                    "conversation_id": "main",
+                    "token_or_byte_budget": {
+                        "tokens": 12_000,
+                        "items": 768,
+                    },
+                },
+            )
+        assert excinfo.value.code == 400
+        payload = json.loads(excinfo.value.read().decode("utf-8"))
+        assert payload["code"] == "cognitive_workspace_budget_exceeded"
+        assert payload["retryable"] is False
+        assert payload["exceeded_dimensions"] == ["bytes"]
+        assert payload["minimum_budget"] == {
+            "bytes": 52_004,
+            "tokens": 13_001,
+            "items": 312,
+        }
     finally:
         server.shutdown()
         server.server_close()
