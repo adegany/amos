@@ -362,6 +362,81 @@ def test_atomic_interaction_thread_head_and_workspace_visibility(amos):
     ]
 
 
+def test_workspace_minimum_budget_is_sufficient_across_digit_boundary(amos):
+    current = interaction(
+        "budget_event_current",
+        sequence=1,
+        role="human",
+        content="x" * 20_000,
+    )
+    context = {
+        "id": "budget_context",
+        "type": "belief",
+        "payload": {"claim": "y"},
+    }
+    amos.commit_memory_transaction(
+        scope=SCOPE,
+        actor="participant-ingress",
+        idempotency_key="budget-boundary",
+        atoms=[current, context],
+        head_updates=[
+            interaction_stream_head(
+                "budget_event_current",
+                expected_head_ref=None,
+                expected_head_version=0,
+            )
+        ],
+    )
+    request = {
+        "current_event_ref": "budget_event_current",
+        "conversation_id": "main",
+        "scope": SCOPE,
+        "requester": "agent:participant",
+        "target_processor": "primary-reasoner",
+        "participant_refs": ["human:participant", "agent:participant"],
+        "context_refs": ["budget_context"],
+        "temporal_limit": 2,
+        "recent_event_floor": 2,
+        "thread_limit": 1,
+    }
+
+    with pytest.raises(CognitiveWorkspaceBudgetExceeded) as overflow:
+        amos.compile_cognitive_workspace(
+            **request,
+            token_or_byte_budget={"tokens": 9_999, "items": 99},
+        )
+
+    # The protected projection lands exactly on a four-byte token boundary.
+    # Growing the token limit from four to five digits adds one serialized
+    # byte, so a raw ceil(used_bytes / 4) receipt would fail when replayed.
+    assert overflow.value.budget["used_bytes"] % 4 == 0
+    assert overflow.value.minimum_budget["tokens"] > overflow.value.budget[
+        "estimated_tokens"
+    ]
+    recovered = amos.compile_cognitive_workspace(
+        **request,
+        token_or_byte_budget={
+            "tokens": overflow.value.minimum_budget["tokens"],
+            "items": overflow.value.minimum_budget["items"],
+        },
+    )
+    assert recovered["status"] == "compiled"
+    assert recovered["budget"]["used_bytes"] <= recovered["budget"]["limit_bytes"]
+    assert recovered["budget"]["used_items"] <= recovered["budget"]["limit_items"]
+    recovered_by_bytes = amos.compile_cognitive_workspace(
+        **request,
+        token_or_byte_budget={
+            "bytes": overflow.value.minimum_budget["bytes"],
+            "items": overflow.value.minimum_budget["items"],
+        },
+    )
+    assert recovered_by_bytes["status"] == "compiled"
+    assert (
+        recovered_by_bytes["budget"]["used_bytes"]
+        <= recovered_by_bytes["budget"]["limit_bytes"]
+    )
+
+
 def test_workspace_uses_verified_rolling_compaction_before_optional_shedding(amos):
     interactions = []
     previous = None

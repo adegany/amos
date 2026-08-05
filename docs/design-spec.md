@@ -4921,8 +4921,12 @@ the bound. The returned budget receipts report every limit and actual usage.
 An HTTP rejection uses the typed
 `cognitive_workspace_budget_exceeded` code and includes the actual protected
 projection size, its minimum byte/token/item budget, and the exceeded
-dimensions. The receipt does not declare that a larger downstream processor
-context is safe; the caller remains responsible for any bounded retry ceiling.
+dimensions. Because budget metadata participates in canonical serialization,
+AMOS computes the byte and token alternatives independently to a fixed point;
+either alternative, paired with the reported item minimum, MUST compile the
+unchanged protected projection. The receipt does not declare that a larger
+downstream processor context is safe; the caller remains responsible for any
+bounded retry ceiling.
 
 An interaction projection is an ordered, access-filtered read model for
 reconstructing disposable delivery caches. Its v2 contract can optionally

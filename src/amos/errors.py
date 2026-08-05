@@ -21,6 +21,7 @@ class CognitiveWorkspaceBudgetExceeded(ValidationError):
         used_bytes: int,
         estimated_tokens: int,
         used_items: int,
+        minimum_budget: dict[str, int] | None = None,
     ) -> None:
         self.budget = {
             "limit_bytes": int(limit_bytes),
@@ -34,11 +35,19 @@ class CognitiveWorkspaceBudgetExceeded(ValidationError):
             "estimated_tokens": int(estimated_tokens),
             "used_items": int(used_items),
         }
-        self.minimum_budget = {
-            "bytes": int(used_bytes),
-            "tokens": int(estimated_tokens),
-            "items": int(used_items),
-        }
+        self.minimum_budget = (
+            {
+                "bytes": int(minimum_budget["bytes"]),
+                "tokens": int(minimum_budget["tokens"]),
+                "items": int(minimum_budget["items"]),
+            }
+            if minimum_budget is not None
+            else {
+                "bytes": int(used_bytes),
+                "tokens": int(estimated_tokens),
+                "items": int(used_items),
+            }
+        )
         self.exceeded_dimensions = [
             *(["bytes"] if int(used_bytes) > int(limit_bytes) else []),
             *(

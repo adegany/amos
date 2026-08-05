@@ -117,8 +117,11 @@ the model-facing projection.
 If caller-protected context cannot fit after optional context is removed, the
 HTTP API returns `cognitive_workspace_budget_exceeded` with the actual budget,
 the minimum byte/token/item budget, and the exceeded dimensions. This is a
-typed capacity receipt; callers need not parse error prose and may choose one
-bounded recompilation under their own processor ceiling.
+typed capacity receipt. Each advertised byte or token alternative is computed
+to a fixed point that includes its own serialized budget envelope, so replaying
+the unchanged request with that alternative and the reported item minimum is
+sufficient. Callers need not parse error prose and may choose one bounded
+recompilation under their own processor ceiling.
 
 `POST /v1/memory-heads:get` returns an access-filtered head reference and
 version without exposing atom content. `POST

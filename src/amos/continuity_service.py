@@ -1451,6 +1451,74 @@ class ContinuityService:
                 )
             )
 
+        def guaranteed_minimum_budget(value: Mapping[str, Any]) -> dict[str, int]:
+            """Return retry budgets that include their own envelope growth.
+
+            Budget metadata is part of the canonical workspace serialization.
+            Replacing a four-digit limit with a five-digit minimum can therefore
+            make an otherwise exact retry one byte too small.  Compute the byte
+            and token alternatives independently to a fixed point so either
+            advertised form is sufficient for an unchanged request.
+            """
+
+            minimum_items = max(1, int(value["budget"]["used_items"]))
+
+            token_candidate = copy.deepcopy(dict(value))
+            minimum_tokens = max(1, int(value["budget"]["estimated_tokens"]))
+            for _ in range(16):
+                token_candidate["budget"]["limit_tokens"] = minimum_tokens
+                token_candidate["budget"]["limit_bytes"] = minimum_tokens * 4
+                token_candidate["budget"]["limit_items"] = minimum_items
+                token_candidate = finalize(token_candidate)
+                required_tokens = max(
+                    minimum_tokens,
+                    int(token_candidate["budget"]["estimated_tokens"]),
+                )
+                required_items = max(
+                    minimum_items,
+                    int(token_candidate["budget"]["used_items"]),
+                )
+                if (
+                    int(token_candidate["budget"]["used_bytes"])
+                    <= required_tokens * 4
+                    and int(token_candidate["budget"]["used_items"])
+                    <= required_items
+                    and required_tokens == minimum_tokens
+                    and required_items == minimum_items
+                ):
+                    break
+                minimum_tokens = required_tokens
+                minimum_items = required_items
+
+            byte_candidate = copy.deepcopy(dict(value))
+            minimum_bytes = max(1, int(value["budget"]["used_bytes"]))
+            for _ in range(16):
+                byte_candidate["budget"]["limit_tokens"] = None
+                byte_candidate["budget"]["limit_bytes"] = minimum_bytes
+                byte_candidate["budget"]["limit_items"] = minimum_items
+                byte_candidate = finalize(byte_candidate)
+                required_bytes = max(
+                    minimum_bytes,
+                    int(byte_candidate["budget"]["used_bytes"]),
+                )
+                required_items = max(
+                    minimum_items,
+                    int(byte_candidate["budget"]["used_items"]),
+                )
+                if (
+                    required_bytes == minimum_bytes
+                    and required_items == minimum_items
+                ):
+                    break
+                minimum_bytes = required_bytes
+                minimum_items = required_items
+
+            return {
+                "bytes": minimum_bytes,
+                "tokens": minimum_tokens,
+                "items": minimum_items,
+            }
+
         workspace = finalize(workspace)
         if exceeds_budget(workspace) and compacted_context:
             through_sequence = int(
@@ -1525,6 +1593,7 @@ class ContinuityService:
                 used_bytes=workspace["budget"]["used_bytes"],
                 estimated_tokens=workspace["budget"]["estimated_tokens"],
                 used_items=workspace["budget"]["used_items"],
+                minimum_budget=guaranteed_minimum_budget(workspace),
             )
         current_revision = self.store.memory_revision()
         if current_revision != revision:
