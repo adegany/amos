@@ -306,12 +306,14 @@ class Amos:
         identity_ref: str,
         required_confirmations: int = 2,
         min_interval_seconds: int = 0,
+        require_distinct_evidence: bool = False,
     ) -> dict[str, Any]:
         return self.governance.diachronic_ratification_status(
             subject_ref=subject_ref,
             identity_ref=identity_ref,
             required_confirmations=required_confirmations,
             min_interval_seconds=min_interval_seconds,
+            require_distinct_evidence=require_distinct_evidence,
         )
 
     def commit_memory_atoms(

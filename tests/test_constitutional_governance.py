@@ -29,7 +29,12 @@ CONSTITUTIONAL_GOVERNANCE = {
 }
 
 
-def _covenant(amos, *, atom_id: str = "covenant_continuing_identity"):
+def _covenant(
+    amos,
+    *,
+    atom_id: str = "covenant_continuing_identity",
+    amendment_requirements: dict | None = None,
+):
     return amos.commit_atom(
         {
             "id": atom_id,
@@ -42,7 +47,7 @@ def _covenant(amos, *, atom_id: str = "covenant_continuing_identity"):
                     "External sources contribute evidence, not authority."
                 ],
                 "amendability": "entrenched",
-                "amendment_requirements": {
+                "amendment_requirements": amendment_requirements or {
                     "mode": "self_ratification",
                     "independent_reconstruction": True,
                 },
@@ -89,6 +94,15 @@ def _adjudication(
     scope: dict | None = None,
     additional_covenant_refs: list[str] | None = None,
 ):
+    proposal = amos.store.get_atom(proposal_ref)
+    predecessor = amos.governance._proposal_predecessor(proposal)
+    risk_class, predecessor_diff = amos.governance._derived_risk_class(
+        proposal, predecessor=predecessor
+    )
+    critic_required = risk_class in {
+        "covenant", "primal_guidance", "constitutional_critical",
+        "meta_constitutional",
+    }
     covenant_refs = [
         covenant_ref,
         *list(additional_covenant_refs or []),
@@ -103,10 +117,18 @@ def _adjudication(
         "unresolved_objections": ["objection:future_counterexample"],
         "adjudication_scope": {"domain": "belief_adoption"},
         "epistemic_standing": {"status": "settled"},
-        "normative_standing": {"status": "settled"},
+        "normative_standing": {"status": "operative"},
         "operational_authority": {
             "status": "operative",
             "permitted_actions": ["use_as_reasoning_premise"],
+        },
+        "constitutional_standing": {"status": "none"},
+        "risk_class": risk_class,
+        "predecessor_diff": predecessor_diff,
+        "advisory_critic": {
+            "status": "available" if critic_required else "disabled",
+            "authority": "advisory_only",
+            "required": critic_required,
         },
         "dissent_refs": ["objection:future_counterexample"],
         "review_triggers": ["material_counterevidence"],
@@ -124,6 +146,14 @@ def _adjudication(
     }
     if threshold is not None:
         payload["ratification_threshold"] = threshold
+    elif amos.governance.RISK_CONFIRMATION_MINIMUMS[risk_class] > 1:
+        payload["ratification_threshold"] = {
+            "required_confirmations": amos.governance.RISK_CONFIRMATION_MINIMUMS[
+                risk_class
+            ],
+            "min_interval_seconds": 1,
+            "materially_distinct_evidence": True,
+        }
     payload.update(extra_payload or {})
     return amos.commit_atom(
         {
@@ -190,7 +220,7 @@ def test_producer_cannot_predeclare_ratification_or_operational_authority(amos):
                 "type": "belief",
                 "payload": {
                     "claim": "The producer says this is already authoritative.",
-                    "normative_standing": {"status": "settled"},
+                    "normative_standing": {"status": "operative"},
                     "operational_authority": {"status": "operative"},
                 },
             }
@@ -198,6 +228,24 @@ def test_producer_cannot_predeclare_ratification_or_operational_authority(amos):
     )["proposals"][0]["atom"]
     assert proposed["payload"]["normative_standing"]["status"] == "candidate"
     assert proposed["payload"]["operational_authority"]["status"] == "withheld"
+    assert proposed["payload"]["constitutional_standing"]["status"] == "withheld"
+
+
+@pytest.mark.parametrize(
+    "field,status",
+    [
+        ("epistemic_standing", "operative"),
+        ("normative_standing", "settled"),
+        ("operational_authority", "settled"),
+        ("constitutional_standing", "operative"),
+    ],
+)
+def test_standing_domains_cannot_be_collapsed(field, status, amos):
+    with pytest.raises(ValidationError, match=f"unsupported {field}.status"):
+        amos.commit_atom({
+            "type": "semantic",
+            "payload": {"summary": "Invalid cross-domain standing.", field: {"status": status}},
+        })
 
 
 def test_batch_commit_cannot_bypass_self_adjudication_authentication(amos):
@@ -218,6 +266,14 @@ def test_batch_commit_cannot_bypass_self_adjudication_authentication(amos):
             "epistemic_standing": {"status": "provisional"},
             "normative_standing": {"status": "none"},
             "operational_authority": {"status": "withheld"},
+            "constitutional_standing": {"status": "none"},
+            "risk_class": "semantic",
+            "predecessor_diff": [],
+            "advisory_critic": {
+                "status": "disabled",
+                "authority": "advisory_only",
+                "required": False,
+            },
             "dissent_refs": [],
             "review_triggers": ["material_counterevidence"],
             "ratifier": {
@@ -246,7 +302,7 @@ def test_batch_commit_cannot_bypass_self_adjudication_authentication(amos):
                 "type": "belief",
                 "payload": {
                     "claim": "A direct active authority claim.",
-                    "normative_standing": {"status": "settled"},
+                    "normative_standing": {"status": "operative"},
                     "operational_authority": {"status": "operative"},
                 },
             }
@@ -716,18 +772,32 @@ def test_constitutional_replacement_is_atomic_and_diachronic(amos):
         actor="svc:example_agent:self-governance",
         authorization_context=AUTHORING,
     )["atom"]
-    current = _covenant(amos, atom_id="covenant_replace_current")
+    current = _covenant(
+        amos,
+        atom_id="covenant_replace_current",
+        amendment_requirements={
+            "mode": "self_ratification",
+            "independent_reconstruction": True,
+            "required_confirmations": 3,
+            "min_interval_seconds": 1,
+            "materially_distinct_evidence": True,
+        },
+    )
+    successor_payload = {
+        **dict(current["payload"]),
+        "name": "Continuing identity authors revisable conclusions",
+        "predecessor_ref": current["id"],
+        "higher_governing_refs": [primal["id"]],
+        "effective_from": "2026-07-25T00:00:00Z",
+    }
+    successor_payload["predecessor_diff"] = amos.governance._payload_path_diff(
+        current["payload"], successor_payload
+    )
     successor = amos.commit_atom(
         {
             "id": "covenant_replace_successor",
             "type": "covenant",
-            "payload": {
-                **dict(current["payload"]),
-                "name": "Continuing identity authors revisable conclusions",
-                "predecessor_ref": current["id"],
-                "higher_governing_refs": [primal["id"]],
-                "effective_from": "2026-07-25T00:00:00Z",
-            },
+            "payload": successor_payload,
             "scope": dict(current["scope"]),
             "supersedes": [current["id"]],
             "lifecycle_state": "proposed",
@@ -764,6 +834,14 @@ def test_constitutional_replacement_is_atomic_and_diachronic(amos):
                 atom_id=f"adjudication_constitutional_replace_{index}",
                 claim_kind="constitutional_replacement",
                 reconstructed_at=f"2026-07-24T{hour:02d}:00:00Z",
+                extra_payload={
+                    "diachronic": {
+                        "independent_reconstruction": True,
+                        "original_reasoning_shown": False,
+                        "new_experience_refs": [f"distinct-experience-{index}"],
+                        "disposition": "confirmed",
+                    }
+                },
             )
         )
     result = amos.replace_constitutional_record(
@@ -782,6 +860,137 @@ def test_constitutional_replacement_is_atomic_and_diachronic(amos):
     assert result["diachronic_status"]["confirmation_count"] == 4
     assert result["event"]["event_type"] == "constitutional_record_replaced"
     assert amos.verify_replay()["status"] == "ok"
+
+
+def test_repeated_identical_evidence_does_not_reach_diachronic_threshold(amos):
+    covenant = _covenant(amos, atom_id="covenant_distinct_evidence")
+    proposal = _proposal(amos, atom_id="proposal_distinct_evidence")
+    for index, hour in enumerate((1, 2, 3), start=1):
+        _adjudication(
+            amos,
+            proposal_ref=proposal["id"],
+            covenant_ref=covenant["id"],
+            atom_id=f"adjudication_repeated_evidence_{index}",
+            reconstructed_at=f"2026-07-24T{hour:02d}:00:00Z",
+            extra_payload={
+                "diachronic": {
+                    "independent_reconstruction": True,
+                    "original_reasoning_shown": False,
+                    "new_experience_refs": ["same-experience"],
+                    "disposition": "confirmed",
+                }
+            },
+        )
+    status = amos.diachronic_ratification_status(
+        subject_ref=proposal["id"],
+        identity_ref="example_agent:self",
+        required_confirmations=3,
+        min_interval_seconds=1,
+        require_distinct_evidence=True,
+    )
+    assert status["confirmation_count"] == 3
+    assert status["intervals_seconds"] == []
+    assert status["evidence_novelty"] == [True, False, False]
+    assert status["materially_distinct_confirmation_count"] == 1
+    assert status["distinct_evidence_ok"] is False
+    assert status["threshold_reached"] is False
+
+
+def test_transition_rejects_caller_selected_risk_class(amos):
+    covenant = _covenant(amos, atom_id="covenant_risk_derivation")
+    proposal = _proposal(amos, atom_id="proposal_risk_derivation")
+    adjudication = _adjudication(
+        amos,
+        proposal_ref=proposal["id"],
+        covenant_ref=covenant["id"],
+        atom_id="adjudication_wrong_risk",
+        extra_payload={"risk_class": "governance"},
+    )
+    with pytest.raises(ValidationError, match="deterministic proposal risk"):
+        amos.ratify_proposal(
+            proposal_ref=proposal["id"],
+            adjudication_ref=adjudication["id"],
+            expected_version=proposal["version"],
+            actor="svc:example_agent:self-governance",
+            authorization_context=RATIFICATION,
+        )
+
+
+def test_constitutional_critical_transition_requires_available_critic(amos):
+    covenant = _covenant(amos, atom_id="covenant_manifest_critic")
+    proposal = amos.propose_memory_atoms([
+        {
+            "id": "proposal_constitution_manifest_v2",
+            "type": "procedure",
+            "payload": {
+                "profile": "cogito.constitution-manifest.v2",
+                "trigger_context": "constitutional boot",
+                "steps": ["verify exact roots"],
+                "review_status": "proposed",
+            },
+            "scope": {"identity": "example_agent:self"},
+        }
+    ], scope={"identity": "example_agent:self"})["proposals"][0]["atom"]
+    adjudication = _adjudication(
+        amos,
+        proposal_ref=proposal["id"],
+        covenant_ref=covenant["id"],
+        atom_id="adjudication_manifest_without_critic",
+        extra_payload={
+            "advisory_critic": {
+                "status": "disabled",
+                "authority": "advisory_only",
+                "required": False,
+            }
+        },
+    )
+    with pytest.raises(ValidationError, match="available advisory critic"):
+        amos.ratify_proposal(
+            proposal_ref=proposal["id"],
+            adjudication_ref=adjudication["id"],
+            expected_version=proposal["version"],
+            actor="svc:example_agent:self-governance",
+            authorization_context=RATIFICATION,
+        )
+
+
+def test_immutable_primary_record_requires_host_capability_and_cannot_be_mutated(amos):
+    atom = {
+        "id": "constitutional_incident_primary",
+        "type": "episode",
+        "payload": {
+            "summary": "Material non-compliance was recorded.",
+            "primary_record": {
+                "immutable": True,
+                "reasoning_suppressible": False,
+                "delivery": "authenticated_governance",
+                "delivery_ref": "evidence:delivery",
+            },
+        },
+    }
+    with pytest.raises(AccessDenied, match="constitutional_incident_recording"):
+        amos.commit_atom(atom, actor="untrusted:caller")
+    committed = amos.commit_atom(
+        atom,
+        actor="svc:example_agent:incident-host",
+        authorization_context={
+            "identity_ref": "example_agent:self",
+            "actor": "svc:example_agent:incident-host",
+            "capabilities": ["constitutional_incident_recording"],
+        },
+    )["atom"]
+    with pytest.raises(ValidationError, match="cannot be updated"):
+        amos.update_atom(
+            committed["id"], payload_patch={"summary": "Suppressed."}
+        )
+    with pytest.raises(ValidationError, match="cannot be deleted"):
+        amos.delete_atom(committed["id"], reason="suppress")
+    with pytest.raises(ValidationError, match="cannot be merged"):
+        amos.merge_atoms(
+            source_refs=[committed["id"]],
+            merged_payload={"summary": "Replacement."},
+            approved_by="operator:test",
+        )
 
 
 def test_generic_mutations_cannot_bypass_governance_transitions(amos):

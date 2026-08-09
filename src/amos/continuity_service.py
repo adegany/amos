@@ -43,7 +43,10 @@ class ContinuityService:
     INTERACTION_PROJECTION_PROFILE = "amos.interaction-projection.v2"
     MEMORY_HEAD_PROFILE = "amos.memory-head.v1"
     SUPPORTED_HEAD_KINDS: ClassVar[frozenset[str]] = frozenset(
-        {"discourse_thread", "goal_work", "interaction_stream", "project_work"}
+        {
+            "assessment_qualification", "discourse_thread", "goal_work",
+            "interaction_stream", "project_work",
+        }
     )
 
     def __init__(
@@ -243,6 +246,20 @@ class ContinuityService:
                 raise ValidationError(
                     "goal.revision must be the next goal head version"
                 )
+        elif series_kind == "assessment_qualification":
+            if new_head.get("type") != "self_assessment":
+                raise ValidationError(
+                    "an assessment_qualification head must identify a self_assessment atom"
+                )
+            payload = new_head.get("payload") or {}
+            if payload.get("assessment_series_id") != series_id:
+                raise ValidationError(
+                    "self_assessment.assessment_series_id must match head_update.series_id"
+                )
+            if int(payload.get("revision", 0)) != current_version + 1:
+                raise ValidationError(
+                    "self_assessment.revision must be the next assessment head version"
+                )
         projected = {
             "scope": dict(scope),
             "series_kind": series_kind,
@@ -414,6 +431,9 @@ class ContinuityService:
                 GovernanceService.assert_adjudication_capability(
                     atom, authorization_context, actor=actor
                 )
+                GovernanceService.assert_immutable_primary_record_capability(
+                    atom, authorization_context, actor=actor
+                )
                 content_digest = self._memory_identity_digest(atom)
                 tombstone = self.store.get_tombstone(
                     str(atom["id"]), content_digest=content_digest
@@ -472,7 +492,8 @@ class ContinuityService:
             superseded_atoms: list[dict[str, Any]] = []
             for head, current in zip(projected_heads, current_heads):
                 if head["series_kind"] not in {
-                    "discourse_thread", "goal_work", "project_work"
+                    "assessment_qualification", "discourse_thread", "goal_work",
+                    "project_work",
                 }:
                     continue
                 if current is None:

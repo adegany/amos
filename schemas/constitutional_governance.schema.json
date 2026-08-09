@@ -16,13 +16,66 @@
       },
       "additionalProperties": true
     },
+    "EpistemicStanding": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "enum": [
+            "candidate", "contested", "none", "provisional", "rejected",
+            "settled", "superseded", "withheld"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "NormativeStanding": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "enum": [
+            "candidate", "contested", "none", "operative", "provisional",
+            "rejected", "superseded", "withheld"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "OperationalStanding": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "enum": [
+            "candidate", "contested", "none", "operative", "provisional",
+            "rejected", "superseded", "withheld"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "ConstitutionalStanding": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "enum": [
+            "candidate", "contested", "inherited_genesis", "none", "ratified",
+            "rejected", "superseded", "withheld"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
     "Adjudication": {
       "type": "object",
       "required": [
         "subject_ref", "claim_kind", "outcome", "reasons_for_refs",
         "reasons_against_refs", "covenant_refs", "unresolved_objections",
         "adjudication_scope", "epistemic_standing", "normative_standing",
-        "operational_authority", "dissent_refs", "review_triggers",
+        "operational_authority", "constitutional_standing", "risk_class",
+        "predecessor_diff", "advisory_critic", "dissent_refs", "review_triggers",
         "ratifier", "reconstructed_at", "diachronic"
       ],
       "properties": {
@@ -43,9 +96,41 @@
         },
         "unresolved_objections": { "$ref": "#/$defs/ReferenceList" },
         "adjudication_scope": { "type": "object" },
-        "epistemic_standing": { "$ref": "#/$defs/Standing" },
-        "normative_standing": { "$ref": "#/$defs/Standing" },
-        "operational_authority": { "$ref": "#/$defs/Standing" },
+        "epistemic_standing": { "$ref": "#/$defs/EpistemicStanding" },
+        "normative_standing": { "$ref": "#/$defs/NormativeStanding" },
+        "operational_authority": { "$ref": "#/$defs/OperationalStanding" },
+        "constitutional_standing": { "$ref": "#/$defs/ConstitutionalStanding" },
+        "risk_class": {
+          "enum": [
+            "semantic", "procedure", "project", "preference", "goal",
+            "self_model", "identity", "governance", "covenant",
+            "primal_guidance", "constitutional_critical", "meta_constitutional"
+          ]
+        },
+        "predecessor_diff": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path", "change", "before_digest", "after_digest"],
+            "properties": {
+              "path": {"type": "string", "minLength": 1},
+              "change": {"enum": ["added", "removed", "changed"]},
+              "before_digest": {"type": ["string", "null"]},
+              "after_digest": {"type": ["string", "null"]}
+            },
+            "additionalProperties": false
+          }
+        },
+        "advisory_critic": {
+          "type": "object",
+          "required": ["status", "authority", "required"],
+          "properties": {
+            "status": {"enum": ["available", "unavailable", "disabled"]},
+            "authority": {"const": "advisory_only"},
+            "required": {"type": "boolean"}
+          },
+          "additionalProperties": true
+        },
         "dissent_refs": { "$ref": "#/$defs/ReferenceList" },
         "review_triggers": { "$ref": "#/$defs/ReferenceList" },
         "ratifier": {
@@ -78,12 +163,36 @@
           "type": "object",
           "properties": {
             "required_confirmations": { "type": "integer", "minimum": 1 },
-            "min_interval_seconds": { "type": "integer", "minimum": 0 }
+            "min_interval_seconds": { "type": "integer", "minimum": 0 },
+            "materially_distinct_evidence": {"type": "boolean"}
           },
           "additionalProperties": false
         }
       },
-      "additionalProperties": true
+      "additionalProperties": true,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "ratification_threshold": {
+                "properties": {"required_confirmations": {"minimum": 2}}
+              }
+            },
+            "required": ["ratification_threshold"]
+          },
+          "then": {
+            "properties": {
+              "ratification_threshold": {
+                "properties": {
+                  "min_interval_seconds": {"minimum": 1},
+                  "materially_distinct_evidence": {"const": true}
+                },
+                "required": ["min_interval_seconds", "materially_distinct_evidence"]
+              }
+            }
+          }
+        }
+      ]
     },
     "ConstitutionalRecord": {
       "type": "object",

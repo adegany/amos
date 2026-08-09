@@ -202,9 +202,22 @@ in-process SQLite store and serializes access through the service boundary:
   cites active constitutional guidance, records objections and scope, and
   passes compare-and-swap. External sources may supply arguments and evidence;
   they cannot become the ratifier.
+- Domain-specific standing validation: `settled` is epistemic only, `operative`
+  is normative or operational, and constitutional standing independently
+  records candidate, inherited-genesis, or ratified status; normative operation
+  never implies epistemic settlement or constitutional authority.
+- Exact constitutional predecessor diffs and protected-field enforcement;
+  one successor cannot remove or weaken its own amendment, audit, evidence, or
+  incident controls.
+- Transition-time deterministic risk/diff verification and required
+  advisory-only critics for constitutional classes; schema-valid caller claims
+  cannot lower their own governance class.
+- Capability-guarded immutable primary incident records that generic mutation,
+  merge, and retrieval-feedback paths cannot suppress or demote.
 - Root-level provenance analysis for independence groups, testimony families,
   common ancestors, ancestry depth, and circular support, plus diachronic
-  reconstruction thresholds for repeated self-ratification.
+  reconstruction thresholds for repeated self-ratification. High-impact
+  thresholds require nonzero intervals and count only materially new evidence.
 - Idempotent capture/commit operations and compare-and-swap update checks.
 - Atomic interaction-memory transactions with immutable events, discourse
   roots, append-only state heads, explicit temporal/discourse relations, and a
@@ -359,7 +372,10 @@ self-authorship; it is not an external approval.
 `POST /v1/proposals:resolve` applies authenticated rejection, revision,
 withdrawal, deferment, or contested status. `POST
 /v1/constitutional-records:replace` atomically supersedes a constitutional head
-after an identity-authored amendment adjudication and its diachronic threshold.
+after an identity-authored amendment adjudication, exact path-level predecessor
+diff, preserved amendment controls, and its diachronic threshold. A repeated or
+empty evidence set does not advance a distinct-evidence threshold; later novel
+evidence can still qualify.
 Global or identity constitutional scope applies to compatible narrower scopes.
 Generic update, archive, delete, maintenance, distillation, and privileged
 service actors cannot complete a cognitive proposal disposition or rewrite
@@ -373,6 +389,11 @@ superseded, archived, and proposed history. Root provenance and diachronic
 confirmation are available through `provenance-analysis` and
 `diachronic-status` in the CLI, or `/v1/provenance:analyze` and
 `/v1/ratifications:diachronic-status` over HTTP.
+
+`assessment_qualification` is a generic canonical CAS head kind for typed
+`self_assessment` series. Its atom must carry the matching
+`assessment_series_id` and next `revision`; AMOS does not interpret or grant
+authority to the assessment's qualification claim.
 
 ### Run the Mirror Agent integration demo
 

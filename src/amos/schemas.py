@@ -49,6 +49,7 @@ GOVERNANCE_PAYLOAD_FIELDS = {
     "epistemic_standing",
     "normative_standing",
     "operational_authority",
+    "constitutional_standing",
     "ratification",
 }
 
@@ -214,16 +215,30 @@ ADJUDICATION_OUTCOMES = POSITIVE_ADJUDICATION_OUTCOMES | {
     "withdrawn",
 }
 
-STANDING_STATUSES = {
+EPISTEMIC_STANDING_STATUSES = {
     "candidate",
     "contested",
     "none",
-    "operative",
     "provisional",
     "rejected",
     "settled",
     "superseded",
     "withheld",
+}
+NORMATIVE_STANDING_STATUSES = {
+    "candidate", "contested", "none", "operative", "provisional",
+    "rejected", "superseded", "withheld",
+}
+OPERATIONAL_STANDING_STATUSES = set(NORMATIVE_STANDING_STATUSES)
+CONSTITUTIONAL_STANDING_STATUSES = {
+    "candidate", "contested", "inherited_genesis", "none", "ratified",
+    "rejected", "superseded", "withheld",
+}
+STANDING_STATUSES_BY_FIELD = {
+    "epistemic_standing": EPISTEMIC_STANDING_STATUSES,
+    "normative_standing": NORMATIVE_STANDING_STATUSES,
+    "operational_authority": OPERATIONAL_STANDING_STATUSES,
+    "constitutional_standing": CONSTITUTIONAL_STANDING_STATUSES,
 }
 
 
@@ -747,6 +762,7 @@ def _validate_standing(
         "epistemic_standing",
         "normative_standing",
         "operational_authority",
+        "constitutional_standing",
     )
     if required:
         _require_payload_fields(atom_type, payload, fields)
@@ -761,7 +777,7 @@ def _validate_standing(
             raise ValidationError(
                 f"{atom_type} payload field {field}.status is required"
             )
-        if status not in STANDING_STATUSES:
+        if status not in STANDING_STATUSES_BY_FIELD[field]:
             raise ValidationError(
                 f"unsupported {field}.status: {status}"
             )
@@ -784,6 +800,10 @@ def _validate_adjudication_payload(payload: Mapping[str, Any]) -> None:
             "epistemic_standing",
             "normative_standing",
             "operational_authority",
+            "constitutional_standing",
+            "risk_class",
+            "predecessor_diff",
+            "advisory_critic",
             "dissent_refs",
             "review_triggers",
             "ratifier",
@@ -802,8 +822,49 @@ def _validate_adjudication_payload(payload: Mapping[str, Any]) -> None:
             "ratifier": Mapping,
             "reconstructed_at": str,
             "diachronic": Mapping,
+            "risk_class": str,
+            "advisory_critic": Mapping,
         },
     )
+    risk_class = str(payload.get("risk_class") or "")
+    if risk_class not in {
+        "semantic", "procedure", "project", "preference", "goal",
+        "self_model", "identity", "governance", "covenant",
+        "primal_guidance", "constitutional_critical",
+        "meta_constitutional",
+    }:
+        raise ValidationError(f"unsupported adjudication risk_class: {risk_class}")
+    predecessor_diff = payload.get("predecessor_diff")
+    if not isinstance(predecessor_diff, list):
+        raise ValidationError("adjudication predecessor_diff must be a list")
+    for item in predecessor_diff:
+        if not isinstance(item, Mapping) or set(item) != {
+            "path", "change", "before_digest", "after_digest"
+        }:
+            raise ValidationError(
+                "adjudication predecessor_diff entries must be exact path diffs"
+            )
+        if not str(item.get("path") or "") or item.get("change") not in {
+            "added", "removed", "changed"
+        }:
+            raise ValidationError("adjudication predecessor_diff entry is invalid")
+        for field in ("before_digest", "after_digest"):
+            value = item.get(field)
+            if value is not None and not isinstance(value, str):
+                raise ValidationError(
+                    f"adjudication predecessor_diff {field} must be a string or null"
+                )
+    critic = payload.get("advisory_critic")
+    if not isinstance(critic, Mapping):
+        raise ValidationError("adjudication advisory_critic must be an object")
+    if critic.get("status") not in {"available", "unavailable", "disabled"}:
+        raise ValidationError("unsupported adjudication advisory_critic.status")
+    if critic.get("authority") != "advisory_only":
+        raise ValidationError(
+            "adjudication advisory_critic.authority must be advisory_only"
+        )
+    if not isinstance(critic.get("required"), bool):
+        raise ValidationError("adjudication advisory_critic.required must be boolean")
     for field in (
         "reasons_for_refs",
         "reasons_against_refs",

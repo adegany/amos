@@ -18,6 +18,7 @@ from .errors import (
     StaleFrameError,
     ValidationError,
 )
+from .governance_service import GovernanceService
 from .schemas import CONSTITUTIONAL_ATOM_TYPES
 from .service import Amos
 from .workers import BackgroundMemoryPolicyWorker
@@ -218,6 +219,22 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         "memory transaction profile must be "
                         "'amos.memory-transaction.v1'"
                     )
+                atoms = list(request.get("atoms") or [])
+                protected = any(
+                    isinstance(atom, Mapping)
+                    and (
+                        str(atom.get("type") or "")
+                        in {*CONSTITUTIONAL_ATOM_TYPES, "adjudication"}
+                        or GovernanceService.is_immutable_primary_record(atom)
+                    )
+                    for atom in atoms
+                )
+                context = self._authorization_context(
+                    server, request, required=protected
+                )
+                request["authorization_context"] = context
+                if protected and context.get("actor"):
+                    request["actor"] = str(context["actor"])
                 return self._write_json(
                     amos.commit_memory_transaction(**request)
                 )
@@ -274,8 +291,11 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 )
                 protected = any(
                     isinstance(atom, Mapping)
-                    and str(atom.get("type") or "")
-                    in {*CONSTITUTIONAL_ATOM_TYPES, "adjudication"}
+                    and (
+                        str(atom.get("type") or "")
+                        in {*CONSTITUTIONAL_ATOM_TYPES, "adjudication"}
+                        or GovernanceService.is_immutable_primary_record(atom)
+                    )
                     for atom in candidates
                 )
                 context = self._authorization_context(
@@ -310,6 +330,7 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                     and (
                         current.get("type")
                         in {*CONSTITUTIONAL_ATOM_TYPES, "adjudication"}
+                        or GovernanceService.is_immutable_primary_record(current)
                         or any(
                             key
                             in {
@@ -317,6 +338,7 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                                 "epistemic_standing",
                                 "normative_standing",
                                 "operational_authority",
+                                "constitutional_standing",
                             }
                             for key in dict(body.get("payload_patch") or {})
                         )
@@ -392,8 +414,11 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 current = amos.store.get_atom(str(body.get("atom_id") or ""))
                 protected = bool(
                     current
-                    and current.get("type")
-                    in {*CONSTITUTIONAL_ATOM_TYPES, "adjudication"}
+                    and (
+                        current.get("type")
+                        in {*CONSTITUTIONAL_ATOM_TYPES, "adjudication"}
+                        or GovernanceService.is_immutable_primary_record(current)
+                    )
                 )
                 context = self._authorization_context(
                     server, body, required=protected

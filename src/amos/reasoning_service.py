@@ -1803,6 +1803,7 @@ class ReasoningFrameService:
                 "epistemic_standing",
                 "normative_standing",
                 "operational_authority",
+                "constitutional_standing",
                 "ratification",
             ):
                 if isinstance(payload.get(field), Mapping):
@@ -2398,6 +2399,7 @@ class ReasoningFrameService:
                 "epistemic_standing",
                 "normative_standing",
                 "operational_authority",
+                "constitutional_standing",
             )
         )
 
@@ -2414,6 +2416,7 @@ class ReasoningFrameService:
                 "epistemic_standing",
                 "normative_standing",
                 "operational_authority",
+                "constitutional_standing",
             )
         )
 

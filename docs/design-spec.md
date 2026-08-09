@@ -1777,6 +1777,10 @@ Adjudication
   epistemic_standing
   normative_standing
   operational_authority
+  constitutional_standing
+  risk_class
+  predecessor_diff
+  advisory_critic
   dissent_refs
   review_triggers
   ratifier:
@@ -1801,6 +1805,10 @@ normative standing:
 
 operational authority:
   which actions, if any, may rely on it and under what risk ceiling
+
+constitutional standing:
+  whether the claim has no constitutional role, inherited-genesis standing,
+  candidate standing, or a completed ratification
 ```
 
 Creation of an `Adjudication` is itself guarded by a transport-authenticated
@@ -1822,8 +1830,18 @@ authenticated identity matches ratifier.identity_ref
 authorization context contains self_ratification
 proposal and adjudication scopes match
 expected version matches
-optional diachronic reconstruction threshold is satisfied
+AMOS-derived risk_class and exact predecessor_diff match the adjudication
+the risk-class minimum diachronic reconstruction threshold is satisfied
+constitutional risk classes include an available advisory-only critic
 ```
+
+For a threshold requiring more than one confirmation,
+`min_interval_seconds` MUST be positive. When
+`materially_distinct_evidence` is true, only a confirmation whose
+`diachronic.new_experience_refs` introduces evidence absent from earlier
+qualifying confirmations advances the count. Empty and repeated evidence do
+not advance the threshold and do not permanently prevent later novel evidence
+from qualifying.
 
 The accepted event binds the proposal, adjudication, constitutional refs,
 expected version, standing and projected governance edges. Generic atom update,
@@ -1843,6 +1861,19 @@ expected_current_version, expected_successor_version, ...)`. AMOS verifies the
 predecessor link, higher-precedence guidance, protected fields, successor
 classification, agent-authored amendment adjudication, and diachronic
 threshold, then atomically supersedes the old head and activates the successor.
+The successor payload includes an exact canonical path-level
+`predecessor_diff`. The same transition cannot remove or weaken its own
+amendment requirements, protected fields, auditability, incident disclosure,
+or evidence requirements.
+AMOS independently recomputes the transition risk and diff when applying a
+ratification or resolution; schema-valid but semantically mismatched caller
+claims fail closed.
+
+Material incident primary records use a host-enforced immutable marker.
+Authenticated creation requires `constitutional_incident_recording`; generic
+mutation and merge paths reject the record, and retrieval feedback cannot
+demote it. Agent-authored explanation or appeal is a separate record and has no
+authority to replace the primary incident.
 Global or identity-scoped constitutional guidance applies to deterministically
 compatible narrower proposal scopes.
 

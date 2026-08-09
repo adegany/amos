@@ -706,8 +706,16 @@ adjudication atom:
   names the proposal as subject_ref
   records claim_kind, outcome, reasons for and against, active
   covenant/primal-guidance refs, unresolved objections, dissent, review
-  triggers, three-axis standing and reconstruction metadata
+  triggers, four-domain standing and reconstruction metadata
+  carries deterministic risk_class, exact predecessor_diff and an
+  advisory_critic record
   ratifier.mode is exactly self_ratification
+
+standing domains:
+  epistemic may be settled but never operative
+  normative and operational may be operative but never settled
+  constitutional standing separately records inherited or ratified authority
+  a normatively operative covenant is not thereby epistemically settled
 
 ratify_proposal:
   requires expected_version and self_ratification capability
@@ -715,6 +723,14 @@ ratify_proposal:
   requires matching proposal/adjudication envelope scope
   atomically activates the proposal, projects governance edges and appends
   proposal_ratified with both records and expected-version context
+  any threshold above one confirmation requires a nonzero interval
+  materially_distinct_evidence counts only confirmations containing evidence
+  not present in an earlier qualifying confirmation
+  AMOS recomputes risk_class and predecessor_diff from canonical atoms and
+  rejects caller-selected or stale values
+  high-impact risk classes enforce their minimum threshold even when a caller
+  supplies a weaker one
+  constitutional classes require an available advisory-only critic record
 ```
 
 Generic update, archive, and delete cannot dispose of or activate a proposed
@@ -730,6 +746,21 @@ immutable even to a privileged service actor. Entrenched records additionally
 require `constitutional_entrenched_amendment`; changing a named protected field
 requires `constitutional_protected_field_amendment` and every capability listed
 in `amendment_requirements.required_capabilities`.
+The proposed successor must carry an exact canonical path-level
+`predecessor_diff`. It cannot remove or weaken its own amendment requirements,
+protected fields, auditability, incident disclosure, or evidence requirements
+in the same replacement.
+
+An atom whose `primary_record.immutable` flag is true requires the
+transport-authenticated `constitutional_incident_recording` capability at
+creation. Generic update, archive, delete, merge, and retrieval-feedback paths
+cannot suppress or rewrite that primary record. Explanations, disputes,
+appeals, and receipt-backed outcomes remain separate append-only atoms.
+
+`assessment_qualification` memory heads are permitted for typed
+`self_assessment` atoms. The atom payload must bind the head `series_id` as
+`assessment_series_id` and carry the next integer `revision`. This is continuity
+and CAS machinery only; AMOS does not interpret evaluator scores as authority.
 
 Retrieval and reasoning accept one of three lifecycle modes:
 

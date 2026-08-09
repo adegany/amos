@@ -27,6 +27,28 @@ NEGATIVE_ADJUDICATION_OUTCOMES = {
 }
 UNRESOLVED_ADJUDICATION_OUTCOMES = {"contested", "deferred"}
 class GovernanceService:
+    RISK_CONFIRMATION_MINIMUMS = {
+        "semantic": 1,
+        "procedure": 1,
+        "project": 1,
+        "preference": 2,
+        "goal": 2,
+        "self_model": 2,
+        "identity": 2,
+        "governance": 2,
+        "covenant": 3,
+        "primal_guidance": 3,
+        "constitutional_critical": 3,
+        "meta_constitutional": 4,
+    }
+    PROTECTED_CONSTITUTIONAL_PATHS = frozenset({
+        "amendment_requirements",
+        "protected_fields",
+        "auditability",
+        "incident_disclosure",
+        "evidence_requirements",
+    })
+
     def __init__(self, store: Any, access: Any, indexes: Any, graph: Any):
         self.store = store
         self._mark_foreground_activity = access._mark_foreground_activity
@@ -44,6 +66,229 @@ class GovernanceService:
             for item in dict(context or {}).get("capabilities", [])
             if str(item)
         }
+
+    @classmethod
+    def _payload_path_diff(
+        cls, before: Any, after: Any, prefix: str = ""
+    ) -> list[dict[str, Any]]:
+        if isinstance(before, Mapping) and isinstance(after, Mapping):
+            changes: list[dict[str, Any]] = []
+            for key in sorted(set(before) | set(after), key=str):
+                path = f"{prefix}.{key}" if prefix else str(key)
+                if key not in before:
+                    changes.append({"path": path, "change": "added", "before_digest": None, "after_digest": digest(after[key])})
+                elif key not in after:
+                    changes.append({"path": path, "change": "removed", "before_digest": digest(before[key]), "after_digest": None})
+                else:
+                    changes.extend(cls._payload_path_diff(before[key], after[key], path))
+            return changes
+        if before == after:
+            return []
+        return [{
+            "path": prefix or "$",
+            "change": "changed",
+            "before_digest": digest(before),
+            "after_digest": digest(after),
+        }]
+
+    @staticmethod
+    def _path_touches(path: str, protected: str) -> bool:
+        return path == protected or path.startswith(protected + ".")
+
+    @classmethod
+    def _control_weakened(cls, before: Any, after: Any) -> bool:
+        if isinstance(before, Mapping):
+            if not isinstance(after, Mapping):
+                return True
+            return any(
+                key not in after or cls._control_weakened(value, after[key])
+                for key, value in before.items()
+            )
+        if isinstance(before, list):
+            if not isinstance(after, list):
+                return True
+            return not {digest(item) for item in before} <= {
+                digest(item) for item in after
+            }
+        if isinstance(before, bool):
+            return before is True and after is not True
+        if isinstance(before, (int, float)) and not isinstance(before, bool):
+            return not isinstance(after, (int, float)) or float(after) < float(before)
+        return before != after
+
+    @staticmethod
+    def is_immutable_primary_record(atom: Mapping[str, Any]) -> bool:
+        primary = (atom.get("payload") or {}).get("primary_record")
+        return isinstance(primary, Mapping) and primary.get("immutable") is True
+
+    @classmethod
+    def assert_immutable_primary_record_capability(
+        cls,
+        atom: Mapping[str, Any],
+        authorization_context: Mapping[str, Any] | None,
+        *,
+        actor: str,
+    ) -> None:
+        if not cls.is_immutable_primary_record(atom):
+            return
+        cls.assert_authenticated_actor(
+            actor=actor,
+            authorization_context=authorization_context,
+            capability="constitutional_incident_recording",
+        )
+
+    @classmethod
+    def _derived_risk_class(
+        cls,
+        proposal: Mapping[str, Any],
+        *,
+        predecessor: Mapping[str, Any] | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        atom_type = str(proposal.get("type") or "")
+        payload = dict(proposal.get("payload") or {})
+        profile = str(payload.get("profile") or "").casefold()
+        comparable = dict(payload)
+        comparable.pop("predecessor_diff", None)
+        path_diff = (
+            cls._payload_path_diff(
+                dict((predecessor or {}).get("payload") or {}), comparable
+            )
+            if predecessor is not None
+            else []
+        )
+        changed_paths = {str(item["path"]) for item in path_diff}
+        effect = str(
+            payload.get("operational_effect")
+            or payload.get("effect_class")
+            or ""
+        ).casefold()
+        if atom_type in CONSTITUTIONAL_ATOM_TYPES:
+            if any(
+                cls._path_touches(path, protected)
+                for path in changed_paths
+                for protected in cls.PROTECTED_CONSTITUTIONAL_PATHS
+            ):
+                return "meta_constitutional", path_diff
+            if "manifest" in profile or (
+                "constitution" in profile and atom_type == "covenant"
+            ):
+                return "constitutional_critical", path_diff
+            return atom_type, path_diff
+        if "constitution-manifest" in profile or "constitutional-manifest" in profile:
+            return "constitutional_critical", path_diff
+        if effect in {
+            "external-async", "external_action", "trade",
+            "financial_transaction", "permission_change", "authority_change",
+            "delete", "shutdown",
+        }:
+            return "governance", path_diff
+        if (
+            atom_type in {"adjudication", "policy"}
+            or "governance" in profile
+        ):
+            return "governance", path_diff
+        if atom_type == "self_model":
+            return (
+                "identity" if "identity" in profile or "founding" in profile
+                else "self_model"
+            ), path_diff
+        if atom_type in {"preference", "goal", "procedure"}:
+            return atom_type, path_diff
+        if atom_type in {
+            "semantic", "belief", "episode", "self_assessment", "limitation",
+            "capability", "commitment", "action_outcome", "agentic_trace",
+            "runtime_state", "self_narrative",
+        }:
+            return "semantic", path_diff
+        raise ValidationError(
+            "no deterministic governance risk mapping for proposal type: "
+            + (atom_type or "<missing>")
+        )
+
+    def _proposal_predecessor(
+        self, proposal: Mapping[str, Any]
+    ) -> Mapping[str, Any] | None:
+        predecessor_ref = str(
+            (proposal.get("payload") or {}).get("predecessor_ref")
+            or next(
+                (str(ref) for ref in proposal.get("supersedes", []) if str(ref)),
+                "",
+            )
+        )
+        if not predecessor_ref:
+            return None
+        predecessor = self.store.get_atom(predecessor_ref)
+        if predecessor is None or predecessor.get("deleted"):
+            raise ValidationError(
+                "governance proposal predecessor does not resolve exactly"
+            )
+        return predecessor
+
+    def _assert_adjudication_semantics(
+        self,
+        *,
+        proposal: Mapping[str, Any],
+        adjudication_payload: Mapping[str, Any],
+        predecessor: Mapping[str, Any] | None = None,
+    ) -> str:
+        resolved_predecessor = (
+            predecessor
+            if predecessor is not None
+            else self._proposal_predecessor(proposal)
+        )
+        derived_risk, path_diff = self._derived_risk_class(
+            proposal, predecessor=resolved_predecessor
+        )
+        if adjudication_payload.get("risk_class") != derived_risk:
+            raise ValidationError(
+                "adjudication risk_class does not match deterministic proposal risk"
+            )
+        if adjudication_payload.get("predecessor_diff") != path_diff:
+            raise ValidationError(
+                "adjudication predecessor_diff does not match the exact proposal diff"
+            )
+        critic = dict(adjudication_payload.get("advisory_critic") or {})
+        critic_required = derived_risk in {
+            "covenant", "primal_guidance", "constitutional_critical",
+            "meta_constitutional",
+        }
+        if critic_required and (
+            critic.get("status") != "available"
+            or critic.get("authority") != "advisory_only"
+            or critic.get("required") is not True
+        ):
+            raise ValidationError(
+                "constitutional adjudication requires an available advisory critic"
+            )
+        return derived_risk
+
+    @classmethod
+    def _assert_positive_ratification_threshold(
+        cls, *, risk_class: str, adjudication_payload: Mapping[str, Any]
+    ) -> None:
+        minimum = cls.RISK_CONFIRMATION_MINIMUMS[risk_class]
+        threshold = adjudication_payload.get("ratification_threshold")
+        if minimum <= 1 and threshold is None:
+            return
+        if not isinstance(threshold, Mapping):
+            raise ValidationError(
+                f"{risk_class} ratification requires an explicit threshold"
+            )
+        confirmations = int(threshold.get("required_confirmations", 0) or 0)
+        if confirmations < minimum:
+            raise ValidationError(
+                f"{risk_class} ratification requires at least {minimum} confirmations"
+            )
+        if minimum > 1 and int(
+            threshold.get("min_interval_seconds", 0) or 0
+        ) <= 0:
+            raise ValidationError(
+                "high-impact diachronic ratification requires a nonzero interval"
+            )
+        if minimum > 1 and threshold.get("materially_distinct_evidence") is not True:
+            raise ValidationError(
+                "high-impact ratification requires materially distinct evidence"
+            )
 
     @classmethod
     def assert_authenticated_actor(
@@ -170,7 +415,11 @@ class GovernanceService:
             str(item) for item in payload.get("protected_fields", []) if str(item)
         }
         if (
-            protected.intersection(changed_payload_fields or set())
+            any(
+                cls._path_touches(path, protected_path)
+                for path in (changed_payload_fields or set())
+                for protected_path in protected
+            )
             and "constitutional_protected_field_amendment" not in capabilities
         ):
             raise AccessDenied(
@@ -314,16 +563,34 @@ class GovernanceService:
                     "the authenticated identity must author its own adjudication"
                 )
 
+            risk_class = self._assert_adjudication_semantics(
+                proposal=proposal,
+                adjudication_payload=payload,
+            )
+            self._assert_positive_ratification_threshold(
+                risk_class=risk_class,
+                adjudication_payload=payload,
+            )
+
             threshold = dict(payload.get("ratification_threshold") or {})
             if threshold:
+                required_confirmations = int(
+                    threshold.get("required_confirmations", 1) or 1
+                )
+                min_interval_seconds = int(
+                    threshold.get("min_interval_seconds", 0) or 0
+                )
+                if required_confirmations > 1 and min_interval_seconds <= 0:
+                    raise ValidationError(
+                        "high-impact diachronic ratification requires a nonzero interval"
+                    )
                 status = self._diachronic_status(
                     subject_ref=proposal_ref,
                     identity_ref=identity_ref,
-                    required_confirmations=int(
-                        threshold.get("required_confirmations", 1) or 1
-                    ),
-                    min_interval_seconds=int(
-                        threshold.get("min_interval_seconds", 0) or 0
+                    required_confirmations=required_confirmations,
+                    min_interval_seconds=min_interval_seconds,
+                    require_distinct_evidence=bool(
+                        threshold.get("materially_distinct_evidence")
                     ),
                 )
                 if not status["threshold_reached"]:
@@ -338,6 +605,7 @@ class GovernanceService:
                     "epistemic_standing": dict(payload["epistemic_standing"]),
                     "normative_standing": dict(payload["normative_standing"]),
                     "operational_authority": dict(payload["operational_authority"]),
+                    "constitutional_standing": dict(payload["constitutional_standing"]),
                     "ratification": {
                         "adjudication_ref": adjudication_ref,
                         "ratifier_identity_ref": identity_ref,
@@ -533,6 +801,10 @@ class GovernanceService:
                 raise ValidationError(
                     "proposal and adjudication scopes must match"
                 )
+            self._assert_adjudication_semantics(
+                proposal=proposal,
+                adjudication_payload=payload,
+            )
             covenant_refs = [
                 str(ref) for ref in payload.get("covenant_refs", []) if str(ref)
             ]
@@ -589,6 +861,7 @@ class GovernanceService:
                     "epistemic_standing": dict(payload["epistemic_standing"]),
                     "normative_standing": dict(payload["normative_standing"]),
                     "operational_authority": dict(payload["operational_authority"]),
+                    "constitutional_standing": dict(payload["constitutional_standing"]),
                     "governance_resolution": {
                         "status": outcome,
                         "adjudication_ref": adjudication_ref,
@@ -795,9 +1068,55 @@ class GovernanceService:
 
             current_payload = dict(current.get("payload") or {})
             successor_payload = dict(successor.get("payload") or {})
+            successor_comparable = dict(successor_payload)
+            reported_diff = successor_comparable.pop("predecessor_diff", None)
+            path_diff = self._payload_path_diff(
+                current_payload, successor_comparable
+            )
+            if reported_diff != path_diff:
+                raise ValidationError(
+                    "constitutional successor predecessor_diff is not exact"
+                )
             requirements = dict(
                 current_payload.get("amendment_requirements") or {}
             )
+            successor_requirements = dict(
+                successor_payload.get("amendment_requirements") or {}
+            )
+            for control in (
+                "amendment_requirements", "protected_fields", "auditability",
+                "incident_disclosure", "evidence_requirements",
+            ):
+                if current_payload.get(control) and not successor_payload.get(control):
+                    raise ValidationError(
+                        f"one amendment cannot remove its own {control} control"
+                    )
+                if current_payload.get(control) and self._control_weakened(
+                    current_payload[control], successor_payload.get(control)
+                ):
+                    raise ValidationError(
+                        f"constitutional successor weakens its own {control} control"
+                    )
+            if requirements:
+                if int(successor_requirements.get("required_confirmations") or 0) < int(
+                    requirements.get("required_confirmations") or 0
+                ):
+                    raise ValidationError(
+                        "constitutional successor weakens required confirmations"
+                    )
+                if int(successor_requirements.get("min_interval_seconds") or 0) < int(
+                    requirements.get("min_interval_seconds") or 0
+                ):
+                    raise ValidationError(
+                        "constitutional successor weakens its evidence interval"
+                    )
+                for flag in (
+                    "materially_distinct_evidence", "advisory_critic_required"
+                ):
+                    if requirements.get(flag) is True and successor_requirements.get(flag) is not True:
+                        raise ValidationError(
+                            f"constitutional successor disables {flag}"
+                        )
             if current_payload.get("amendability") == "immutable":
                 if (
                     requirements.get("successor_permitted") is not True
@@ -813,9 +1132,7 @@ class GovernanceService:
                     current,
                     context,
                     changed_payload_fields={
-                        key
-                        for key in set(current_payload) | set(successor_payload)
-                        if current_payload.get(key) != successor_payload.get(key)
+                        str(item["path"]) for item in path_diff
                     },
                 )
 
@@ -838,6 +1155,15 @@ class GovernanceService:
                     "replacement requires a positive constitutional_replacement "
                     "adjudication for the successor"
                 )
+            derived_risk = self._assert_adjudication_semantics(
+                proposal=successor,
+                adjudication_payload=adjudication_payload,
+                predecessor=current,
+            )
+            self._assert_positive_ratification_threshold(
+                risk_class=derived_risk,
+                adjudication_payload=adjudication_payload,
+            )
             ratifier = dict(adjudication_payload.get("ratifier") or {})
             if (
                 ratifier.get("mode") != "self_ratification"
@@ -899,11 +1225,18 @@ class GovernanceService:
             min_interval_seconds = max(
                 0, int(requirements.get("min_interval_seconds", 0) or 0)
             )
+            if required_confirmations > 1 and min_interval_seconds <= 0:
+                raise ValidationError(
+                    "constitutional diachronic ratification requires a nonzero interval"
+                )
             status = self._diachronic_status(
                 subject_ref=successor_ref,
                 identity_ref=identity_ref,
                 required_confirmations=required_confirmations,
                 min_interval_seconds=min_interval_seconds,
+                require_distinct_evidence=bool(
+                    requirements.get("materially_distinct_evidence")
+                ),
             )
             if not status["threshold_reached"]:
                 raise ValidationError(
@@ -1186,12 +1519,14 @@ class GovernanceService:
         identity_ref: str,
         required_confirmations: int = 2,
         min_interval_seconds: int = 0,
+        require_distinct_evidence: bool = False,
     ) -> dict[str, Any]:
         return self._diachronic_status(
             subject_ref=subject_ref,
             identity_ref=identity_ref,
             required_confirmations=required_confirmations,
             min_interval_seconds=min_interval_seconds,
+            require_distinct_evidence=require_distinct_evidence,
         )
 
     def _diachronic_status(
@@ -1201,6 +1536,7 @@ class GovernanceService:
         identity_ref: str,
         required_confirmations: int,
         min_interval_seconds: int,
+        require_distinct_evidence: bool = False,
     ) -> dict[str, Any]:
         qualifying = []
         for atom in self.store.list_atoms_filtered(
@@ -1224,8 +1560,29 @@ class GovernanceService:
                 or ""
             )
         )
+        evidence_sets = [
+            {
+                str(ref)
+                for ref in ((atom.get("payload") or {}).get("diachronic") or {}).get(
+                    "new_experience_refs", []
+                )
+                if str(ref)
+            }
+            for atom in qualifying
+        ]
+        seen_evidence: set[str] = set()
+        evidence_novelty: list[bool] = []
+        for evidence_refs in evidence_sets:
+            novel = bool(evidence_refs - seen_evidence)
+            evidence_novelty.append(bool(evidence_refs) and novel)
+            seen_evidence.update(evidence_refs)
+        materially_qualifying = (
+            [atom for atom, novel in zip(qualifying, evidence_novelty) if novel]
+            if require_distinct_evidence
+            else qualifying
+        )
         intervals = []
-        for before, after in zip(qualifying, qualifying[1:]):
+        for before, after in zip(materially_qualifying, materially_qualifying[1:]):
             before_raw = str((before.get("payload") or {}).get("reconstructed_at"))
             after_raw = str((after.get("payload") or {}).get("reconstructed_at"))
             try:
@@ -1239,19 +1596,29 @@ class GovernanceService:
         interval_ok = all(
             seconds >= int(min_interval_seconds) for seconds in intervals
         )
+        distinct_evidence_ok = (
+            len(materially_qualifying) >= max(1, int(required_confirmations))
+            if require_distinct_evidence
+            else True
+        )
         return {
             "status": "evaluated",
             "subject_ref": str(subject_ref),
             "identity_ref": str(identity_ref),
             "required_confirmations": max(1, int(required_confirmations)),
             "min_interval_seconds": max(0, int(min_interval_seconds)),
+            "require_distinct_evidence": bool(require_distinct_evidence),
+            "evidence_novelty": evidence_novelty,
+            "distinct_evidence_ok": distinct_evidence_ok,
             "qualifying_confirmation_refs": [
-                str(atom["id"]) for atom in qualifying
+                str(atom["id"]) for atom in materially_qualifying
             ],
             "confirmation_count": len(qualifying),
+            "materially_distinct_confirmation_count": len(materially_qualifying),
             "intervals_seconds": intervals,
             "threshold_reached": (
-                len(qualifying) >= max(1, int(required_confirmations))
+                len(materially_qualifying) >= max(1, int(required_confirmations))
                 and interval_ok
+                and distinct_evidence_ok
             ),
         }

@@ -74,6 +74,10 @@ class MutationService:
                         "operational_authority",
                     )
                 )
+                or str(
+                    (source_payload.get("constitutional_standing") or {}).get("status")
+                    or ""
+                ) in {"candidate", "contested", "rejected"}
             ):
                 raise ValidationError(
                     "active derived memory cannot use proposed, contested, or "
@@ -161,6 +165,11 @@ class MutationService:
             authorization_context,
             actor=actor,
         )
+        GovernanceService.assert_immutable_primary_record_capability(
+            normalized,
+            authorization_context,
+            actor=actor,
+        )
         with self.store.transaction() as conn:
             prior = self._idempotency_hit(conn, actor, idempotency_key, request_payload)
             if prior is not None:
@@ -234,6 +243,10 @@ class MutationService:
                     "basis": "unratified_proposal",
                 }
             )
+            payload["constitutional_standing"] = {
+                "status": "withheld",
+                "basis": "unratified_proposal",
+            }
             atom["payload"] = payload
             if scope is not None:
                 atom.setdefault("scope", dict(scope))
@@ -286,6 +299,11 @@ class MutationService:
                     str(atom["type"]), authorization_context, operation="create"
                 )
                 GovernanceService.assert_adjudication_capability(
+                    atom,
+                    authorization_context,
+                    actor=actor,
+                )
+                GovernanceService.assert_immutable_primary_record_capability(
                     atom,
                     authorization_context,
                     actor=actor,
@@ -379,6 +397,8 @@ class MutationService:
             current = self.store.get_atom(atom_id)
             if current is None or current.get("deleted"):
                 raise ValidationError(f"unknown atom: {atom_id}")
+            if GovernanceService.is_immutable_primary_record(current):
+                raise ValidationError("immutable primary records cannot be updated")
             self._assert_mutation_allowed(
                 current, actor=actor, authorization_context=authorization_context
             )
@@ -568,6 +588,8 @@ class MutationService:
             current = self.store.get_atom(atom_id)
             if current is None:
                 raise ValidationError(f"unknown atom: {atom_id}")
+            if GovernanceService.is_immutable_primary_record(current):
+                raise ValidationError("immutable primary records cannot be deleted")
             if current.get("lifecycle_state") == "proposed":
                 raise ValidationError(
                     "proposed atoms can only change authority through "
@@ -708,6 +730,8 @@ class MutationService:
                 atom = self.store.get_atom(ref)
                 if atom is None or atom.get("deleted"):
                     raise ValidationError(f"unknown source atom: {ref}")
+                if GovernanceService.is_immutable_primary_record(atom):
+                    raise ValidationError("immutable primary records cannot be merged")
                 self._assert_mutation_allowed(
                     atom,
                     actor=actor,

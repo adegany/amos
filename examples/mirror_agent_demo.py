@@ -1849,6 +1849,20 @@ class MirrorAgentDemo:
         proposal = proposal_lookup.get("item")
         if proposal is None:
             raise RuntimeError(f"governance proposal missing: {proposal_ref}")
+        canonical_proposal = self.amos.store.get_atom(proposal_ref)
+        if canonical_proposal is None:
+            raise RuntimeError(f"canonical governance proposal missing: {proposal_ref}")
+        predecessor = self.amos.governance._proposal_predecessor(canonical_proposal)
+        risk_class, predecessor_diff = self.amos.governance._derived_risk_class(
+            canonical_proposal, predecessor=predecessor
+        )
+        critic_required = risk_class in {
+            "covenant", "primal_guidance", "constitutional_critical",
+            "meta_constitutional",
+        }
+        required_confirmations = (
+            self.amos.governance.RISK_CONFIRMATION_MINIMUMS[risk_class]
+        )
         frame = self.amos.compile_memory_frame(
             need=f"Adjudicate Mirror proposal {proposal_ref}",
             purpose=(
@@ -1885,10 +1899,20 @@ class MirrorAgentDemo:
                         "status": "settled" if positive else "rejected"
                     },
                     "normative_standing": {
-                        "status": "settled" if positive else "rejected"
+                        "status": "operative" if positive else "rejected"
                     },
                     "operational_authority": {
                         "status": "operative" if positive else "none"
+                    },
+                    "constitutional_standing": {
+                        "status": "none" if positive else "withheld"
+                    },
+                    "risk_class": risk_class,
+                    "predecessor_diff": predecessor_diff,
+                    "advisory_critic": {
+                        "status": "available" if critic_required else "disabled",
+                        "authority": "advisory_only",
+                        "required": critic_required,
                     },
                     "dissent_refs": [],
                     "review_triggers": ["material_counterevidence"],
@@ -1911,8 +1935,13 @@ class MirrorAgentDemo:
                         "disposition": "confirmed" if positive else "withdrawn",
                     },
                     "ratification_threshold": {
-                        "required_confirmations": 1,
-                        "min_interval_seconds": 0,
+                        "required_confirmations": required_confirmations,
+                        "min_interval_seconds": (
+                            1 if required_confirmations > 1 else 0
+                        ),
+                        "materially_distinct_evidence": (
+                            required_confirmations > 1
+                        ),
                     },
                 },
                 "scope": SCOPE,
@@ -1924,8 +1953,9 @@ class MirrorAgentDemo:
         diachronic = self.amos.diachronic_ratification_status(
             subject_ref=proposal_ref,
             identity_ref=AGENT_ID,
-            required_confirmations=1,
-            min_interval_seconds=0,
+            required_confirmations=required_confirmations,
+            min_interval_seconds=(1 if required_confirmations > 1 else 0),
+            require_distinct_evidence=required_confirmations > 1,
         )
         transition = (
             self.amos.ratify_proposal(

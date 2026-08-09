@@ -1101,6 +1101,10 @@ class StewardshipService:
                     "operational_authority",
                 )
             )
+            or str(
+                ((source.get("payload") or {}).get("constitutional_standing") or {}).get("status")
+                or ""
+            ) in {"candidate", "contested", "rejected"}
             for source in source_atoms
         ):
             return {

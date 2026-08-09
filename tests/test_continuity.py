@@ -1252,3 +1252,37 @@ def test_http_memory_transaction_workspace_and_cas_conflict(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+def test_assessment_qualification_head_is_canonical_and_revision_guarded(amos):
+    scope = {"system": "test", "namespace": "assessment"}
+    first = {
+        "id": "assessment_qualification_1",
+        "type": "self_assessment",
+        "payload": {
+            "profile": "test.assessment-qualification.v1",
+            "agent_id": "agent:test",
+            "claim": "The candidate remains developmental.",
+            "calibration": {"runs": 1},
+            "assessment_series_id": "suite:test",
+            "revision": 1,
+        },
+        "scope": scope,
+    }
+    amos.commit_memory_transaction(
+        atoms=[first],
+        head_updates=[{
+            "series_kind": "assessment_qualification",
+            "series_id": "suite:test",
+            "expected_head_ref": None,
+            "expected_head_version": 0,
+            "new_head_ref": first["id"],
+        }],
+        actor="assessment:test",
+        scope=scope,
+    )
+    head = amos.get_memory_head(
+        scope=scope,
+        series_kind="assessment_qualification",
+        series_id="suite:test",
+    )
+    assert head["head_ref"] == first["id"]
+    assert head["head_version"] == 1

@@ -24,6 +24,7 @@ from ._service_support import (
     stable_id,
     utc_now,
 )
+from .governance_service import GovernanceService
 
 MEMORY_MODES = {
     "deliberation",
@@ -662,6 +663,8 @@ class RetrievalService:
         for atom_ref in sorted(positive_refs.union(correction_refs)):
             atom = self.store.get_atom(atom_ref)
             if atom is None or atom.get("deleted"):
+                continue
+            if GovernanceService.is_immutable_primary_record(atom):
                 continue
             changed = dict(atom)
             telemetry = dict(changed.get("decay_policy") or {}).get(
@@ -1353,6 +1356,7 @@ class RetrievalService:
                 "health_status": atom["health_status"],
             },
             "scope": atom["scope"],
+            "supersedes": list(atom.get("supersedes") or []),
             "lifecycle_state": atom["lifecycle_state"],
             "health_status": atom["health_status"],
             "updated_at": atom["updated_at"],

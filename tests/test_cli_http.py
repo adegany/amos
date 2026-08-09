@@ -278,6 +278,22 @@ def test_http_constitutional_governance_endpoints(tmp_path):
                 },
             )
         assert forged.value.code == 403
+        with pytest.raises(urllib.error.HTTPError) as forged_transaction:
+            http_json(
+                f"{base}/v1/memory-transactions:commit",
+                {
+                    "profile": "amos.memory-transaction.v1",
+                    "atoms": [{
+                        **adjudication,
+                        "id": "http_transaction_forged_adjudication",
+                    }],
+                    "actor": "svc:example_agent:self-governance",
+                    "scope": dict(adjudication["scope"]),
+                    "authorization_context": RATIFICATION,
+                    "idempotency_key": "http-forged-governance-transaction",
+                },
+            )
+        assert forged_transaction.value.code == 403
         ratified = http_json(
             f"{base}/v1/proposals:ratify",
             {

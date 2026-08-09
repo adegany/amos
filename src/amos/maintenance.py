@@ -1217,6 +1217,7 @@ def proposal_is_auto_committable(proposal: Mapping[str, Any]) -> bool:
             "epistemic_standing",
             "normative_standing",
             "operational_authority",
+            "constitutional_standing",
             "ratification",
         }.intersection(payload)
     )

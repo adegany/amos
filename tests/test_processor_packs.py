@@ -697,8 +697,16 @@ def test_proposed_canonical_facets_remain_dormant_until_ratification(amos):
                 "unresolved_objections": [],
                 "adjudication_scope": {"domain": "canonical_graph"},
                 "epistemic_standing": {"status": "settled"},
-                "normative_standing": {"status": "settled"},
+                "normative_standing": {"status": "operative"},
                 "operational_authority": {"status": "operative"},
+                "constitutional_standing": {"status": "none"},
+                "risk_class": "semantic",
+                "predecessor_diff": [],
+                "advisory_critic": {
+                    "status": "disabled",
+                    "authority": "advisory_only",
+                    "required": False,
+                },
                 "dissent_refs": [],
                 "review_triggers": ["contradictory_graph_evidence"],
                 "ratifier": {
