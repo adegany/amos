@@ -67,6 +67,174 @@ def interaction_stream_head(
     }
 
 
+def project_state(
+    atom_id: str,
+    *,
+    project_ref: str,
+    revision: int,
+    status: str,
+) -> dict:
+    return {
+        "id": atom_id,
+        "type": "goal",
+        "payload": {
+            "profile": "example.project-work-object.v1",
+            "project_ref": project_ref,
+            "revision": revision,
+            "objective": "Exercise canonical project continuity.",
+            "goal_status": status,
+            "owner": "agent:test",
+        },
+    }
+
+
+def project_head(
+    new_head_ref: str,
+    *,
+    project_ref: str,
+    expected_head_ref: str | None,
+    expected_head_version: int,
+) -> dict:
+    return {
+        "series_kind": "project_work",
+        "series_id": project_ref,
+        "new_head_ref": new_head_ref,
+        "expected_head_ref": expected_head_ref,
+        "expected_head_version": expected_head_version,
+    }
+
+
+def goal_state(atom_id: str, *, goal_ref: str, revision: int) -> dict:
+    return {
+        "id": atom_id,
+        "type": "goal",
+        "payload": {
+            "profile": "example.generic-goal-work.v1",
+            "goal_ref": goal_ref,
+            "revision": revision,
+            "objective": "Exercise generic canonical goal continuity.",
+            "status": "active",
+        },
+    }
+
+
+def goal_head(
+    new_head_ref: str,
+    *,
+    goal_ref: str,
+    expected_head_ref: str | None,
+    expected_head_version: int,
+) -> dict:
+    return {
+        "series_kind": "goal_work",
+        "series_id": goal_ref,
+        "new_head_ref": new_head_ref,
+        "expected_head_ref": expected_head_ref,
+        "expected_head_version": expected_head_version,
+    }
+
+
+def test_generic_goal_work_heads_are_typed_versioned_and_superseding(amos):
+    first = amos.commit_memory_transaction(
+        scope=SCOPE,
+        actor="goal-test",
+        idempotency_key="goal-head-1",
+        atoms=[goal_state("goal_state_1", goal_ref="goal:self-directed", revision=1)],
+        head_updates=[goal_head(
+            "goal_state_1",
+            goal_ref="goal:self-directed",
+            expected_head_ref=None,
+            expected_head_version=0,
+        )],
+    )
+    assert first["heads"][0]["head_version"] == 1
+
+    second = amos.commit_memory_transaction(
+        scope=SCOPE,
+        actor="goal-test",
+        idempotency_key="goal-head-2",
+        atoms=[goal_state("goal_state_2", goal_ref="goal:self-directed", revision=2)],
+        head_updates=[goal_head(
+            "goal_state_2",
+            goal_ref="goal:self-directed",
+            expected_head_ref="goal_state_1",
+            expected_head_version=1,
+        )],
+    )
+    assert second["heads"][0]["head_version"] == 2
+    assert amos.get_memory_head(
+        scope=SCOPE,
+        series_kind="goal_work",
+        series_id="goal:self-directed",
+    )["head_ref"] == "goal_state_2"
+    assert amos.store.get_atom("goal_state_1")["lifecycle_state"] == "superseded"
+
+
+def test_project_work_heads_are_typed_versioned_and_cas_guarded(amos):
+    first = amos.commit_memory_transaction(
+        scope=SCOPE,
+        actor="project-test",
+        idempotency_key="project-head-1",
+        atoms=[project_state(
+            "project_state_1",
+            project_ref="project:continuity",
+            revision=1,
+            status="adopted_unplanned",
+        )],
+        head_updates=[project_head(
+            "project_state_1",
+            project_ref="project:continuity",
+            expected_head_ref=None,
+            expected_head_version=0,
+        )],
+    )
+    assert first["heads"][0]["head_version"] == 1
+
+    with pytest.raises(CASConflict):
+        amos.commit_memory_transaction(
+            scope=SCOPE,
+            actor="project-test",
+            idempotency_key="project-head-stale",
+            atoms=[project_state(
+                "project_state_stale",
+                project_ref="project:continuity",
+                revision=2,
+                status="planned",
+            )],
+            head_updates=[project_head(
+                "project_state_stale",
+                project_ref="project:continuity",
+                expected_head_ref=None,
+                expected_head_version=0,
+            )],
+        )
+
+    second = amos.commit_memory_transaction(
+        scope=SCOPE,
+        actor="project-test",
+        idempotency_key="project-head-2",
+        atoms=[project_state(
+            "project_state_2",
+            project_ref="project:continuity",
+            revision=2,
+            status="planned",
+        )],
+        head_updates=[project_head(
+            "project_state_2",
+            project_ref="project:continuity",
+            expected_head_ref="project_state_1",
+            expected_head_version=1,
+        )],
+    )
+    assert second["heads"][0]["head_version"] == 2
+    assert amos.get_memory_head(
+        scope=SCOPE,
+        series_kind="project_work",
+        series_id="project:continuity",
+    )["head_ref"] == "project_state_2"
+    assert amos.store.get_atom("project_state_1")["lifecycle_state"] == "superseded"
+
+
 def thread_root(atom_id: str, *, opening_event_ref: str) -> dict:
     return {
         "id": atom_id,

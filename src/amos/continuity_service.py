@@ -43,7 +43,7 @@ class ContinuityService:
     INTERACTION_PROJECTION_PROFILE = "amos.interaction-projection.v2"
     MEMORY_HEAD_PROFILE = "amos.memory-head.v1"
     SUPPORTED_HEAD_KINDS: ClassVar[frozenset[str]] = frozenset(
-        {"discourse_thread", "interaction_stream"}
+        {"discourse_thread", "goal_work", "interaction_stream", "project_work"}
     )
 
     def __init__(
@@ -214,6 +214,34 @@ class ContinuityService:
                 raise ValidationError(
                     "interaction_event.in_reply_to must identify the current "
                     "interaction stream head"
+                )
+        elif series_kind == "project_work":
+            if new_head.get("type") != "goal":
+                raise ValidationError(
+                    "a project_work head must identify a goal atom"
+                )
+            payload = new_head.get("payload") or {}
+            if payload.get("project_ref") != series_id:
+                raise ValidationError(
+                    "goal.project_ref must match head_update.series_id"
+                )
+            if int(payload.get("revision", 0)) != current_version + 1:
+                raise ValidationError(
+                    "goal.revision must be the next project head version"
+                )
+        elif series_kind == "goal_work":
+            if new_head.get("type") != "goal":
+                raise ValidationError(
+                    "a goal_work head must identify a goal atom"
+                )
+            payload = new_head.get("payload") or {}
+            if payload.get("goal_ref") != series_id:
+                raise ValidationError(
+                    "goal.goal_ref must match head_update.series_id"
+                )
+            if int(payload.get("revision", 0)) != current_version + 1:
+                raise ValidationError(
+                    "goal.revision must be the next goal head version"
                 )
         projected = {
             "scope": dict(scope),
@@ -443,7 +471,9 @@ class ContinuityService:
             # A successful CAS mechanically creates the supersession lineage.
             superseded_atoms: list[dict[str, Any]] = []
             for head, current in zip(projected_heads, current_heads):
-                if head["series_kind"] != "discourse_thread":
+                if head["series_kind"] not in {
+                    "discourse_thread", "goal_work", "project_work"
+                }:
                     continue
                 if current is None:
                     continue
