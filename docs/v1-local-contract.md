@@ -622,6 +622,7 @@ service calls do not need to complete maintenance before responding:
 ```text
 GET /v1/health/memory
   reports memory health and background worker status
+  reports canonical atoms and non-deleted graph edges as atoms and edges
   includes quality diagnostics for active atom pressure, active superseded
   atoms, isolated active atoms, and derived-index graph lag
   does not run a policy tick inline
@@ -809,6 +810,12 @@ reference summaries, to reference-only form while retaining active-conclusion,
 constraint, commitment, conflict, supersession, temporal-sequence, and source
 references.
 
+Every compiled reasoning frame also stores a compact feedback packet under its
+`frame_id`. The packet contains only the atom refs resident in returned units
+and their association traces. A client may therefore submit the existing
+retrieval-outcome contract with `packet_id = frame_id`; AMOS accepts feedback
+only for refs that were actually resident in that frame.
+
 The packet endpoints remain available for associative recall, and
 `/v1/atoms:get` remains the exact-ID path. AMOS does not select an application
 memory mode on its own: it enforces the mode explicitly selected by the caller.
@@ -837,6 +844,8 @@ create provenance-linked semantic distillations when enough eligible source
 build a bounded evidence window and run registered maintenance processor packs
 read canonical `semantic_facets` and `graph_relations` directly from active
   atoms through the built-in generic processor
+do not infer similarity or support merely because two unscoped registry
+  procedures share a generic subject and procedure intent
 commit only low-risk, policy-allowed proposals such as add_atom distillations
   and explicit structural graph relations with active endpoints
 defer medium/high-risk proposals, health changes, merges, archives, access

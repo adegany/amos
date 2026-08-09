@@ -85,6 +85,8 @@ def test_worker_artifacts_update_indexes_and_observability(amos):
     }
     health = amos.health_memory()
     assert health["projection_lag"] == 0
+    assert health["atoms"] == amos.store.atom_count()
+    assert health["edges"] == amos.store.edge_count()
     assert "semantic_lexical_vectors" in health["index_freshness"]
     assert "semantic_lsa_vectors" in health["index_freshness"]
 
@@ -954,6 +956,28 @@ def test_health_isolation_separates_active_graph_from_dormant_proposals(amos):
     assert quality["isolated_proposed_atoms"]["count"] == 1
     assert quality["isolated_proposed_atoms"]["expected_dormant"] is True
     assert quality["isolated_proposed_atoms"]["sample_refs"] == [proposed["id"]]
+
+
+def test_quality_diagnostics_accept_superseded_atoms_as_lineage_endpoints(amos):
+    historical = amos.commit_atom({
+        "id": "historical_superseded_source",
+        "type": "semantic",
+        "payload": {"summary": "A historical source retained for lineage."},
+        "lifecycle_state": "superseded",
+    })["atom"]
+    amos.commit_atom({
+        "id": "active_lineage_consumer",
+        "type": "semantic",
+        "payload": {"summary": "An active conclusion with historical lineage."},
+        "evidence_refs": [historical["id"]],
+    })
+
+    quality = amos.health_memory(run_policy=False)["quality"]
+
+    assert historical["id"] not in quality["graph_quality"][
+        "unresolved_ref_samples"
+    ]
+    assert quality["graph_quality"]["unresolved_ref_count"] == 0
 
 
 def test_memory_policy_storage_cleanup_deletes_expired_archived_and_stale_atoms(amos):

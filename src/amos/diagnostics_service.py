@@ -35,6 +35,7 @@ class DiagnosticsService:
             "journal_events": self.store.event_count(),
             "memory_heads": len(self.store.list_memory_heads()),
             "atoms": self.store.atom_count(),
+            "edges": self.store.edge_count(),
             "by_type": by_type,
             "by_health": by_health,
             "by_lifecycle": by_lifecycle,

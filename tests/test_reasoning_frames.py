@@ -60,6 +60,42 @@ def test_frame_keeps_supersession_chain_as_one_coherent_unit(amos):
     assert unit["unit_id"] not in {page["unit_ref"] for page in frame["page_index"]}
 
 
+def test_reasoning_frame_accepts_exact_retrieval_use_feedback(amos):
+    atom = amos.commit_atom({
+        "id": "frame_feedback_source",
+        "type": "semantic",
+        "payload": {"summary": "A distinctive memory about frame feedback telemetry."},
+    })["atom"]
+    frame = amos.compile_memory_frame(
+        need="distinctive frame feedback telemetry",
+        purpose="verify source-use feedback",
+        requester="agent:cogito",
+        target_processor="participant-response",
+        run_policy=False,
+    )
+    resident_refs = {
+        ref for unit in frame["units"] for ref in unit["source_atom_refs"]
+    }
+    assert atom["id"] in resident_refs
+
+    outcome = amos.record_retrieval_outcome(
+        packet_id=frame["frame_id"],
+        request=frame["request"],
+        outcome={
+            "status": "used",
+            "materially_used": True,
+            "used_atom_refs": [atom["id"]],
+            "summary": "The resident source conditioned a completed response.",
+        },
+    )
+
+    assert outcome["feedback"]["positive_refs"] == [atom["id"]]
+    refreshed = amos.store.get_atom(atom["id"])
+    telemetry = refreshed["decay_policy"]["retrieval_telemetry"]
+    assert telemetry["used_count"] == 1
+    assert refreshed["last_accessed"]
+
+
 def test_historical_frame_reconstructs_archived_structured_supersession(amos):
     old = amos.commit_atom(
         {

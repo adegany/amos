@@ -425,6 +425,33 @@ def test_generic_semantic_facets_do_not_infer_support_between_activities():
     assert proposals == []
 
 
+def test_generic_semantic_facets_do_not_associate_unscoped_registry_procedures():
+    proposals = semantic_relation_proposals_from_facets(
+        [
+            SemanticFacet(
+                atom_ref="registry_skill_dialogue",
+                subject="Cogito",
+                intent="procedure:procedure",
+                outcome="available",
+                outcome_direction="positive",
+                confidence=1.0,
+                attributes={"semantic_role": "procedure"},
+            ),
+            SemanticFacet(
+                atom_ref="registry_skill_knowledge",
+                subject="Cogito",
+                intent="procedure:procedure",
+                outcome="available",
+                outcome_direction="positive",
+                confidence=1.0,
+                attributes={"semantic_role": "procedure"},
+            ),
+        ]
+    )
+
+    assert proposals == []
+
+
 def test_generic_semantic_graph_degree_is_bounded():
     proposals = semantic_relation_proposals_from_facets(
         [

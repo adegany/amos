@@ -974,7 +974,14 @@ class PolicyService:
         top_five_degree = sum(degree for _ref, degree in top_hubs[:5])
 
         evidence_records = self.store.list_evidence()
-        known_refs = active_refs | {str(atom["id"]) for atom in proposed_atoms} | {
+        # Superseded and archived atoms remain valid historical lineage
+        # endpoints. Excluding them made healthy references appear unresolved.
+        historical_refs = {
+            str(atom["id"])
+            for atom in self.store.list_atoms_filtered()
+            if str(atom.get("id") or "")
+        }
+        known_refs = historical_refs | {
             str(record.get("evidence_id") or "") for record in evidence_records
         }
         unresolved_refs: set[str] = set()

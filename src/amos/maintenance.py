@@ -1003,6 +1003,17 @@ def _semantic_relation_for_pair(
     left_role = str((left.get("attributes") or {}).get("semantic_role") or "")
     right_role = str((right.get("attributes") or {}).get("semantic_role") or "")
     if (
+        left_role == right_role == "procedure"
+        and not left_context
+        and not right_context
+    ):
+        # Registry procedures often share the agent as subject and a generic
+        # procedure:procedure intent. That is catalog co-membership, not
+        # semantic evidence that the procedures support or resemble each
+        # other. Producers that want association must supply a scoped semantic
+        # context key or an explicit typed edge.
+        return None
+    if (
         left_role in {"activity", "project_activity"}
         and right_role in {"activity", "project_activity"}
     ):

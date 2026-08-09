@@ -158,7 +158,8 @@ agents.
 - Per-agent self-models, capabilities, limitations, commitments, and runtime-state overlays.
 - Retrieval packets that disclose provenance, omissions, conflicts, degradation, and scope filtering.
 - Revision-bound coherent reasoning frames with demand-loaded pages instead of
-  fixed independent memory slots.
+  fixed independent memory slots; resident frame sources are cached under the
+  frame ID for exact retrieval-outcome feedback.
 - Producer-supplied `semantic_facets` and `graph_relations` that become
   provenance-bearing graph proposals under deterministic policy gates.
 - Deterministic cleanup and distillation paths that do not require an LLM.
@@ -250,6 +251,9 @@ in-process SQLite store and serializes access through the service boundary:
   `semantic_facets` and `graph_relations` to typed atoms; AMOS builds governed
   edges without a domain processor. Domain-specific processors remain optional
   adapters for payloads that cannot emit the canonical contract directly.
+  Unscoped registry procedures are catalog co-membership, not semantic
+  similarity or support; procedure producers must provide a scoped context key
+  or an explicit typed relation when such an association is intended.
 - Processor-specific bounded worksets, hierarchical evidence coverage,
   explicit producer hints/cohorts, domain-owned distillation lanes,
   coherence-bounded automatic packets, edge derivation provenance, and graph,
@@ -420,8 +424,9 @@ The principals file is a JSON object keyed by bearer token. Each value binds
 request-accessible storage.
 
 The HTTP service starts a background memory-policy worker. `GET
-/v1/health/memory` reports health and worker status without running maintenance
-inline, while `POST /v1/atoms:get` resolves a known atom ID without semantic or
+/v1/health/memory` reports canonical atom and graph-edge counts, health, and
+worker status without running maintenance inline, while `POST /v1/atoms:get`
+resolves a known atom ID without semantic or
 associative ranking and `POST /v1/packets:retrieve` performs associative recall.
 Both retrieval paths queue a policy tick and return immediately. Explicit
 `POST /v1/memory-policy:run` and the CLI

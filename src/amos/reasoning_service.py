@@ -814,6 +814,35 @@ class ReasoningFrameService:
                         "token_or_byte_budget is too small for the reasoning frame envelope"
                     )
             frame = self._finalize_token_estimate(build_frame())
+        feedback_items = []
+        seen_feedback_refs: set[str] = set()
+        for unit in frame.get("units", []):
+            if not isinstance(unit, Mapping):
+                continue
+            for atom_ref in unit.get("source_atom_refs", []):
+                atom_ref = str(atom_ref or "")
+                if not atom_ref or atom_ref in seen_feedback_refs:
+                    continue
+                seen_feedback_refs.add(atom_ref)
+                feedback_items.append({
+                    "atom_ref": atom_ref,
+                    "association_trace": list(unit.get("association_trace") or []),
+                })
+        # Reasoning frames are retrieval products too. Cache a compact feedback
+        # projection under frame_id so clients can report exact material use
+        # through the existing retrieval-outcome contract.
+        with self.store.transaction() as conn:
+            self.store.cache_packet(
+                conn,
+                packet_id=frame_id,
+                request=dict(frame.get("request") or {}),
+                response={
+                    "packet_id": frame_id,
+                    "request": dict(frame.get("request") or {}),
+                    "items": feedback_items,
+                },
+                graph_version=self.store.graph_version(),
+            )
         return frame
 
     def _frame_payload(
