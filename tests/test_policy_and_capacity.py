@@ -769,6 +769,10 @@ def test_memory_policy_archives_superseded_atoms_and_retrieval_omits_them(amos):
             "id": "superseded_runtime_observation",
             "type": "semantic",
             "payload": {"summary": "terrain candidate alpha old snapshot"},
+            "decay_policy": {
+                "enabled": False,
+                "protection_reason": "retain until explicitly superseded",
+            },
         }
     )["atom"]
     new = amos.commit_atom(
@@ -822,6 +826,65 @@ def test_memory_policy_archives_superseded_atoms_and_retrieval_omits_them(amos):
     assert archived["lifecycle_state"] == "archived"
     assert archived["health_status"] == "stale"
     assert amos.store.get_atom(new["id"])["lifecycle_state"] == "active"
+
+
+def test_memory_policy_archives_successor_sources_in_the_same_policy_pass(
+    amos, monkeypatch
+):
+    old = amos.commit_atom(
+        {
+            "id": "same_pass_old_summary",
+            "type": "semantic",
+            "payload": {"summary": "old processor summary"},
+        }
+    )["atom"]
+
+    def commit_successor(**_kwargs):
+        successor = amos.commit_atom(
+            {
+                "id": "same_pass_current_summary",
+                "type": "semantic",
+                "payload": {"summary": "current processor summary"},
+                "supersedes": [old["id"]],
+            }
+        )["atom"]
+        return {
+            "status": "completed",
+            "proposals": [],
+            "committed": [{"atom": successor, "source_refs": [old["id"]]}],
+            "deferred": [],
+        }
+
+    monkeypatch.setattr(
+        amos.policy,
+        "run_maintenance_distiller",
+        commit_successor,
+    )
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": True},
+        decay={
+            "enabled": True,
+            "require_atom_policy": True,
+            "archive_superseded": True,
+            "archive_superseded_after_seconds": 0,
+        },
+        storage_cleanup={"enabled": False},
+    )
+
+    result = amos.run_memory_policy(force=True, trigger="same_pass_successor")
+
+    assert result["results"]["maintenance_distiller"]["status"] == "completed"
+    assert result["results"]["decay"]["actions"][0]["atom_ref"] == old["id"]
+    assert amos.store.get_atom(old["id"])["lifecycle_state"] == "archived"
+    assert (
+        amos.store.get_atom("same_pass_current_summary")["lifecycle_state"]
+        == "active"
+    )
+    assert "active_superseded_atoms_present" not in amos.health_memory(
+        run_policy=False
+    )["quality"]["warnings"]
 
 
 def test_service_owned_decay_archives_scoped_superseded_atoms_with_empty_scope(amos):

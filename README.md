@@ -395,6 +395,14 @@ confirmation are available through `provenance-analysis` and
 `assessment_series_id` and next `revision`; AMOS does not interpret or grant
 authority to the assessment's qualification claim.
 
+`authority_record` is a generic CAS head kind for application-owned immutable
+`procedure` revisions. Each successor binds the exact `authority_series_id` and
+next `authority_revision`; applications define the authority meaning, while
+AMOS atomically advances the pointer and preserves superseded checksum-bearing
+predecessors. When first establishing a head over a pre-head record, the
+transaction may bind one exact `legacy_predecessor_ref`; AMOS supersedes it in
+the same commit.
+
 ### Run the Mirror Agent integration demo
 
 ```bash

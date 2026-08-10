@@ -203,19 +203,6 @@ class PolicyService:
                         if ref
                     )
 
-            decay = policy["decay"]
-            if decay["enabled"]:
-                results["decay"] = self._run_decay_policy(
-                    decay=decay,
-                    scope=scope,
-                    actor=actor,
-                )
-                target_refs.extend(
-                    action["atom_ref"]
-                    for action in results["decay"].get("actions", [])
-                    if action.get("atom_ref")
-                )
-
             if policy["distillation"]["enabled"]:
                 results["distillation"] = self._run_policy_distillation(
                     policy=policy,
@@ -251,6 +238,23 @@ class PolicyService:
                     if atom:
                         target_refs.append(atom["id"])
                     target_refs.extend(committed.get("source_refs", []))
+
+            # Distillation may commit an active successor. Apply lifecycle
+            # policy after those commits so its superseded predecessor is
+            # archived in this same policy pass rather than remaining an
+            # active graph-quality warning until the next interval.
+            decay = policy["decay"]
+            if decay["enabled"]:
+                results["decay"] = self._run_decay_policy(
+                    decay=decay,
+                    scope=scope,
+                    actor=actor,
+                )
+                target_refs.extend(
+                    action["atom_ref"]
+                    for action in results["decay"].get("actions", [])
+                    if action.get("atom_ref")
+                )
 
             storage_cleanup = policy["storage_cleanup"]
             if storage_cleanup["enabled"] and due.get("storage_cleanup", {}).get("due"):
@@ -1591,8 +1595,6 @@ class PolicyService:
                 else {}
             )
             explicit_atom_policy = self._has_explicit_atom_decay_policy(atom_policy)
-            if atom_policy.get("enabled") is False:
-                continue
             superseded_action = duplicate_actions.get(str(atom["id"]))
             if superseded_action is None:
                 superseded_action = self._decay_action_for_superseded_atom(
@@ -1600,6 +1602,8 @@ class PolicyService:
                     superseded_by=superseded_refs.get(atom["id"], []),
                     policy=decay,
                 )
+            if superseded_action is None and atom_policy.get("enabled") is False:
+                continue
             if superseded_action is None:
                 superseded_action = self._decay_action_for_proposed_atom(
                     atom, policy=decay

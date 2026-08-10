@@ -4918,6 +4918,13 @@ discourse_state head:
   each state entry carries caller-defined state class and authority metadata
   plus exact basis references
   advancing this head supersedes only its previous state revision
+
+authority_record head:
+  application-owned procedure revision with exact authority_series_id
+  authority_revision equals the next compare-and-swap head version
+  advancing the head preserves the checksum-bearing predecessor as superseded
+  first adoption may atomically supersede one exact legacy_predecessor_ref
+  AMOS provides continuity but does not interpret or grant application authority
 ```
 
 Every transaction that adds an interaction event must advance the matching

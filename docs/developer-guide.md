@@ -469,6 +469,11 @@ proposal retention/deduplication, separate active/proposed quota enforcement,
 cache invalidation, and capacity governance. It does not require an LLM or an
 external vector database.
 
+Distillation and maintenance-processor commits precede decay within one policy
+pass. A newly committed active successor therefore causes its active
+predecessor to be archived before that pass completes, avoiding a transient
+active-superseded quality warning until the next interval.
+
 Clients that retain every cognitive occurrence in their own audit store may
 bound the AMOS review queue by attaching
 `payload.proposal_retention.deduplication_key` and

@@ -134,6 +134,116 @@ def goal_head(
     }
 
 
+def authority_record(
+    atom_id: str,
+    *,
+    series_id: str,
+    revision: int,
+    checksum: str,
+    supersedes: tuple[str, ...] = (),
+) -> dict:
+    atom = {
+        "id": atom_id,
+        "type": "procedure",
+        "scope": dict(SCOPE),
+        "payload": {
+            "profile": "example.authority-record.v1",
+            "trigger_context": "reconcile an installed immutable package",
+            "steps": ["verify checksum", "apply current standing"],
+            "authority_series_id": series_id,
+            "authority_revision": revision,
+            "checksum": checksum,
+        },
+    }
+    if supersedes:
+        atom["supersedes"] = list(supersedes)
+    return atom
+
+
+def authority_head(
+    new_head_ref: str,
+    *,
+    series_id: str,
+    expected_head_ref: str | None,
+    expected_head_version: int,
+    legacy_predecessor_ref: str | None = None,
+) -> dict:
+    value = {
+        "series_kind": "authority_record",
+        "series_id": series_id,
+        "new_head_ref": new_head_ref,
+        "expected_head_ref": expected_head_ref,
+        "expected_head_version": expected_head_version,
+    }
+    if legacy_predecessor_ref is not None:
+        value["legacy_predecessor_ref"] = legacy_predecessor_ref
+    return value
+
+
+def test_authority_record_heads_preserve_superseded_checksum_revisions(amos):
+    series_id = "plugin:example"
+    amos.commit_atom(
+        authority_record(
+            "legacy_authority_state",
+            series_id=series_id,
+            revision=0,
+            checksum="sha256:legacy",
+        ),
+        idempotency_key="legacy-authority-state",
+    )
+    first = amos.commit_memory_transaction(
+        scope=SCOPE,
+        actor="authority-test",
+        idempotency_key="authority-head-1",
+        atoms=[authority_record(
+            "authority_state_1",
+            series_id=series_id,
+            revision=1,
+            checksum="sha256:old",
+        )],
+        head_updates=[authority_head(
+            "authority_state_1",
+            series_id=series_id,
+            expected_head_ref=None,
+            expected_head_version=0,
+            legacy_predecessor_ref="legacy_authority_state",
+        )],
+    )
+    assert first["heads"][0]["head_version"] == 1
+    assert amos.store.get_atom("legacy_authority_state")["lifecycle_state"] == (
+        "superseded"
+    )
+
+    second = amos.commit_memory_transaction(
+        scope=SCOPE,
+        actor="authority-test",
+        idempotency_key="authority-head-2",
+        atoms=[authority_record(
+            "authority_state_2",
+            series_id=series_id,
+            revision=2,
+            checksum="sha256:new",
+            supersedes=("authority_state_1",),
+        )],
+        head_updates=[authority_head(
+            "authority_state_2",
+            series_id=series_id,
+            expected_head_ref="authority_state_1",
+            expected_head_version=1,
+        )],
+    )
+
+    assert second["heads"][0]["head_version"] == 2
+    assert amos.get_memory_head(
+        scope=SCOPE,
+        series_kind="authority_record",
+        series_id=series_id,
+    )["head_ref"] == "authority_state_2"
+    assert amos.store.get_atom("authority_state_1")["lifecycle_state"] == "superseded"
+    assert amos.store.get_atom("authority_state_1")["payload"]["checksum"] == "sha256:old"
+    assert amos.store.get_atom("authority_state_2")["payload"]["checksum"] == "sha256:new"
+
+
 def test_generic_goal_work_heads_are_typed_versioned_and_superseding(amos):
     first = amos.commit_memory_transaction(
         scope=SCOPE,

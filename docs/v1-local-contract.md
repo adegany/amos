@@ -762,6 +762,14 @@ appeals, and receipt-backed outcomes remain separate append-only atoms.
 `assessment_series_id` and carry the next integer `revision`. This is continuity
 and CAS machinery only; AMOS does not interpret evaluator scores as authority.
 
+`authority_record` memory heads are permitted for immutable application-owned
+`procedure` revisions. The atom payload must bind the head `series_id` as
+`authority_series_id` and carry the next integer `authority_revision`. AMOS
+provides CAS continuity and supersession history; it does not interpret or
+grant the application's asserted authority. The first head update may include
+an exact `legacy_predecessor_ref` when adopting a pre-head record; that
+predecessor is superseded atomically with head creation.
+
 Retrieval and reasoning accept one of three lifecycle modes:
 
 ```text
@@ -866,10 +874,6 @@ When due, the policy should:
 ```text
 run SMP analysis
 run the memory steward for low-risk reversible cleanup
-execute deterministic decay rules from atom decay_policy and configured global
-  bounds
-archive active atoms that are superseded by active replacement atoms when
-  archive_superseded is enabled
 create provenance-linked semantic distillations when enough eligible source
   atoms are available
 build a bounded evidence window and run registered maintenance processor packs
@@ -878,6 +882,10 @@ read canonical `semantic_facets` and `graph_relations` directly from active
 do not infer similarity or support merely because two unscoped registry
   procedures share a generic subject and procedure intent
 commit only low-risk, policy-allowed proposals such as add_atom distillations
+execute deterministic decay rules from atom decay_policy and configured global
+  bounds after distillation and processor commits
+archive active atoms that are superseded by active replacement atoms in that
+  same policy pass when archive_superseded is enabled
   and explicit structural graph relations with active endpoints
 defer medium/high-risk proposals, health changes, merges, archives, access
   policy changes, and ambiguous claims to explicit review

@@ -44,8 +44,8 @@ class ContinuityService:
     MEMORY_HEAD_PROFILE = "amos.memory-head.v1"
     SUPPORTED_HEAD_KINDS: ClassVar[frozenset[str]] = frozenset(
         {
-            "assessment_qualification", "discourse_thread", "goal_work",
-            "interaction_stream", "project_work",
+            "assessment_qualification", "authority_record", "discourse_thread",
+            "goal_work", "interaction_stream", "project_work",
         }
     )
 
@@ -177,6 +177,34 @@ class ContinuityService:
                 f"{expected_ref!r}@{expected_version}, current "
                 f"{current_ref!r}@{current_version}"
             )
+        legacy_predecessor_ref = update.get("legacy_predecessor_ref")
+        if legacy_predecessor_ref is not None:
+            if (
+                series_kind != "authority_record"
+                or current is not None
+                or expected_ref is not None
+                or expected_version != 0
+                or not isinstance(legacy_predecessor_ref, str)
+                or not legacy_predecessor_ref
+            ):
+                raise ValidationError(
+                    "legacy_predecessor_ref is permitted only when establishing "
+                    "an absent authority_record head"
+                )
+            predecessor = self.store.get_atom(legacy_predecessor_ref)
+            if predecessor is None:
+                raise ValidationError(
+                    "authority_record legacy_predecessor_ref must identify an "
+                    "existing atom"
+                )
+            if normalize_scope(predecessor.get("scope")) != normalize_scope(scope):
+                raise ValidationError(
+                    "authority_record legacy predecessor must share the head scope"
+                )
+            current = {
+                "head_ref": legacy_predecessor_ref,
+                "head_version": 0,
+            }
         new_head = prepared_by_id.get(new_head_ref)
         if new_head is None:
             raise ValidationError(
@@ -259,6 +287,20 @@ class ContinuityService:
             if int(payload.get("revision", 0)) != current_version + 1:
                 raise ValidationError(
                     "self_assessment.revision must be the next assessment head version"
+                )
+        elif series_kind == "authority_record":
+            if new_head.get("type") != "procedure":
+                raise ValidationError(
+                    "an authority_record head must identify a procedure atom"
+                )
+            payload = new_head.get("payload") or {}
+            if payload.get("authority_series_id") != series_id:
+                raise ValidationError(
+                    "procedure.authority_series_id must match head_update.series_id"
+                )
+            if int(payload.get("authority_revision", 0)) != current_version + 1:
+                raise ValidationError(
+                    "procedure.authority_revision must be the next authority head version"
                 )
         projected = {
             "scope": dict(scope),
@@ -492,8 +534,8 @@ class ContinuityService:
             superseded_atoms: list[dict[str, Any]] = []
             for head, current in zip(projected_heads, current_heads):
                 if head["series_kind"] not in {
-                    "assessment_qualification", "discourse_thread", "goal_work",
-                    "project_work",
+                    "assessment_qualification", "authority_record",
+                    "discourse_thread", "goal_work", "project_work",
                 }:
                     continue
                 if current is None:
