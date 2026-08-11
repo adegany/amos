@@ -207,6 +207,21 @@ class Amos:
             idempotency_key=idempotency_key,
         )
 
+    def classify_refs(
+        self,
+        refs: Sequence[str],
+        *,
+        scope: Mapping[str, Any] | None = None,
+        requester: str = "system",
+        target_processor: str = "reasoner",
+    ) -> dict[str, Any]:
+        return self.retrieval.classify_refs(
+            refs,
+            scope=scope,
+            requester=requester,
+            target_processor=target_processor,
+        )
+
     def commit_atom(
         self,
         atom: Mapping[str, Any],
@@ -514,6 +529,25 @@ class Amos:
             include_archived=include_archived,
             include_low_health=include_low_health,
             include_superseded=include_superseded,
+            run_policy=run_policy,
+        )
+
+    def retrieve_evidence(
+        self,
+        evidence_id: str,
+        *,
+        scope: Mapping[str, Any] | None = None,
+        requester: str = "system",
+        target_processor: str = "reasoner",
+        run_policy: bool = True,
+    ) -> dict[str, Any]:
+        """Resolve a known evidence ID without associative ranking."""
+
+        return self.retrieval.retrieve_evidence(
+            evidence_id,
+            scope=scope,
+            requester=requester,
+            target_processor=target_processor,
             run_policy=run_policy,
         )
 
@@ -979,3 +1013,6 @@ class Amos:
 
     def verify_replay(self) -> dict[str, Any]:
         return self.diagnostics.verify_replay()
+
+    def verify_integrity(self) -> dict[str, Any]:
+        return self.diagnostics.verify_integrity()

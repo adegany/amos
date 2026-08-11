@@ -71,6 +71,8 @@ DEFAULT_MEMORY_POLICY = {
     },
     "maintenance": {
         "enabled": True,
+        "repair_reference_contracts": True,
+        "max_reference_contract_repairs": 2048,
         "run_smp": True,
         "max_smp_atoms": 128,
         "run_steward": True,

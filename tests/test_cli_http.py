@@ -211,17 +211,94 @@ def test_http_v1_endpoints_smoke(tmp_path):
         assert exact["status"] == "found"
         assert exact["retrieval_mode"] == "exact"
         assert exact["item"]["atom_ref"] == "http_atom"
+        captured = server.amos.capture_event(
+            source_type="http-test",
+            source_ref="http-evidence-source",
+            payload={"summary": "HTTP exact evidence retrieval works"},
+        )["evidence"]
+        exact_evidence = http_json(
+            f"{base}/v1/evidence:get",
+            {
+                "evidence_id": captured["evidence_id"],
+                "requester": "http-test",
+                "target_processor": "reasoner",
+                "run_policy": False,
+            },
+        )
+        assert exact_evidence["status"] == "found"
+        assert exact_evidence["record"]["evidence_id"] == captured["evidence_id"]
+        classified = http_json(
+            f"{base}/v1/refs:classify",
+            {
+                "refs": [
+                    "http_atom",
+                    captured["evidence_id"],
+                    "http_missing_ref",
+                ],
+                "requester": "http-test",
+            },
+        )
+        assert classified["atom_refs"] == ["http_atom"]
+        assert classified["evidence_refs"] == [captured["evidence_id"]]
+        assert classified["unknown_refs"] == ["http_missing_ref"]
         packet = http_json(
             f"{base}/v1/packets:retrieve",
             {"cues": ["HTTP endpoint"]},
         )
         assert "http_atom" in item_refs(packet)
+        ready = http_json(f"{base}/v1/ready")
+        assert ready == {
+            "status": "ready",
+            "graph_version": server.amos.store.graph_version(),
+        }
         health = http_json(f"{base}/v1/health/memory")
         assert health["atoms"] == 3
         verify = http_json(f"{base}/v1/verify")
         assert verify["journal"]["status"] == "ok"
         assert verify["replay"]["status"] == "ok"
     finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_maintenance_does_not_block_health_reads(tmp_path):
+    db_path = str(tmp_path / "http_maintenance_lane.sqlite3")
+    try:
+        server = AmosHTTPServer(("127.0.0.1", 0), db_path)
+    except PermissionError as exc:
+        pytest.skip(f"loopback sockets unavailable in this sandbox: {exc}")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_maintenance(**_kwargs):
+        entered.set()
+        assert release.wait(timeout=2)
+        return {"status": "completed"}
+
+    server.maintenance_amos.run_maintenance_distiller = slow_maintenance
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    maintenance_result: list[dict] = []
+    maintenance_thread = threading.Thread(
+        target=lambda: maintenance_result.append(
+            http_json(f"{base}/v1/maintenance-distiller:run", {})
+        ),
+        daemon=True,
+    )
+    try:
+        maintenance_thread.start()
+        assert entered.wait(timeout=1)
+        started = time.monotonic()
+        health = http_json(f"{base}/v1/health/memory")
+        assert time.monotonic() - started < 1
+        assert health["atoms"] == 0
+        release.set()
+        maintenance_thread.join(timeout=2)
+        assert maintenance_result == [{"status": "completed"}]
+    finally:
+        release.set()
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)

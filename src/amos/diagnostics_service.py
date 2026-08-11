@@ -84,6 +84,10 @@ class DiagnosticsService:
 
 
     def verify_journal_chain(self) -> dict[str, Any]:
+        with self.store.read_snapshot():
+            return self._verify_journal_chain()
+
+    def _verify_journal_chain(self) -> dict[str, Any]:
         events = self.store.list_events()
         previous = "genesis"
         failures = []
@@ -117,8 +121,16 @@ class DiagnosticsService:
 
 
     def replay_graph(self) -> dict[str, Any]:
+        with self.store.read_snapshot():
+            return self._replay_graph()
+
+    def _replay_graph(self) -> dict[str, Any]:
         atoms: dict[str, dict[str, Any]] = {}
         edges: dict[str, dict[str, Any]] = {}
+        # SQLite retains deleted edge rows, and insert-only writers use
+        # ``ON CONFLICT DO NOTHING``.  Keep that physical identity history so a
+        # later duplicate journal projection is replayed as the same no-op.
+        known_edge_ids: set[str] = set()
         heads: dict[str, dict[str, Any]] = {}
         tombstones: dict[str, dict[str, Any]] = {}
 
@@ -130,6 +142,22 @@ class DiagnosticsService:
                     str(projected.get("relation") or "")
                 )
             return projected
+
+        def replay_inserted_edge(edge: dict[str, Any]) -> None:
+            edge_id = str(edge["edge_id"])
+            if edge_id in known_edge_ids:
+                return
+            known_edge_ids.add(edge_id)
+            if not edge.get("deleted"):
+                edges[edge_id] = replay_edge_projection(edge)
+
+        def replay_upserted_edge(edge: dict[str, Any]) -> None:
+            edge_id = str(edge["edge_id"])
+            known_edge_ids.add(edge_id)
+            if edge.get("deleted"):
+                edges.pop(edge_id, None)
+            else:
+                edges[edge_id] = replay_edge_projection(edge)
 
         def replay_legacy_retrieval_edge_feedback(
             payload: dict[str, Any],
@@ -185,18 +213,12 @@ class DiagnosticsService:
                 atom = payload["atom"]
                 atoms[atom["id"]] = atom
                 for edge in payload.get("projected_edges", []):
-                    if edge.get("deleted"):
-                        edges.pop(edge["edge_id"], None)
-                    else:
-                        edges[edge["edge_id"]] = replay_edge_projection(edge)
+                    replay_inserted_edge(edge)
             elif event_type == "atom_updated":
                 atom = payload["after"]
                 atoms[atom["id"]] = atom
                 for edge in payload.get("projected_edges", []):
-                    if edge.get("deleted"):
-                        edges.pop(edge["edge_id"], None)
-                    else:
-                        edges[edge["edge_id"]] = replay_edge_projection(edge)
+                    replay_upserted_edge(edge)
             elif event_type == "atom_deleted":
                 before = payload["before"]
                 atom_id = before["id"]
@@ -204,21 +226,15 @@ class DiagnosticsService:
                 tombstone = payload["tombstone"]
                 tombstones[tombstone["target_ref"]] = tombstone
                 for edge in payload.get("projected_edges", []):
-                    edges.pop(edge["edge_id"], None)
+                    replay_upserted_edge(edge)
             elif event_type == "memories_distilled":
                 atom = payload["atom"]
                 atoms[atom["id"]] = atom
                 for edge in payload.get("projected_edges", []):
-                    if edge.get("deleted"):
-                        edges.pop(edge["edge_id"], None)
-                    else:
-                        edges[edge["edge_id"]] = replay_edge_projection(edge)
+                    replay_inserted_edge(edge)
             elif event_type == "edge_committed":
                 for edge in payload.get("projected_edges", []):
-                    if edge.get("deleted"):
-                        edges.pop(edge["edge_id"], None)
-                    else:
-                        edges[edge["edge_id"]] = replay_edge_projection(edge)
+                    replay_upserted_edge(edge)
             elif event_type == "memory_transaction_committed":
                 for atom in payload.get("projected_atoms", []):
                     if atom.get("deleted"):
@@ -226,10 +242,7 @@ class DiagnosticsService:
                     else:
                         atoms[atom["id"]] = atom
                 for edge in payload.get("projected_edges", []):
-                    if edge.get("deleted"):
-                        edges.pop(edge["edge_id"], None)
-                    else:
-                        edges[edge["edge_id"]] = replay_edge_projection(edge)
+                    replay_inserted_edge(edge)
                 for head in payload.get("projected_heads", []):
                     key = (
                         f"{digest(head.get('scope') or {})}:"
@@ -248,6 +261,7 @@ class DiagnosticsService:
                 "constitutional_record_replaced",
                 "steward_run",
                 "retrieval_outcome_recorded",
+                "memory_reference_contract_repaired",
                 "decay_policy_applied",
                 "storage_cleanup_run",
             }:
@@ -257,10 +271,10 @@ class DiagnosticsService:
                     else:
                         atoms[atom["id"]] = atom
                 for edge in payload.get("projected_edges", []):
-                    if edge.get("deleted"):
-                        edges.pop(edge["edge_id"], None)
+                    if event_type == "atom_merged":
+                        replay_inserted_edge(edge)
                     else:
-                        edges[edge["edge_id"]] = replay_edge_projection(edge)
+                        replay_upserted_edge(edge)
                 if event_type == "retrieval_outcome_recorded":
                     replay_legacy_retrieval_edge_feedback(payload)
                 for tombstone in payload.get("tombstones", []):
@@ -275,7 +289,11 @@ class DiagnosticsService:
 
 
     def verify_replay(self) -> dict[str, Any]:
-        replayed = self.replay_graph()
+        with self.store.read_snapshot():
+            return self._verify_replay()
+
+    def _verify_replay(self) -> dict[str, Any]:
+        replayed = self._replay_graph()
         stored_atoms = {
             atom["id"]: atom
             for atom in self.store.list_atoms()
@@ -346,3 +364,12 @@ class DiagnosticsService:
             "replayed_head_count": len(replayed_heads),
             "stored_head_count": len(stored_heads),
         }
+
+    def verify_integrity(self) -> dict[str, Any]:
+        """Verify journal and replay against the same canonical read snapshot."""
+
+        with self.store.read_snapshot():
+            return {
+                "journal": self._verify_journal_chain(),
+                "replay": self._verify_replay(),
+            }

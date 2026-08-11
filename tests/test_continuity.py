@@ -345,6 +345,114 @@ def test_project_work_heads_are_typed_versioned_and_cas_guarded(amos):
     assert amos.store.get_atom("project_state_1")["lifecycle_state"] == "superseded"
 
 
+def test_memory_transaction_reuses_existing_edge_without_rejournal_projection(amos):
+    amos.commit_memory_atoms(
+        [
+            {
+                "id": "edge_reuse_source",
+                "type": "belief",
+                "payload": {"claim": "a"},
+                "scope": dict(SCOPE),
+            },
+            {
+                "id": "edge_reuse_target",
+                "type": "belief",
+                "payload": {"claim": "b"},
+                "scope": dict(SCOPE),
+            },
+        ],
+        actor="continuity-test",
+        idempotency_key="edge-reuse-atoms",
+    )
+    request_edge = {
+        "source_ref": "edge_reuse_source",
+        "target_ref": "edge_reuse_target",
+        "relation": "rel:supports",
+        "confidence": {"level": "medium", "score": 0.6},
+    }
+    first = amos.commit_memory_transaction(
+        scope=SCOPE,
+        actor="continuity-test",
+        idempotency_key="edge-reuse-first",
+        edges=[request_edge],
+    )
+    stored = dict(first["edges"][0])
+
+    second = amos.commit_memory_transaction(
+        scope=SCOPE,
+        actor="continuity-test",
+        idempotency_key="edge-reuse-second",
+        edges=[
+            {
+                **request_edge,
+                "confidence": {"level": "high", "score": 0.95},
+            }
+        ],
+    )
+
+    assert second["edges"] == [stored]
+    assert second["event"]["payload"]["projected_edges"] == []
+    assert second["event"]["payload"]["reused_edge_refs"] == [stored["edge_id"]]
+    assert amos.verify_replay()["status"] == "ok"
+
+
+def test_replay_mirrors_legacy_insert_only_duplicate_edge_projection(amos):
+    amos.commit_memory_atoms(
+        [
+            {
+                "id": "legacy_edge_source",
+                "type": "belief",
+                "payload": {"claim": "a"},
+                "scope": dict(SCOPE),
+            },
+            {
+                "id": "legacy_edge_target",
+                "type": "belief",
+                "payload": {"claim": "b"},
+                "scope": dict(SCOPE),
+            },
+        ],
+        actor="continuity-test",
+        idempotency_key="legacy-edge-atoms",
+    )
+    first = amos.commit_memory_transaction(
+        scope=SCOPE,
+        actor="continuity-test",
+        idempotency_key="legacy-edge-first",
+        edges=[{
+            "source_ref": "legacy_edge_source",
+            "target_ref": "legacy_edge_target",
+            "relation": "rel:supports",
+        }],
+    )
+    legacy_projection = {
+        **first["edges"][0],
+        "confidence": {"level": "high", "score": 0.99},
+        "updated_at": "2099-01-01T00:00:00Z",
+        "version": 99,
+    }
+    with amos.store.transaction() as conn:
+        amos.store.append_event(
+            conn,
+            event_type="memory_transaction_committed",
+            actor="legacy-writer",
+            payload={
+                "profile": "amos.memory-transaction.v1",
+                "operation": "commit_memory_transaction",
+                "evidence": [],
+                "projected_atoms": [],
+                "projected_edges": [legacy_projection],
+                "projected_heads": [],
+                "receipt_refs": [],
+                "scope": dict(SCOPE),
+            },
+            target_refs=["legacy_edge_source", "legacy_edge_target"],
+        )
+
+    assert amos.store.get_edge(legacy_projection["edge_id"]) == first["edges"][0]
+    assert amos.verify_replay()["status"] == "ok"
+
+
 def thread_root(atom_id: str, *, opening_event_ref: str) -> dict:
     return {
         "id": atom_id,

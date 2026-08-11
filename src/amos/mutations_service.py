@@ -17,6 +17,18 @@ from .governance_service import GovernanceService
 from .schemas import CONSTITUTIONAL_ATOM_TYPES, GOVERNANCE_PAYLOAD_FIELDS
 
 
+PROCESS_PROVENANCE_ATOM_TYPES = frozenset({
+    "action_outcome",
+    "agentic_trace",
+    "discourse_state",
+    "discourse_thread",
+    "episode",
+    "goal",
+    "interaction_event",
+    "runtime_state",
+})
+
+
 class MutationService:
     def __init__(self, store: Any, access: Any, indexes: Any, graph: Any):
         self.store = store
@@ -62,26 +74,45 @@ class MutationService:
             if source is None:
                 continue
             source_payload = source.get("payload") or {}
+            source_lifecycle = str(source.get("lifecycle_state") or "")
+            process_provenance = str(atom.get("type") or "") in (
+                PROCESS_PROVENANCE_ATOM_TYPES
+            )
             if (
-                source.get("lifecycle_state") != "active"
-                or source.get("health_status") == "contradicted"
-                or any(
-                    str((source_payload.get(field) or {}).get("status") or "")
-                    in {"candidate", "contested", "none", "rejected", "withheld"}
-                    for field in (
-                        "epistemic_standing",
-                        "normative_standing",
-                        "operational_authority",
+                source_lifecycle not in (
+                    {"active", "archived", "proposed", "superseded"}
+                    if process_provenance
+                    else {"active", "archived", "superseded"}
+                )
+                or (
+                    not process_provenance
+                    and (
+                        source.get("health_status") == "contradicted"
+                        or any(
+                            str((source_payload.get(field) or {}).get("status") or "")
+                            in {
+                                "candidate", "contested", "none", "rejected", "withheld"
+                            }
+                            for field in (
+                                "epistemic_standing",
+                                "normative_standing",
+                                "operational_authority",
+                            )
+                        )
+                        or str(
+                            (source_payload.get("constitutional_standing") or {}).get(
+                                "status"
+                            )
+                            or ""
+                        )
+                        in {"candidate", "contested", "rejected"}
                     )
                 )
-                or str(
-                    (source_payload.get("constitutional_standing") or {}).get("status")
-                    or ""
-                ) in {"candidate", "contested", "rejected"}
             ):
                 raise ValidationError(
-                    "active derived memory cannot use proposed, contested, or "
-                    f"unratified source atom: {source_ref}"
+                    "active derived memory cannot use proposed, deleted, "
+                    "contradicted, contested, or unratified source atom: "
+                    f"{source_ref}"
                 )
         if any(
             str((payload.get(field) or {}).get("status") or "")

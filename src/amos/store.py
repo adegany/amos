@@ -20,6 +20,7 @@ JSON_COLUMNS = {
     "confidence",
     "decay_policy",
     "evidence_refs",
+    "feedback_json",
     "expected_versions",
     "index_refs",
     "outcome_json",
@@ -108,6 +109,19 @@ class SQLiteStore:
             raise
         else:
             self.conn.commit()
+
+    @contextmanager
+    def read_snapshot(self) -> Iterator[sqlite3.Connection]:
+        """Hold one consistent SQLite snapshot across related diagnostic reads."""
+
+        if self.conn.in_transaction:
+            yield self.conn
+            return
+        self.conn.execute("BEGIN")
+        try:
+            yield self.conn
+        finally:
+            self.conn.rollback()
 
     def init_schema(self) -> None:
         self.conn.executescript(
@@ -262,6 +276,13 @@ class SQLiteStore:
             );
             CREATE INDEX IF NOT EXISTS idx_packet_cache_request_graph
                 ON amos_packet_cache(request_digest, graph_version);
+
+            CREATE TABLE IF NOT EXISTS amos_retrieval_packet_receipts (
+                packet_id TEXT PRIMARY KEY,
+                graph_version INTEGER NOT NULL,
+                feedback_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS amos_retrieval_outcomes (
                 outcome_id TEXT PRIMARY KEY,
@@ -711,6 +732,54 @@ class SQLiteStore:
     def get_atom(self, atom_id: str) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM amos_atoms WHERE id = ?", (atom_id,)).fetchone()
         return None if row is None else self._row_dict(row)
+
+    def reference_records(
+        self, refs: Sequence[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Resolve reference namespaces in bulk without returning record payloads."""
+
+        normalized = list(dict.fromkeys(str(ref) for ref in refs if str(ref)))
+        if not normalized:
+            return {}
+        placeholders = ",".join("?" for _ in normalized)
+        records: dict[str, list[dict[str, Any]]] = {
+            ref: [] for ref in normalized
+        }
+        atom_rows = self.conn.execute(
+            f"""
+            SELECT id, scope, access_policy, deleted
+            FROM amos_atoms
+            WHERE id IN ({placeholders})
+            """,
+            tuple(normalized),
+        ).fetchall()
+        for row in atom_rows:
+            records[str(row["id"])].append(
+                {
+                    "kind": "atom",
+                    "scope": self._json(row["scope"]),
+                    "access_policy": self._json(row["access_policy"]),
+                    "deleted": bool(row["deleted"]),
+                }
+            )
+        evidence_rows = self.conn.execute(
+            f"""
+            SELECT evidence_id, scope, access_policy
+            FROM amos_evidence
+            WHERE evidence_id IN ({placeholders})
+            """,
+            tuple(normalized),
+        ).fetchall()
+        for row in evidence_rows:
+            records[str(row["evidence_id"])].append(
+                {
+                    "kind": "evidence",
+                    "scope": self._json(row["scope"]),
+                    "access_policy": self._json(row["access_policy"]),
+                    "deleted": False,
+                }
+            )
+        return records
 
     def insert_atom(self, conn: sqlite3.Connection, atom: Mapping[str, Any]) -> None:
         conn.execute(
@@ -1184,8 +1253,11 @@ class SQLiteStore:
             ),
         )
 
-    def list_edges(self) -> list[dict[str, Any]]:
-        rows = self.conn.execute("SELECT * FROM amos_edges WHERE deleted = 0").fetchall()
+    def list_edges(self, *, include_deleted: bool = False) -> list[dict[str, Any]]:
+        query = "SELECT * FROM amos_edges"
+        if not include_deleted:
+            query += " WHERE deleted = 0"
+        rows = self.conn.execute(query).fetchall()
         return [self._row_dict(row) for row in rows]
 
     def edge_count(self) -> int:
@@ -1194,11 +1266,31 @@ class SQLiteStore:
         ).fetchone()
         return int(row["count"])
 
-    def edge_degree_counts(self, refs: list[str] | None = None) -> dict[str, int]:
+    def edge_degree_counts(
+        self,
+        refs: list[str] | None = None,
+        *,
+        include_deleted: bool = False,
+    ) -> dict[str, int]:
         counts: dict[str, int] = {}
         if refs is not None:
             ref_set = {str(ref) for ref in refs if str(ref)}
-            for edge in self.list_edges_for_refs(sorted(ref_set)):
+            if not ref_set:
+                return counts
+            if include_deleted:
+                placeholders = ",".join("?" for _ in ref_set)
+                rows = self.conn.execute(
+                    f"""
+                    SELECT source_ref, target_ref
+                    FROM amos_edges
+                    WHERE source_ref IN ({placeholders})
+                       OR target_ref IN ({placeholders})
+                    """,
+                    (*sorted(ref_set), *sorted(ref_set)),
+                ).fetchall()
+            else:
+                rows = self.list_edges_for_refs(sorted(ref_set))
+            for edge in rows:
                 source = str(edge["source_ref"])
                 target = str(edge["target_ref"])
                 if source in ref_set:
@@ -1206,11 +1298,12 @@ class SQLiteStore:
                 if target in ref_set:
                     counts[target] = counts.get(target, 0) + 1
         else:
+            deleted_filter = "" if include_deleted else "WHERE deleted = 0"
             rows = self.conn.execute(
-                """
+                f"""
                 SELECT source_ref, target_ref
                 FROM amos_edges
-                WHERE deleted = 0
+                {deleted_filter}
                 """
             ).fetchall()
             for row in rows:
@@ -1287,6 +1380,46 @@ class SQLiteStore:
                     edge["edge_id"],
                 ),
             )
+        return edges
+
+    def restore_edges_for_ref(
+        self, conn: sqlite3.Connection, target_ref: str
+    ) -> list[dict[str, Any]]:
+        """Reactivate archived edges from a restored current memory head.
+
+        Only edges whose opposite endpoint is still active or proposed are
+        restored. This avoids reviving an obsolete subgraph merely because a
+        canonical head was incorrectly archived by an older pressure policy.
+        """
+
+        rows = conn.execute(
+            """
+            SELECT e.*
+            FROM amos_edges e
+            WHERE e.deleted = 1
+              AND (e.source_ref = ? OR e.target_ref = ?)
+              AND EXISTS (
+                  SELECT 1
+                  FROM amos_atoms a
+                  WHERE a.id = CASE
+                      WHEN e.source_ref = ? THEN e.target_ref
+                      ELSE e.source_ref
+                  END
+                    AND a.deleted = 0
+                    AND a.lifecycle_state IN ('active', 'proposed')
+              )
+            """,
+            (target_ref, target_ref, target_ref),
+        ).fetchall()
+        edges = [self._row_dict(row) for row in rows]
+        now = utc_now()
+        for edge in edges:
+            edge["deleted"] = 0
+            edge["lifecycle_state"] = "active"
+            edge["health_status"] = "healthy"
+            edge["updated_at"] = now
+            edge["version"] = int(edge["version"]) + 1
+            self.upsert_edge(conn, edge)
         return edges
 
     def mark_edges_deleted(
@@ -1414,6 +1547,96 @@ class SQLiteStore:
                 utc_now(),
             ),
         )
+        self.cache_packet_feedback_receipt(
+            conn,
+            packet_id=packet_id,
+            response=response,
+            graph_version=graph_version,
+        )
+
+    @staticmethod
+    def _packet_feedback_projection(response: Mapping[str, Any]) -> dict[str, Any]:
+        items: list[dict[str, Any]] = []
+        evidence_refs: set[str] = set()
+        for raw in response.get("items", []) or []:
+            if not isinstance(raw, Mapping):
+                continue
+            item_ref = str(
+                raw.get("atom_ref")
+                or raw.get("atom_id")
+                or raw.get("item_ref")
+                or ""
+            )
+            if not item_ref:
+                continue
+            trace = [
+                {"edge_id": str(step.get("edge_id") or "")}
+                for step in raw.get("association_trace", []) or []
+                if isinstance(step, Mapping) and str(step.get("edge_id") or "")
+            ]
+            visible_evidence = sorted(
+                {
+                    str(ref)
+                    for ref in raw.get("evidence_refs", []) or []
+                    if str(ref)
+                }
+            )
+            evidence_refs.update(visible_evidence)
+            items.append(
+                {
+                    "item_ref": item_ref,
+                    "association_trace": trace,
+                    "evidence_refs": visible_evidence,
+                }
+            )
+        record = response.get("record")
+        if isinstance(record, Mapping) and str(record.get("evidence_id") or ""):
+            evidence_refs.add(str(record["evidence_id"]))
+        return {
+            "retrieval_mode": str(response.get("retrieval_mode") or ""),
+            "items": items,
+            "evidence_refs": sorted(evidence_refs),
+        }
+
+    def cache_packet_feedback_receipt(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        packet_id: str,
+        response: Mapping[str, Any],
+        graph_version: int,
+    ) -> None:
+        """Persist the compact packet membership needed by delayed feedback."""
+
+        conn.execute(
+            """
+            INSERT INTO amos_retrieval_packet_receipts(
+                packet_id, graph_version, feedback_json, created_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(packet_id) DO UPDATE SET
+                graph_version = excluded.graph_version,
+                feedback_json = excluded.feedback_json,
+                created_at = excluded.created_at
+            """,
+            (
+                str(packet_id),
+                int(graph_version),
+                canonical_json(self._packet_feedback_projection(response)),
+                utc_now(),
+            ),
+        )
+
+    def get_packet_feedback_receipt(self, packet_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT packet_id, graph_version, feedback_json, created_at
+            FROM amos_retrieval_packet_receipts
+            WHERE packet_id = ?
+            """,
+            (str(packet_id),),
+        ).fetchone()
+        return None if row is None else self._row_dict(row)
 
     def get_cached_packet(
         self, *, request: Mapping[str, Any], graph_version: int

@@ -61,6 +61,131 @@ class RetrievalService:
         self._seconds_since = temporal._seconds_since
         self.run_memory_policy = policy_runner
 
+    def classify_refs(
+        self,
+        refs: Sequence[str],
+        *,
+        scope: Mapping[str, Any] | None = None,
+        requester: str = "system",
+        target_processor: str = "reasoner",
+    ) -> dict[str, Any]:
+        """Classify visible durable references without exposing their payloads."""
+
+        normalized = list(
+            dict.fromkeys(str(ref).strip() for ref in refs if str(ref).strip())
+        )
+        if len(normalized) > 512:
+            raise ValidationError("reference classification is limited to 512 refs")
+        records = self.store.reference_records(normalized)
+        classified = {
+            "atom_refs": [],
+            "evidence_refs": [],
+            "unknown_refs": [],
+            "denied_refs": [],
+            "ambiguous_refs": [],
+        }
+        request_scope = dict(scope or {})
+        for ref in normalized:
+            candidates = records.get(ref, [])
+            visible = [
+                candidate
+                for candidate in candidates
+                if scope_visible(candidate.get("scope") or {}, request_scope)
+                and access_visible(
+                    candidate.get("access_policy") or {},
+                    requester,
+                    target_processor,
+                )
+            ]
+            kinds = {str(candidate.get("kind") or "") for candidate in visible}
+            if len(kinds) > 1:
+                classified["ambiguous_refs"].append(ref)
+            elif kinds == {"atom"}:
+                classified["atom_refs"].append(ref)
+            elif kinds == {"evidence"}:
+                classified["evidence_refs"].append(ref)
+            elif candidates:
+                classified["denied_refs"].append(ref)
+            else:
+                classified["unknown_refs"].append(ref)
+        return {
+            "profile": "amos.reference-classification.v1",
+            "scope": request_scope,
+            **classified,
+        }
+
+    def retrieve_evidence(
+        self,
+        evidence_id: str,
+        *,
+        scope: Mapping[str, Any] | None = None,
+        requester: str = "system",
+        target_processor: str = "reasoner",
+        run_policy: bool = True,
+    ) -> dict[str, Any]:
+        """Resolve one known evidence record with scope and access enforcement."""
+
+        evidence_id = str(evidence_id or "").strip()
+        if not evidence_id:
+            raise ValidationError("evidence_id is required")
+        self._mark_foreground_activity(requester)
+        if run_policy:
+            self.run_memory_policy(trigger="retrieve_evidence", scope=scope or {})
+        request = {
+            "evidence_id": evidence_id,
+            "scope": dict(scope or {}),
+            "requester": requester,
+            "target_processor": target_processor,
+            "retrieval_mode": "exact_evidence",
+            "run_policy": bool(run_policy),
+        }
+        evidence = self.store.get_evidence(evidence_id)
+        omissions: list[dict[str, Any]] = []
+        if evidence is None:
+            omissions.append({"evidence_ref": evidence_id, "reason": "not_found"})
+        elif not scope_visible(evidence["scope"], request["scope"]):
+            omissions.append({"evidence_ref": evidence_id, "reason": "scope_hidden"})
+        elif not access_visible(
+            evidence["access_policy"], requester, target_processor
+        ):
+            omissions.append({"evidence_ref": evidence_id, "reason": "access_hidden"})
+        found = evidence is not None and not omissions
+        packet_id = stable_id(
+            "pkt",
+            {
+                "request": request,
+                "checksum": evidence.get("checksum") if found and evidence else None,
+            },
+        )
+        packet = {
+            "packet_id": packet_id,
+            "schema_version": SCHEMA_VERSION,
+            "request": request,
+            "generated_at": utc_now(),
+            "target_processor": target_processor,
+            "retrieval_mode": "exact_evidence",
+            "scope": dict(scope or {}),
+            "status": "found" if found else "not_found",
+            "found": found,
+            "record": dict(evidence) if found and evidence is not None else None,
+            "omissions": omissions,
+            "degradation": {
+                "mode": "exact-evidence-local",
+                "semantic_ranking_used": False,
+                "reason_codes": sorted(
+                    {str(omission["reason"]) for omission in omissions}
+                ),
+            },
+        }
+        with self.store.transaction() as conn:
+            self.store.cache_packet_feedback_receipt(
+                conn,
+                packet_id=packet_id,
+                response=packet,
+                graph_version=self.store.graph_version(),
+            )
+        return packet
+
     def retrieve_atom(
         self,
         atom_id: str,
@@ -631,6 +756,9 @@ class RetrievalService:
             outcome
         )
         packet = self.store.get_cached_packet_by_id(packet_id)
+        if packet is None:
+            receipt = self.store.get_packet_feedback_receipt(packet_id)
+            packet = dict((receipt or {}).get("feedback_json") or {})
         packet_items = {
             str(item.get("atom_ref") or item.get("atom_id") or item.get("item_ref")): item
             for item in (packet or {}).get("items", [])
@@ -767,6 +895,21 @@ class RetrievalService:
                     "correction_count": correction_count,
                 }
             )
+        reported_evidence_refs = set(
+            self._retrieval_outcome_evidence_refs(outcome)
+        )
+        packet_evidence_refs = {
+            str(ref)
+            for ref in (packet or {}).get("evidence_refs", []) or []
+            if str(ref)
+        }
+        for item in (packet or {}).get("items", []) or []:
+            if isinstance(item, Mapping):
+                packet_evidence_refs.update(
+                    str(ref)
+                    for ref in item.get("evidence_refs", []) or []
+                    if str(ref)
+                )
         return {
             "updated_atom_refs": [item["atom_ref"] for item in updated_atoms],
             "updated_atoms": updated_atoms,
@@ -777,7 +920,13 @@ class RetrievalService:
             "updated_edge_refs": [item["edge_id"] for item in updated_edges],
             "updated_edges": updated_edges,
             "ignored_non_packet_refs": ignored_refs,
-            "reported_evidence_refs": self._retrieval_outcome_evidence_refs(outcome),
+            "reported_evidence_refs": sorted(reported_evidence_refs),
+            "accepted_evidence_refs": sorted(
+                reported_evidence_refs.intersection(packet_evidence_refs)
+            ),
+            "ignored_non_packet_evidence_refs": sorted(
+                reported_evidence_refs - packet_evidence_refs
+            ),
             "feedback_contract": "packet_items_only",
         }
 

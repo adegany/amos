@@ -572,12 +572,13 @@ class ContinuityService:
                     )
                 )
 
-            projected_edges: list[dict[str, Any]] = []
+            requested_edges: list[dict[str, Any]] = []
+            historical_edge_matches_allowed: set[str] = set()
             seen_edges: set[str] = set()
             for atom in prepared:
                 for edge in self._intrinsic_edges_for_atom(atom):
                     if edge["edge_id"] not in seen_edges:
-                        projected_edges.append(edge)
+                        requested_edges.append(edge)
                         seen_edges.add(str(edge["edge_id"]))
             for index, raw in enumerate(edge_input):
                 item = self._mapping(raw, f"edges[{index}]")
@@ -612,6 +613,15 @@ class ContinuityService:
                     derivation={
                         "kind": "explicit_memory_transaction",
                         "actor": actor,
+                        "source_refs": [
+                            self._required_text(
+                                ref, f"edges[{index}].source_refs"
+                            )
+                            for ref in self._sequence(
+                                item.get("source_refs"),
+                                f"edges[{index}].source_refs",
+                            )
+                        ],
                     },
                 )
                 supplied_edge_id = item.get("edge_id")
@@ -620,8 +630,53 @@ class ContinuityService:
                         supplied_edge_id, f"edges[{index}].edge_id"
                     )
                 if edge["edge_id"] not in seen_edges:
-                    projected_edges.append(edge)
+                    requested_edges.append(edge)
                     seen_edges.add(str(edge["edge_id"]))
+                allow_historical_match = item.get(
+                    "allow_historical_match", False
+                )
+                if not isinstance(allow_historical_match, bool):
+                    raise ValidationError(
+                        f"edges[{index}].allow_historical_match must be a boolean"
+                    )
+                if allow_historical_match:
+                    historical_edge_matches_allowed.add(str(edge["edge_id"]))
+
+            # ``insert_edge`` is deliberately insert-only.  A stable edge id may
+            # therefore already identify the requested relationship (for
+            # example when two source-bound transactions cite the same
+            # relationship).  Journal only the projections that this
+            # transaction will actually insert; otherwise replay would apply
+            # the later metadata while SQLite correctly retained the first
+            # projection.
+            projected_edges: list[dict[str, Any]] = []
+            resolved_edges: list[dict[str, Any]] = []
+            reused_edge_refs: list[str] = []
+            historical_edge_refs: list[str] = []
+            identity_fields = ("source_ref", "target_ref", "relation", "scope")
+            for edge in requested_edges:
+                edge_id = str(edge["edge_id"])
+                existing = self.store.get_edge(edge_id)
+                if existing is None:
+                    projected_edges.append(edge)
+                    resolved_edges.append(edge)
+                    continue
+                if any(existing.get(field) != edge.get(field) for field in identity_fields):
+                    raise ValidationError(
+                        "memory transaction edge_id collides with a different "
+                        f"relationship: {edge_id}"
+                    )
+                if existing.get("deleted"):
+                    if edge_id not in historical_edge_matches_allowed:
+                        raise ValidationError(
+                            "memory transaction cannot silently reactivate a "
+                            f"deleted edge: {edge_id}"
+                        )
+                    resolved_edges.append(existing)
+                    historical_edge_refs.append(edge_id)
+                    continue
+                resolved_edges.append(existing)
+                reused_edge_refs.append(edge_id)
 
             projected_atoms = [*superseded_atoms, *prepared]
             event_payload = {
@@ -630,6 +685,8 @@ class ContinuityService:
                 "evidence": prepared_evidence,
                 "projected_atoms": projected_atoms,
                 "projected_edges": projected_edges,
+                "reused_edge_refs": reused_edge_refs,
+                "historical_edge_refs": historical_edge_refs,
                 "projected_heads": projected_heads,
                 "receipt_refs": receipts,
                 "scope": dict(transaction_scope),
@@ -681,7 +738,8 @@ class ContinuityService:
                 "evidence": prepared_evidence,
                 "atoms": prepared,
                 "superseded_atoms": superseded_atoms,
-                "edges": projected_edges,
+                "edges": resolved_edges,
+                "historical_edge_refs": historical_edge_refs,
                 "heads": committed_heads,
                 "receipt_refs": receipts,
                 "event": event,

@@ -291,6 +291,18 @@ def test_self_awareness_tracks_open_commitments_and_calibrates_claims(amos):
             "scope": {"tenant": "qandl"},
         }
     )["atom"]
+    fulfilled_native = amos.commit_atom(
+        {
+            "id": "commit_done_native_status",
+            "type": "commitment",
+            "payload": {
+                "agent_id": "trainer",
+                "description": "new profile done item",
+                "commitment_status": "fulfilled",
+            },
+            "scope": {"tenant": "qandl"},
+        }
+    )["atom"]
 
     view = amos.retrieve_self_awareness(
         agent_id="trainer",
@@ -298,6 +310,10 @@ def test_self_awareness_tracks_open_commitments_and_calibrates_claims(amos):
     )
     assert commitment["id"] in {item["atom_ref"] for item in view["open_commitments"]}
     assert fulfilled["id"] not in {item["atom_ref"] for item in view["open_commitments"]}
+    assert fulfilled_native["id"] not in {
+        item["atom_ref"] for item in view["open_commitments"]
+    }
+    assert view["request"]["retrieval_mode"] == "self_awareness"
     assert view["calibration"]["overconfident_claim_rate"] == 1.0
     recorded = amos.calibrate_self_model(
         agent_id="trainer",

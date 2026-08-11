@@ -188,6 +188,19 @@ class PolicyService:
         target_refs: list[str] = []
         try:
             maintenance = policy["maintenance"]
+            if maintenance["enabled"] and maintenance["repair_reference_contracts"]:
+                results["reference_contracts"] = (
+                    self._run_reference_contract_repairs(
+                        scope=scope,
+                        actor=actor,
+                        max_repairs=maintenance["max_reference_contract_repairs"],
+                    )
+                )
+                target_refs.extend(
+                    action["record_ref"]
+                    for action in results["reference_contracts"].get("actions", [])
+                    if action.get("record_kind") == "atom"
+                )
             if maintenance["enabled"] and maintenance["run_smp"]:
                 results["smp"] = self.run_smp_analysis(
                     scope=scope,
@@ -391,6 +404,7 @@ class PolicyService:
         maintenance = normalized["maintenance"]
         for key in [
             "enabled",
+            "repair_reference_contracts",
             "run_smp",
             "run_steward",
             "rebuild_indexes",
@@ -398,6 +412,10 @@ class PolicyService:
             "invalidate_packet_cache",
         ]:
             maintenance[key] = bool(maintenance.get(key, True))
+        maintenance["max_reference_contract_repairs"] = max(
+            1,
+            int(maintenance.get("max_reference_contract_repairs", 2048) or 2048),
+        )
         maintenance["max_smp_atoms"] = max(
             1,
             int(maintenance.get("max_smp_atoms", 128) or 128),
@@ -850,6 +868,28 @@ class PolicyService:
             and graph_delta > 0
         ):
             reasons.append(f"capacity_pressure:{pressure_mode}")
+        if schedule.get("run_on_pressure", True) and graph_delta > 0:
+            decay = dict(policy.get("decay") or {})
+            max_atoms = max(1, int(decay.get("max_atoms", 256) or 256))
+            max_active_atoms = max(
+                1, int(decay.get("max_active_atoms", max_atoms) or max_atoms)
+            )
+            max_proposed_atoms = max(
+                1, int(decay.get("max_proposed_atoms", max_atoms) or max_atoms)
+            )
+            hot_atoms = self.store.list_atoms_filtered(
+                lifecycle_states=["active", "proposed"]
+            )
+            active_count = sum(
+                atom.get("lifecycle_state") == "active" for atom in hot_atoms
+            )
+            proposed_count = len(hot_atoms) - active_count
+            if len(hot_atoms) > max_atoms:
+                reasons.append("memory_atom_pressure:hot")
+            if active_count > max_active_atoms:
+                reasons.append("memory_atom_pressure:active")
+            if proposed_count > max_proposed_atoms:
+                reasons.append("memory_atom_pressure:proposed")
         storage_cleanup = self._storage_cleanup_due(
             policy.get("storage_cleanup", {}), state, force=force
         )
@@ -890,10 +930,24 @@ class PolicyService:
         max_active_atoms = int(decay.get("max_active_atoms", max_atoms) or max_atoms)
         max_proposed_atoms = int(decay.get("max_proposed_atoms", max_atoms) or max_atoms)
         edge_degrees = self.store.edge_degree_counts()
+        # Archival deliberately retires hot graph edges, but those rows remain
+        # durable provenance. An active consolidation whose only sources were
+        # archived is historically connected, not an orphan that never had
+        # graph lineage.
+        historical_edge_refs = set(
+            self.store.edge_degree_counts(include_deleted=True)
+        )
+        head_anchored_refs = {
+            str(head.get("head_ref") or "")
+            for head in self.store.list_memory_heads()
+            if str(head.get("head_ref") or "")
+        }
         isolated = [
             atom
             for atom in active_atoms
             if int(edge_degrees.get(str(atom["id"]), 0)) == 0
+            and str(atom["id"]) not in historical_edge_refs
+            and str(atom["id"]) not in head_anchored_refs
         ]
         isolated_proposed = [
             atom
@@ -985,9 +1039,37 @@ class PolicyService:
             for atom in self.store.list_atoms_filtered()
             if str(atom.get("id") or "")
         }
-        known_refs = historical_refs | {
-            str(record.get("evidence_id") or "") for record in evidence_records
+        evidence_ids = {
+            str(record.get("evidence_id") or "")
+            for record in evidence_records
+            if str(record.get("evidence_id") or "")
         }
+        known_refs = historical_refs | evidence_ids
+        reference_contract_counts = {
+            "atom_evidence_refs": 0,
+            "edge_evidence_refs": 0,
+            "exact_evidence_refs": 0,
+            "mistyped_atom_refs": 0,
+            "unresolved_refs": 0,
+        }
+        mistyped_ref_samples: set[str] = set()
+        contract_unresolved_samples: set[str] = set()
+        for record_kind, records in (("atom", atoms), ("edge", edges)):
+            count_key = f"{record_kind}_evidence_refs"
+            for record in records:
+                for raw_ref in record.get("evidence_refs", []):
+                    ref = str(raw_ref or "")
+                    if not ref:
+                        continue
+                    reference_contract_counts[count_key] += 1
+                    if ref in evidence_ids:
+                        reference_contract_counts["exact_evidence_refs"] += 1
+                    elif ref in historical_refs:
+                        reference_contract_counts["mistyped_atom_refs"] += 1
+                        mistyped_ref_samples.add(ref)
+                    else:
+                        reference_contract_counts["unresolved_refs"] += 1
+                        contract_unresolved_samples.add(ref)
         unresolved_refs: set[str] = set()
         for atom in atoms:
             unresolved_refs.update(
@@ -1107,12 +1189,13 @@ class PolicyService:
             }
             | {max_atoms}
         )
-        required_with_headroom = int(
+        required_with_headroom = max(1, int(
             math.ceil(hot_count / max(0.1, 1.0 - capacity_headroom_ratio))
-        )
+        ))
+        if capacity_targets[-1] < required_with_headroom:
+            capacity_targets.append(required_with_headroom)
         recommended_target = next(
-            (target for target in capacity_targets if target >= required_with_headroom),
-            capacity_targets[-1],
+            target for target in capacity_targets if target >= required_with_headroom
         )
         capacity_utilization = hot_count / max(1, max_atoms)
         capacity_near_limit = capacity_utilization >= 1.0 - capacity_headroom_ratio
@@ -1145,6 +1228,10 @@ class PolicyService:
             warnings.append("active_superseded_atoms_present")
         if isolated:
             warnings.append("isolated_active_atoms_present")
+        if reference_contract_counts["mistyped_atom_refs"]:
+            warnings.append("atom_ids_present_in_evidence_refs")
+        if reference_contract_counts["unresolved_refs"]:
+            warnings.append("unresolved_evidence_refs_present")
         maintenance_every = int(
             dict(policy.get("schedule") or {}).get("every_graph_versions", 25) or 25
         )
@@ -1217,6 +1304,19 @@ class PolicyService:
                 "count": len(isolated),
                 "by_type": isolated_by_type,
                 "sample_refs": sorted(str(atom["id"]) for atom in isolated)[:10],
+                "head_anchored_excluded_count": sum(
+                    1
+                    for atom in active_atoms
+                    if int(edge_degrees.get(str(atom["id"]), 0)) == 0
+                    and str(atom["id"]) in head_anchored_refs
+                ),
+                "historically_connected_excluded_count": sum(
+                    1
+                    for atom in active_atoms
+                    if int(edge_degrees.get(str(atom["id"]), 0)) == 0
+                    and str(atom["id"]) in historical_edge_refs
+                    and str(atom["id"]) not in head_anchored_refs
+                ),
             },
             "isolated_proposed_atoms": {
                 "count": len(isolated_proposed),
@@ -1224,6 +1324,11 @@ class PolicyService:
                 "sample_refs": sorted(
                     str(atom["id"]) for atom in isolated_proposed
                 )[:10],
+            },
+            "reference_contract": {
+                **reference_contract_counts,
+                "mistyped_atom_ref_samples": sorted(mistyped_ref_samples)[:32],
+                "unresolved_ref_samples": sorted(contract_unresolved_samples)[:32],
             },
             "derived_index_lag": {
                 "max_graph_delta": max_index_lag,
@@ -1545,6 +1650,228 @@ class PolicyService:
         return {**result, "completed_at": completed_at}
 
 
+    @staticmethod
+    def _partition_evidence_refs(
+        refs: Sequence[Any],
+        *,
+        atom_refs: set[str],
+        evidence_refs: set[str],
+    ) -> tuple[list[str], list[str], list[str]]:
+        normalized = list(
+            dict.fromkeys(str(ref).strip() for ref in refs if str(ref).strip())
+        )
+        exact_evidence: list[str] = []
+        source_atoms: list[str] = []
+        unresolved: list[str] = []
+        for ref in normalized:
+            # In the unlikely event that legacy data reused an identifier in
+            # both namespaces, retain it as evidence.  Evidence identifiers
+            # are the narrower contract and must not be silently demoted.
+            if ref in evidence_refs:
+                exact_evidence.append(ref)
+            elif ref in atom_refs:
+                source_atoms.append(ref)
+            else:
+                unresolved.append(ref)
+        return exact_evidence, source_atoms, unresolved
+
+
+    def _run_reference_contract_repairs(
+        self,
+        *,
+        scope: Mapping[str, Any],
+        actor: str,
+        max_repairs: int,
+    ) -> dict[str, Any]:
+        """Repair legacy provenance that mixed atom IDs into evidence_refs.
+
+        Evidence references name captured evidence records only.  Older
+        clients also placed atom lineage there.  Preserve that lineage in the
+        generic source_refs metadata and preserve unresolvable identifiers in
+        unresolved_source_refs so maintenance never discards provenance.
+        """
+
+        all_atoms = self.store.list_atoms_filtered(include_deleted=True)
+        atom_refs = {
+            str(atom.get("id") or "")
+            for atom in all_atoms
+            if str(atom.get("id") or "")
+        }
+        evidence_refs = {
+            str(record.get("evidence_id") or "")
+            for record in self.store.list_evidence()
+            if str(record.get("evidence_id") or "")
+        }
+        candidate_atoms = [
+            atom
+            for atom in all_atoms
+            if not atom.get("deleted")
+            and atom.get("lifecycle_state") in {"active", "proposed"}
+            and maintenance_scope_visible(atom.get("scope", {}), scope)
+        ]
+        candidate_edges = [
+            edge
+            for edge in self.store.list_edges()
+            if edge.get("lifecycle_state", "active") == "active"
+            and maintenance_scope_visible(edge.get("scope", {}), scope)
+        ]
+        actions: list[dict[str, Any]] = []
+        projected_atoms: list[dict[str, Any]] = []
+        projected_edges: list[dict[str, Any]] = []
+        now = utc_now()
+
+        with self.store.transaction() as conn:
+            for atom in candidate_atoms:
+                if len(actions) >= max_repairs:
+                    break
+                exact, source_atoms, unresolved = self._partition_evidence_refs(
+                    atom.get("evidence_refs", []),
+                    atom_refs=atom_refs,
+                    evidence_refs=evidence_refs,
+                )
+                if (
+                    exact == list(atom.get("evidence_refs", []))
+                    and not source_atoms
+                    and not unresolved
+                ):
+                    continue
+                payload = dict(atom.get("payload") or {})
+                prior_source_refs = payload.get("source_refs", [])
+                if not isinstance(prior_source_refs, list):
+                    prior_source_refs = []
+                prior_unresolved_refs = payload.get("unresolved_source_refs", [])
+                if not isinstance(prior_unresolved_refs, list):
+                    prior_unresolved_refs = []
+                payload["source_refs"] = list(
+                    dict.fromkeys(
+                        str(ref)
+                        for ref in [*prior_source_refs, *source_atoms]
+                        if str(ref)
+                    )
+                )
+                if unresolved or prior_unresolved_refs:
+                    payload["unresolved_source_refs"] = list(
+                        dict.fromkeys(
+                            str(ref)
+                            for ref in [*prior_unresolved_refs, *unresolved]
+                            if str(ref)
+                        )
+                    )
+                changed = dict(atom)
+                changed["payload"] = payload
+                changed["evidence_refs"] = exact
+                changed["version"] = int(changed["version"]) + 1
+                changed["updated_at"] = now
+                changed["revision_history"] = list(
+                    changed.get("revision_history") or []
+                )
+                changed["revision_history"].append(
+                    {
+                        "version": atom["version"],
+                        "digest": digest(self._atom_projection(atom)),
+                        "changed_at": now,
+                        "actor": actor,
+                        "reason": "reference_contract_repair",
+                    }
+                )
+                changed = normalize_atom(
+                    self._attach_search_index(changed), require_id=True
+                )
+                self.store.replace_atom(conn, changed)
+                projected_atoms.append(changed)
+                actions.append(
+                    {
+                        "record_kind": "atom",
+                        "record_ref": changed["id"],
+                        "moved_source_refs": source_atoms,
+                        "moved_unresolved_refs": unresolved,
+                        "retained_evidence_refs": exact,
+                    }
+                )
+
+            for edge in candidate_edges:
+                if len(actions) >= max_repairs:
+                    break
+                exact, source_atoms, unresolved = self._partition_evidence_refs(
+                    edge.get("evidence_refs", []),
+                    atom_refs=atom_refs,
+                    evidence_refs=evidence_refs,
+                )
+                if (
+                    exact == list(edge.get("evidence_refs", []))
+                    and not source_atoms
+                    and not unresolved
+                ):
+                    continue
+                derivation = dict(edge.get("derivation") or {})
+                prior_source_refs = derivation.get("source_refs", [])
+                if not isinstance(prior_source_refs, list):
+                    prior_source_refs = []
+                prior_unresolved_refs = derivation.get(
+                    "unresolved_source_refs", []
+                )
+                if not isinstance(prior_unresolved_refs, list):
+                    prior_unresolved_refs = []
+                derivation["source_refs"] = list(
+                    dict.fromkeys(
+                        str(ref)
+                        for ref in [*prior_source_refs, *source_atoms]
+                        if str(ref)
+                    )
+                )
+                if unresolved or prior_unresolved_refs:
+                    derivation["unresolved_source_refs"] = list(
+                        dict.fromkeys(
+                            str(ref)
+                            for ref in [*prior_unresolved_refs, *unresolved]
+                            if str(ref)
+                        )
+                    )
+                changed_edge = dict(edge)
+                changed_edge["evidence_refs"] = exact
+                changed_edge["derivation"] = derivation
+                changed_edge["version"] = int(changed_edge.get("version", 1)) + 1
+                changed_edge["updated_at"] = now
+                self.store.upsert_edge(conn, changed_edge)
+                projected_edges.append(changed_edge)
+                actions.append(
+                    {
+                        "record_kind": "edge",
+                        "record_ref": changed_edge["edge_id"],
+                        "moved_source_refs": source_atoms,
+                        "moved_unresolved_refs": unresolved,
+                        "retained_evidence_refs": exact,
+                    }
+                )
+
+            if actions:
+                event = self.store.append_event(
+                    conn,
+                    event_type="memory_reference_contract_repaired",
+                    actor=actor,
+                    payload={
+                        "operation": "repair_reference_contracts",
+                        "actions": actions,
+                        "projected_atoms": projected_atoms,
+                        "projected_edges": projected_edges,
+                    },
+                    target_refs=[action["record_ref"] for action in actions],
+                )
+                self.store.clear_packet_cache(conn)
+            else:
+                event = None
+
+        return {
+            "status": "completed",
+            "action_count": len(actions),
+            "actions": actions,
+            "projected_atoms": projected_atoms,
+            "projected_edges": projected_edges,
+            "truncated": len(actions) >= max_repairs,
+            "event": event,
+        }
+
+
     def _run_decay_policy(
         self,
         *,
@@ -1564,6 +1891,51 @@ class PolicyService:
         projected_atoms: list[dict[str, Any]] = []
         projected_edges: list[dict[str, Any]] = []
         now = utc_now()
+        current_head_refs = {
+            str(head.get("head_ref") or "")
+            for head in self.store.list_memory_heads()
+            if str(head.get("head_ref") or "")
+            and maintenance_scope_visible(head.get("scope", {}), scope)
+        }
+        # Older pressure policies could archive the atom still named by a
+        # canonical memory head. Repair that structural contradiction before
+        # considering decay, then protect all current heads dynamically. The
+        # protection follows the head and therefore does not pin predecessors.
+        with self.store.transaction() as conn:
+            for head_ref in sorted(current_head_refs):
+                atom = self.store.get_atom(head_ref)
+                if atom is None or atom.get("deleted"):
+                    continue
+                if atom.get("lifecycle_state") != "archived":
+                    continue
+                changed = dict(atom)
+                changed["version"] = int(changed["version"]) + 1
+                changed["updated_at"] = now
+                changed["lifecycle_state"] = "active"
+                changed["health_status"] = "healthy"
+                changed["decay_policy"] = {
+                    **dict(changed.get("decay_policy") or {}),
+                    "last_decay": {
+                        "action": "restore",
+                        "reason": "current_memory_head_protection",
+                        "applied_at": now,
+                    },
+                }
+                changed = normalize_atom(
+                    self._attach_search_index(changed), require_id=True
+                )
+                self.store.replace_atom(conn, changed)
+                restored_edges = self.store.restore_edges_for_ref(conn, head_ref)
+                projected_atoms.append(changed)
+                projected_edges.extend(restored_edges)
+                actions.append({
+                    "atom_ref": head_ref,
+                    "action": "restore",
+                    "reason": "current_memory_head_protection",
+                    "health_status": "healthy",
+                    "lifecycle_state": "active",
+                    "restored_edge_count": len(restored_edges),
+                })
         superseded_refs = (
             self._active_superseded_refs()
             if decay.get("archive_superseded", True)
@@ -1583,9 +1955,32 @@ class PolicyService:
         atoms = list(atoms_by_ref.values())
         planned: list[tuple[dict[str, Any], dict[str, Any]]] = []
         planned_archives: set[str] = set()
+        edge_degrees = self.store.edge_degree_counts()
+        historically_satisfied_commitments = {
+            str(edge.get("target_ref") or "")
+            for edge in self.store.list_edges(include_deleted=True)
+            if edge.get("relation") == "rel:satisfied_commitment"
+            and str(edge.get("target_ref") or "")
+        }
         duplicate_actions = self._proposed_duplicate_archive_actions(atoms)
         for atom in atoms:
             if not maintenance_scope_visible(atom["scope"], scope):
+                continue
+            if str(atom.get("id") or "") in current_head_refs:
+                continue
+            if (
+                atom.get("lifecycle_state") == "active"
+                and str(atom.get("type") or "") == "commitment"
+                and str(atom.get("id") or "")
+                in historically_satisfied_commitments
+            ):
+                action = {
+                    "action": "archive",
+                    "reason": "satisfied_commitment_recorded",
+                    "health_status": "healthy",
+                }
+                planned.append((atom, action))
+                planned_archives.add(str(atom["id"]))
                 continue
             if str(atom.get("type") or "") in GOVERNANCE_MAINTENANCE_PROTECTED_TYPES:
                 continue
@@ -1594,6 +1989,22 @@ class PolicyService:
                 if isinstance(atom.get("decay_policy"), Mapping)
                 else {}
             )
+            orphaned_authority_revision = (
+                atom.get("lifecycle_state") == "active"
+                and str(atom.get("type") or "") == "procedure"
+                and atom_policy.get("protection_reason")
+                == "authoritative_plugin_registry"
+                and int(edge_degrees.get(str(atom["id"]), 0) or 0) == 0
+            )
+            if orphaned_authority_revision:
+                action = {
+                    "action": "archive",
+                    "reason": "orphaned_noncanonical_authority_revision",
+                    "health_status": "stale",
+                }
+                planned.append((atom, action))
+                planned_archives.add(str(atom["id"]))
+                continue
             explicit_atom_policy = self._has_explicit_atom_decay_policy(atom_policy)
             superseded_action = duplicate_actions.get(str(atom["id"]))
             if superseded_action is None:
@@ -1654,6 +2065,7 @@ class PolicyService:
             atom
             for atom in atoms
             if str(atom["id"]) not in planned_archives
+            and str(atom["id"]) not in current_head_refs
             and self._pressure_archive_eligible(
                 atom, decay=decay, scope=scope, lifecycle_state="proposed"
             )
@@ -1662,6 +2074,7 @@ class PolicyService:
             atom
             for atom in atoms
             if str(atom["id"]) not in planned_archives
+            and str(atom["id"]) not in current_head_refs
             and self._pressure_archive_eligible(
                 atom, decay=decay, scope=scope, lifecycle_state="active"
             )
@@ -1669,7 +2082,6 @@ class PolicyService:
         pressure_required = bool(
             total_pressure_needed or active_pressure_needed or proposed_pressure_needed
         )
-        edge_degrees = self.store.edge_degree_counts() if pressure_required else {}
         proposal_pressure_candidates.sort(
             key=lambda atom: self._pressure_archive_sort_key(atom, edge_degrees)
         )

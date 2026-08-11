@@ -273,10 +273,21 @@ class ViewService:
                 continue
             visible_capabilities.append(item)
 
+        satisfied_commitment_refs = {
+            str(edge.get("target_ref") or "")
+            for edge in self.store.list_edges()
+            if str(edge.get("relation") or "") == "rel:satisfied_commitment"
+            and not edge.get("deleted")
+        }
         open_commitments = [
             item
             for item in by_type["commitment"]
-            if str(item["payload"].get("status", "open")).lower()
+            if str(item.get("atom_ref") or "") not in satisfied_commitment_refs
+            if str(
+                item["payload"].get("status")
+                or item["payload"].get("commitment_status")
+                or "open"
+            ).lower()
             not in {"fulfilled", "cancelled", "canceled", "superseded"}
         ]
         response_items = [
@@ -377,6 +388,7 @@ class ViewService:
             "omissions": omissions,
             "conflicts": conflicts,
             "source_packet_id": packet_id,
+            "request": request,
         }
 
 

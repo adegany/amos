@@ -478,6 +478,88 @@ def test_batch_preflight_rejects_active_memory_derived_from_proposed_batch_atom(
     assert amos.store.graph_version() == 0
 
 
+@pytest.mark.parametrize("source_lifecycle", ["archived", "superseded"])
+def test_batch_preflight_accepts_historical_source_atom(amos, source_lifecycle):
+    committed = amos.commit_memory_atoms(
+        [
+            {
+                "id": f"batch_{source_lifecycle}_source",
+                "type": "action_outcome",
+                "payload": {
+                    "agent_id": "agent:test",
+                    "action_ref": "action:test",
+                    "status": "completed",
+                    "summary": "A retained historical execution result.",
+                },
+                "lifecycle_state": source_lifecycle,
+                "health_status": "stale" if source_lifecycle == "archived" else "healthy",
+            },
+            {
+                "id": f"batch_{source_lifecycle}_derivative",
+                "type": "semantic",
+                "payload": {
+                    "summary": "An active assessment of historical evidence.",
+                    "source_refs": [f"batch_{source_lifecycle}_source"],
+                },
+            },
+        ],
+        idempotency_key=f"batch-{source_lifecycle}-source",
+    )
+
+    assert [item["atom"]["lifecycle_state"] for item in committed["committed"]] == [
+        source_lifecycle,
+        "active",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("atom_type", "payload"),
+    [
+        ("goal", {"objective": "Track a provisional reflection."}),
+        ("episode", {"summary": "Examined a provisional reflection."}),
+        (
+            "action_outcome",
+            {
+                "agent_id": "agent:test",
+                "action_ref": "action:reflect",
+                "status": "completed",
+            },
+        ),
+    ],
+)
+def test_process_provenance_accepts_proposed_contradicted_source(
+    amos,
+    atom_type,
+    payload,
+):
+    source_ref = f"proposed_process_source_{atom_type}"
+    derived_ref = f"active_process_record_{atom_type}"
+
+    committed = amos.commit_memory_atoms(
+        [
+            {
+                "id": source_ref,
+                "type": "semantic",
+                "payload": {"summary": "A provisional, contested reflection."},
+                "lifecycle_state": "proposed",
+                "health_status": "contradicted",
+            },
+            {
+                "id": derived_ref,
+                "type": atom_type,
+                "payload": {**payload, "source_refs": [source_ref]},
+            },
+        ],
+        idempotency_key=f"process-provenance-{atom_type}",
+    )
+
+    assert [item["atom"]["id"] for item in committed["committed"]] == [
+        source_ref,
+        derived_ref,
+    ]
+    assert amos.store.get_atom(derived_ref)["lifecycle_state"] == "active"
+
+
 def test_batch_replay_precedes_later_source_lifecycle_validation(amos):
     source = amos.commit_atom(
         {
@@ -808,6 +890,50 @@ def test_journal_replay_and_cache_invalidation_after_delete(amos):
     assert chain["status"] == "ok"
     assert replay["status"] == "ok"
     assert first["id"] not in amos.replay_graph()["atoms"]
+
+
+def test_integrity_verification_uses_one_snapshot_during_concurrent_write(
+    amos,
+    monkeypatch,
+):
+    amos.commit_atom(
+        {
+            "id": "snapshot_initial",
+            "type": "belief",
+            "payload": {"claim": "Present before verification."},
+        }
+    )
+    writer = Amos(amos.store.path)
+    original_list_events = amos.store.list_events
+    wrote_concurrently = False
+
+    def list_events_with_concurrent_write(*, limit=None):
+        nonlocal wrote_concurrently
+        events = original_list_events(limit=limit)
+        if not wrote_concurrently:
+            wrote_concurrently = True
+            writer.commit_atom(
+                {
+                    "id": "snapshot_concurrent",
+                    "type": "belief",
+                    "payload": {"claim": "Committed during verification."},
+                }
+            )
+        return events
+
+    monkeypatch.setattr(amos.store, "list_events", list_events_with_concurrent_write)
+    try:
+        verified = amos.verify_integrity()
+    finally:
+        writer.close()
+
+    assert verified["journal"]["status"] == "ok"
+    assert verified["replay"]["status"] == "ok"
+    assert verified["journal"]["graph_version"] == 1
+    assert verified["replay"]["graph_version"] == 1
+    assert verified["replay"]["stored_atom_count"] == 1
+    assert verified["replay"]["replayed_atom_count"] == 1
+    assert amos.store.get_atom("snapshot_concurrent") is not None
 
 
 def test_mutation_authorization_enforces_actor_trust_and_capability(amos):

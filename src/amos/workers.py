@@ -101,10 +101,12 @@ class BackgroundMemoryPolicyWorker:
         *,
         interval_seconds: float = 60.0,
         actor: str = "svc:memory_policy",
+        execution_lock: threading.Lock | threading.RLock | None = None,
     ):
         self.amos = amos
         self.interval_seconds = max(0.1, float(interval_seconds))
         self.actor = actor
+        self.execution_lock = execution_lock
         self._condition = threading.Condition()
         self._pending: list[dict[str, Any]] = []
         self._running = False
@@ -207,12 +209,11 @@ class BackgroundMemoryPolicyWorker:
                     }
                 self._running = True
             try:
-                result = self.amos.run_memory_policy(
-                    force=bool(request["force"]),
-                    trigger=str(request["trigger"]),
-                    scope=dict(request["scope"]),
-                    actor=self.actor,
-                )
+                if self.execution_lock is None:
+                    result = self._run_request(request)
+                else:
+                    with self.execution_lock:
+                        result = self._run_request(request)
                 compact = self._compact_result(result)
                 with self._condition:
                     self._last_result = compact
@@ -225,6 +226,14 @@ class BackgroundMemoryPolicyWorker:
             finally:
                 with self._condition:
                     self._running = False
+
+    def _run_request(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        return self.amos.run_memory_policy(
+            force=bool(request["force"]),
+            trigger=str(request["trigger"]),
+            scope=dict(request["scope"]),
+            actor=self.actor,
+        )
 
     def _compact_result(self, result: Mapping[str, Any]) -> dict[str, Any]:
         compact = {

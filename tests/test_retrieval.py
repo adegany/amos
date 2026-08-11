@@ -183,6 +183,96 @@ def test_retrieve_atom_enforces_scope_access_and_lifecycle_filters(amos):
     ]
 
 
+def test_retrieve_evidence_resolves_exact_record_with_scope_and_access(amos):
+    evidence = amos.capture_event(
+        source_type="observation",
+        source_ref="artifact:7",
+        payload={"visual_summary": "The rendered result is visible."},
+        scope={"tenant": "exact-test"},
+        access_policy={"visibility": ["processor:critic"]},
+    )["evidence"]
+
+    found = amos.retrieve_evidence(
+        evidence["evidence_id"],
+        scope={"tenant": "exact-test"},
+        target_processor="critic",
+        run_policy=False,
+    )
+    assert found["status"] == "found"
+    assert found["retrieval_mode"] == "exact_evidence"
+    assert found["record"]["evidence_id"] == evidence["evidence_id"]
+    assert found["record"]["payload"]["visual_summary"].startswith("The rendered")
+
+    hidden = amos.retrieve_evidence(
+        evidence["evidence_id"],
+        scope={"tenant": "exact-test"},
+        target_processor="reasoner",
+        run_policy=False,
+    )
+    assert hidden["found"] is False
+    assert hidden["omissions"] == [
+        {"evidence_ref": evidence["evidence_id"], "reason": "access_hidden"}
+    ]
+
+    missing = amos.retrieve_evidence("missing_evidence", run_policy=False)
+    assert missing["found"] is False
+    assert missing["omissions"] == [
+        {"evidence_ref": "missing_evidence", "reason": "not_found"}
+    ]
+
+
+def test_reference_classification_separates_atoms_evidence_and_unknowns(amos):
+    evidence = amos.capture_event(
+        source_type="observation",
+        source_ref="classification-source",
+        payload={"summary": "classification evidence"},
+        scope={"tenant": "classification-test"},
+    )["evidence"]
+    atom = amos.commit_atom(
+        {
+            "id": "classification_atom",
+            "type": "belief",
+            "payload": {"claim": "classification atom"},
+            "scope": {"tenant": "classification-test"},
+        }
+    )["atom"]
+
+    result = amos.classify_refs(
+        [atom["id"], evidence["evidence_id"], "missing_classification_ref"],
+        scope={"tenant": "classification-test"},
+        requester="classification-test",
+    )
+
+    assert result["atom_refs"] == [atom["id"]]
+    assert result["evidence_refs"] == [evidence["evidence_id"]]
+    assert result["unknown_refs"] == ["missing_classification_ref"]
+    assert result["denied_refs"] == []
+
+
+def test_exact_evidence_feedback_uses_evidence_ref_contract(amos):
+    evidence = amos.capture_event(
+        source_type="observation",
+        source_ref="artifact:feedback",
+        payload={"summary": "Exact evidence feedback target."},
+    )["evidence"]
+    packet = amos.retrieve_evidence(evidence["evidence_id"], run_policy=False)
+
+    outcome = amos.record_retrieval_outcome(
+        packet_id=packet["packet_id"],
+        request=packet["request"],
+        outcome={
+            "used_evidence_refs": [evidence["evidence_id"]],
+            "label": "useful",
+        },
+    )
+
+    assert outcome["feedback"]["updated_atom_refs"] == []
+    assert outcome["feedback"]["accepted_evidence_refs"] == [
+        evidence["evidence_id"]
+    ]
+    assert outcome["feedback"]["ignored_non_packet_evidence_refs"] == []
+
+
 def test_retrieve_packet_attention_context_shapes_ranking_and_trace(amos):
     amos.commit_atom(
         {
@@ -788,6 +878,44 @@ def test_retrieval_outcome_telemetry_is_reportable(amos):
     assert amos.health_memory()["retrieval_outcomes"] == 1
 
 
+def test_sibling_feedback_survives_graph_mutation_cache_invalidation(amos):
+    first = amos.commit_atom(
+        {
+            "id": "feedback_sibling_first",
+            "type": "belief",
+            "payload": {"claim": "durable sibling feedback shared cue first"},
+        }
+    )["atom"]
+    second = amos.commit_atom(
+        {
+            "id": "feedback_sibling_second",
+            "type": "belief",
+            "payload": {"claim": "durable sibling feedback shared cue second"},
+        }
+    )["atom"]
+    packet = amos.retrieve_packet(
+        cues=["durable sibling feedback shared cue"],
+        max_items=5,
+        run_policy=False,
+    )
+
+    amos.record_retrieval_outcome(
+        packet_id=packet["packet_id"],
+        request=packet["request"],
+        outcome={"used_item_refs": [first["id"]], "label": "useful"},
+    )
+    assert amos.store.get_cached_packet_by_id(packet["packet_id"]) is None
+    assert amos.store.get_packet_feedback_receipt(packet["packet_id"]) is not None
+    sibling_outcome = amos.record_retrieval_outcome(
+        packet_id=packet["packet_id"],
+        request=packet["request"],
+        outcome={"used_item_refs": [second["id"]], "label": "useful"},
+    )
+
+    assert sibling_outcome["feedback"]["updated_atom_refs"] == [second["id"]]
+    assert amos.store.get_atom(second["id"])["utility"] > second["utility"]
+
+
 def test_retrieval_feedback_only_updates_members_of_the_exact_packet(amos):
     selected = amos.commit_atom(
         {
@@ -858,6 +986,14 @@ def test_two_hop_association_trace_is_bounded_and_trains_used_edges(amos):
     assert leaf["score_components"]["edge_activation"] > 0
     assert [step["depth"] for step in leaf["association_trace"]] == [1, 2]
 
+    # A first graph-mutating outcome clears the response cache.  The later
+    # associated-item outcome must still train its trace from the compact
+    # durable packet receipt.
+    amos.record_retrieval_outcome(
+        packet_id=packet["packet_id"],
+        request=packet["request"],
+        outcome={"used_item_refs": ["association_seed"], "label": "useful"},
+    )
     outcome = amos.record_retrieval_outcome(
         packet_id=packet["packet_id"],
         request=packet["request"],

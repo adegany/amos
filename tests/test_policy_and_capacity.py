@@ -399,6 +399,52 @@ def test_memory_policy_executes_atom_decay_policy(amos):
     )
 
 
+def test_decay_archives_isolated_noncanonical_authority_revision(amos):
+    atom = amos.commit_atom(
+        {
+            "id": "legacy_isolated_authority_revision",
+            "type": "procedure",
+            "payload": {
+                "profile": "test.authority-record.v1",
+                "trigger_context": "legacy registry reconciliation",
+                "steps": ["verify the old registry snapshot"],
+            },
+            "decay_policy": {
+                "enabled": False,
+                "protection_reason": "authoritative_plugin_registry",
+            },
+        }
+    )["atom"]
+    amos.configure_memory_policy(
+        enabled=True,
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        storage_cleanup={"enabled": False},
+        decay={
+            "enabled": True,
+            "require_atom_policy": True,
+            "max_atoms": 100,
+            "max_active_atoms": 100,
+            "max_proposed_atoms": 100,
+        },
+    )
+
+    result = amos.run_memory_policy(
+        force=True,
+        trigger="orphaned-authority-revision-test",
+    )
+
+    assert result["results"]["decay"]["actions"] == [
+        {
+            "atom_ref": atom["id"],
+            "action": "archive",
+            "reason": "orphaned_noncanonical_authority_revision",
+            "health_status": "stale",
+            "lifecycle_state": "archived",
+        }
+    ]
+
+
 def test_memory_policy_pressure_archives_policyless_atoms_to_limit(amos):
     old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat().replace(
         "+00:00", "Z"
@@ -581,6 +627,41 @@ def test_memory_policy_enforces_proposed_quota_separately_from_active_atoms(amos
     assert health["hot_atom_limit"] == 10
 
 
+def test_memory_policy_is_due_immediately_when_hot_atom_quota_is_exceeded(amos):
+    amos.configure_memory_policy(
+        schedule={
+            "every_graph_versions": 1000,
+            "every_seconds": 3600,
+            "run_on_pressure": True,
+        },
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={
+            "enabled": True,
+            "max_atoms": 1,
+            "max_active_atoms": 10,
+            "max_proposed_atoms": 10,
+        },
+        storage_cleanup={"enabled": False},
+    )
+    amos.commit_atom({
+        "id": "atom_pressure_due_one",
+        "type": "semantic",
+        "payload": {"summary": "First hot atom"},
+    })
+    amos.commit_atom({
+        "id": "atom_pressure_due_two",
+        "type": "semantic",
+        "payload": {"summary": "Second hot atom"},
+    })
+
+    due = amos.memory_policy_status()["due"]
+
+    assert due["due"] is True
+    assert "memory_atom_pressure:hot" in due["reasons"]
+
+
 def test_memory_policy_deduplicates_only_explicitly_keyed_proposals(amos):
     base = {
         "type": "semantic",
@@ -636,6 +717,82 @@ def test_memory_policy_deduplicates_only_explicitly_keyed_proposals(amos):
     ]
     assert amos.store.get_atom(second["id"])["lifecycle_state"] == "proposed"
     assert amos.store.get_atom(unkeyed["id"])["lifecycle_state"] == "proposed"
+
+
+def test_memory_policy_protects_and_repairs_current_memory_heads(amos):
+    scope = {"tenant": "head-protection"}
+    amos.commit_memory_transaction(
+        scope=scope,
+        actor="head-protection-test",
+        idempotency_key="head-protection-seed",
+        atoms=[
+                {
+                    "id": "protected_goal_head",
+                    "type": "goal",
+                    "payload": {
+                        "goal_ref": "goal:protected",
+                        "revision": 1,
+                        "objective": "Preserve the canonical current goal state",
+                        "summary": "Canonical current goal state",
+                    },
+                },
+            {
+                "id": "protected_goal_context",
+                "type": "semantic",
+                "payload": {"summary": "Active context for the goal"},
+            },
+        ],
+        edges=[{
+            "source_ref": "protected_goal_head",
+            "target_ref": "protected_goal_context",
+            "relation": "rel:derived_from",
+            "evidence_refs": [],
+        }],
+        head_updates=[{
+            "series_kind": "goal_work",
+            "series_id": "goal:protected",
+            "expected_head_ref": None,
+            "expected_head_version": 0,
+            "new_head_ref": "protected_goal_head",
+        }],
+    )
+    # Reproduce the invalid legacy state: pressure archived a current head and
+    # deleted its graph edges while the head table still named it.
+    with amos.store.transaction() as conn:
+        archived = dict(amos.store.get_atom("protected_goal_head"))
+        archived["lifecycle_state"] = "archived"
+        archived["health_status"] = "stale"
+        archived["version"] = int(archived["version"]) + 1
+        amos.store.replace_atom(conn, archived)
+        amos.store.mark_edges_deleted_for_ref(conn, "protected_goal_head")
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={
+            "enabled": True,
+            "max_atoms": 2,
+            "max_active_atoms": 2,
+            "pressure_archive_policyless": True,
+        },
+        storage_cleanup={"enabled": False},
+    )
+
+    result = amos.run_memory_policy(force=True, trigger="head_protection_test")
+
+    repaired = amos.store.get_atom("protected_goal_head")
+    assert repaired["lifecycle_state"] == "active"
+    assert repaired["health_status"] == "healthy"
+    assert any(
+        action["atom_ref"] == "protected_goal_head"
+        and action["reason"] == "current_memory_head_protection"
+        for action in result["results"]["decay"]["actions"]
+    )
+    assert any(
+        edge["source_ref"] == "protected_goal_head"
+        and edge["target_ref"] == "protected_goal_context"
+        for edge in amos.store.list_edges()
+    )
 
 
 def test_memory_policy_archives_proposal_after_explicit_retention_window(amos):
@@ -761,6 +918,34 @@ def test_memory_health_recommends_capacity_target_with_headroom(amos):
         },
     ]
     assert "active_atom_capacity_headroom_low" in health["quality"]["warnings"]
+
+
+def test_memory_health_synthesizes_viable_capacity_target(amos):
+    for index in range(3):
+        amos.commit_atom(
+            {
+                "id": f"capacity_fallback_atom_{index}",
+                "type": "semantic",
+                "payload": {"summary": f"Capacity fallback observation {index}"},
+            }
+        )
+    amos.configure_memory_policy(
+        decay={
+            "max_atoms": 3,
+            "capacity_assessment_targets": [3],
+            "capacity_headroom_ratio": 0.2,
+        }
+    )
+
+    capacity = amos.health_memory(run_policy=False)["quality"]["capacity_assessment"]
+
+    assert capacity["recommended_target"] == 4
+    assert capacity["candidate_targets"][-1] == {
+        "target": 4,
+        "headroom_atoms": 1,
+        "utilization": 0.75,
+        "meets_headroom_target": True,
+    }
 
 
 def test_memory_policy_archives_superseded_atoms_and_retrieval_omits_them(amos):
@@ -934,6 +1119,151 @@ def test_service_owned_decay_archives_scoped_superseded_atoms_with_empty_scope(a
     assert amos.store.get_atom(new["id"])["lifecycle_state"] == "active"
 
 
+def test_memory_policy_repairs_legacy_atom_ids_in_evidence_refs(amos):
+    evidence = amos.capture_event(
+        source_type="observation",
+        source_ref="reference-contract-source",
+        payload={"summary": "captured evidence"},
+    )["evidence"]
+    source = amos.commit_atom(
+        {
+            "id": "reference_contract_source_atom",
+            "type": "belief",
+            "payload": {"claim": "source lineage atom"},
+        }
+    )["atom"]
+    target = amos.commit_atom(
+        {
+            "id": "reference_contract_target_atom",
+            "type": "belief",
+            "payload": {"claim": "target with legacy mixed references"},
+            "evidence_refs": [
+                evidence["evidence_id"],
+                source["id"],
+                "unresolved_legacy_reference",
+            ],
+        }
+    )["atom"]
+    edge = amos.commit_memory_transaction(
+        actor="reference-contract-test",
+        idempotency_key="reference-contract-edge",
+        edges=[
+            {
+                "source_ref": source["id"],
+                "target_ref": target["id"],
+                "relation": "rel:supports",
+                "evidence_refs": [evidence["evidence_id"], source["id"]],
+            }
+        ],
+    )["edges"][0]
+    health_before = amos.health_memory(run_policy=False)
+    assert health_before["quality"]["reference_contract"]["mistyped_atom_refs"] == 2
+
+    amos.configure_memory_policy(
+        maintenance={
+            "enabled": True,
+            "repair_reference_contracts": True,
+            "run_smp": False,
+            "run_steward": False,
+            "rebuild_indexes": False,
+            "rebuild_lsa": False,
+            "invalidate_packet_cache": False,
+        },
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": False},
+        storage_cleanup={"enabled": False},
+    )
+    result = amos.run_memory_policy(force=True, trigger="reference_contract_test")
+
+    repair = result["results"]["reference_contracts"]
+    assert repair["action_count"] == 2
+    repaired_atom = amos.store.get_atom(target["id"])
+    assert repaired_atom["evidence_refs"] == [evidence["evidence_id"]]
+    assert repaired_atom["payload"]["source_refs"] == [source["id"]]
+    assert repaired_atom["payload"]["unresolved_source_refs"] == [
+        "unresolved_legacy_reference"
+    ]
+    repaired_edge = amos.store.get_edge(edge["edge_id"])
+    assert repaired_edge["evidence_refs"] == [evidence["evidence_id"]]
+    assert repaired_edge["derivation"]["source_refs"] == [source["id"]]
+    health_after = amos.health_memory(run_policy=False)
+    assert health_after["quality"]["reference_contract"]["mistyped_atom_refs"] == 0
+    assert "atom_ids_present_in_evidence_refs" not in health_after["quality"]["warnings"]
+    assert amos.verify_replay()["status"] == "ok"
+
+
+def test_memory_policy_archives_commitment_with_recorded_satisfaction(amos):
+    commitment = amos.commit_atom(
+        {
+            "id": "completed_commitment_for_lifecycle_repair",
+            "type": "commitment",
+            "payload": {
+                "agent_id": "agent:test",
+                "description": "Complete the bounded task",
+                "status": "open",
+            },
+        }
+    )["atom"]
+    outcome = amos.commit_atom(
+        {
+            "id": "completed_commitment_outcome",
+            "type": "action_outcome",
+            "payload": {
+                "agent_id": "agent:test",
+                "action_ref": commitment["id"],
+                "status": "completed",
+            },
+        }
+    )["atom"]
+    amos.commit_memory_transaction(
+        actor="commitment-lifecycle-test",
+        idempotency_key="completed-commitment-satisfaction",
+        edges=[
+            {
+                "source_ref": outcome["id"],
+                "target_ref": commitment["id"],
+                "relation": "rel:satisfied_commitment",
+            }
+        ],
+    )
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": True},
+        storage_cleanup={"enabled": False},
+    )
+
+    result = amos.run_memory_policy(force=True, trigger="commitment_lifecycle_test")
+
+    action = next(
+        action
+        for action in result["results"]["decay"]["actions"]
+        if action["atom_ref"] == commitment["id"]
+    )
+    assert action["reason"] == "satisfied_commitment_recorded"
+    archived = amos.store.get_atom(commitment["id"])
+    assert archived["lifecycle_state"] == "archived"
+    assert archived["health_status"] == "healthy"
+    historical = amos.commit_memory_transaction(
+        actor="commitment-lifecycle-test",
+        idempotency_key="completed-commitment-historical-match",
+        edges=[
+            {
+                "source_ref": outcome["id"],
+                "target_ref": commitment["id"],
+                "relation": "rel:satisfied_commitment",
+                "allow_historical_match": True,
+            }
+        ],
+    )
+    assert historical["historical_edge_refs"]
+    assert historical["event"]["payload"]["projected_edges"] == []
+    assert bool(historical["edges"][0]["deleted"]) is True
+    assert amos.verify_replay()["status"] == "ok"
+
+
 def test_health_memory_reports_quality_diagnostics(amos):
     amos.configure_memory_policy(
         decay={"max_atoms": 1},
@@ -1019,6 +1349,42 @@ def test_health_isolation_separates_active_graph_from_dormant_proposals(amos):
     assert quality["isolated_proposed_atoms"]["count"] == 1
     assert quality["isolated_proposed_atoms"]["expected_dormant"] is True
     assert quality["isolated_proposed_atoms"]["sample_refs"] == [proposed["id"]]
+
+
+def test_health_does_not_call_active_memory_with_archived_lineage_isolated(amos):
+    source = amos.commit_atom({
+        "id": "historical_lineage_source",
+        "type": "episode",
+        "payload": {
+            "task": "preserve lineage",
+            "outcome": "observed",
+            "started_at": "2026-01-01T00:00:00Z",
+            "participants": ["test"],
+        },
+    })["atom"]
+    derived = amos.commit_memory_transaction(
+        scope={},
+        actor="historical-lineage-test",
+        atoms=[{
+            "id": "active_historical_lineage_consumer",
+            "type": "semantic",
+            "payload": {"summary": "A consolidation with archived provenance"},
+        }],
+        edges=[{
+            "source_ref": "active_historical_lineage_consumer",
+            "target_ref": source["id"],
+            "relation": "rel:derived_from",
+            "evidence_refs": [],
+        }],
+    )["atoms"][0]
+    amos.archive_atom(source["id"], reason="source aged out of the hot graph")
+
+    quality = amos.health_memory(run_policy=False)["quality"]
+
+    assert derived["id"] not in quality["isolated_active_atoms"]["sample_refs"]
+    assert quality["isolated_active_atoms"][
+        "historically_connected_excluded_count"
+    ] == 1
 
 
 def test_quality_diagnostics_accept_superseded_atoms_as_lineage_endpoints(amos):

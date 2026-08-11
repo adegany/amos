@@ -44,12 +44,18 @@ class AmosHTTPServer(ThreadingHTTPServer):
             db_path,
             maintenance_processor_paths=self.maintenance_processor_paths,
         )
+        self.maintenance_amos = Amos(
+            db_path,
+            maintenance_processor_paths=self.maintenance_processor_paths,
+        )
         self.policy_worker_amos = Amos(
             db_path,
             maintenance_processor_paths=self.maintenance_processor_paths,
         )
+        self.maintenance_lock = threading.Lock()
         self.memory_policy_worker = BackgroundMemoryPolicyWorker(
-            self.policy_worker_amos
+            self.policy_worker_amos,
+            execution_lock=self.maintenance_lock,
         )
         self.memory_policy_worker.start()
         self.service_lock = threading.RLock()
@@ -63,6 +69,8 @@ class AmosHTTPServer(ThreadingHTTPServer):
         try:
             super().server_close()
         finally:
+            with self.maintenance_lock:
+                self.maintenance_amos.close()
             with self.service_lock:
                 self.policy_worker_amos.close()
                 self.amos.close()
@@ -86,6 +94,30 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
             try:
                 body = self._read_json() if method == "POST" else {}
                 server = cast(AmosHTTPServer, self.server)
+                path = self.path.split("?", 1)[0]
+                if method == "POST" and path == "/v1/maintenance-distiller:run":
+                    with server.service_lock:
+                        closing = server.closing
+                    if closing:
+                        self._write_json(
+                            {
+                                "status": "error",
+                                "error": "server is shutting down",
+                                "retryable": True,
+                            },
+                            status=HTTPStatus.SERVICE_UNAVAILABLE,
+                        )
+                        return
+                    # A semantic processor may make bounded model calls. Keep
+                    # that work off the global read/API lock, and serialize it
+                    # with the service-owned policy worker so duplicate
+                    # distillations cannot contend for the same model substrate.
+                    with server.maintenance_lock:
+                        return self._write_json(
+                            server.maintenance_amos.run_maintenance_distiller(
+                                **body
+                            )
+                        )
                 with server.service_lock:
                     if server.closing:
                         self._write_json(
@@ -182,6 +214,14 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
             amos = server.amos
             path = self.path.split("?", 1)[0]
             if method == "GET":
+                if path == "/v1/ready":
+                    # Sidecar readiness must remain constant-time as the memory
+                    # graph grows. Full graph-quality diagnostics belong to
+                    # /v1/health/memory and are intentionally not part of boot.
+                    return self._write_json({
+                        "status": "ready",
+                        "graph_version": amos.store.graph_version(),
+                    })
                 if path == "/v1/health/memory":
                     payload = amos.health_memory(run_policy=False)
                     payload["background_policy_worker"] = (
@@ -201,16 +241,20 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 if path == "/v1/maintenance-processors":
                     return self._write_json(amos.list_maintenance_processors())
                 if path == "/v1/verify":
-                    return self._write_json(
-                        {
-                            "journal": amos.verify_journal_chain(),
-                            "replay": amos.verify_replay(),
-                        }
-                    )
+                    return self._write_json(amos.verify_integrity())
                 raise NotImplementedError
 
             if path == "/v1/events:capture":
                 return self._write_json(amos.capture_event(**body))
+            if path == "/v1/refs:classify":
+                request = dict(body)
+                profile = request.pop("profile", None)
+                if profile not in {None, "amos.reference-classification.v1"}:
+                    raise ValidationError(
+                        "reference classification profile must be "
+                        "'amos.reference-classification.v1'"
+                    )
+                return self._write_json(amos.classify_refs(**request))
             if path == "/v1/memory-transactions:commit":
                 request = dict(body)
                 profile = request.pop("profile", None)
@@ -452,6 +496,20 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 if policy_schedule is not None:
                     packet["policy_schedule"] = policy_schedule
                 return self._write_json(packet)
+            if path == "/v1/evidence:get":
+                request = dict(body)
+                evidence_id = request.pop("evidence_id")
+                policy_schedule = None
+                if bool(request.get("run_policy", True)):
+                    policy_schedule = server.memory_policy_worker.request_tick(
+                        trigger="retrieve_evidence",
+                        scope=request.get("scope") or {},
+                    )
+                    request["run_policy"] = False
+                packet = amos.retrieve_evidence(evidence_id, **request)
+                if policy_schedule is not None:
+                    packet["policy_schedule"] = policy_schedule
+                return self._write_json(packet)
             if path == "/v1/packets:retrieve":
                 request = dict(body)
                 policy_schedule = None
@@ -514,7 +572,9 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
             if path == "/v1/memory-policy:run":
                 return self._write_json(amos.run_memory_policy(**body))
             if path == "/v1/maintenance-distiller:run":
-                return self._write_json(amos.run_maintenance_distiller(**body))
+                raise RuntimeError(
+                    "maintenance distiller must use the isolated execution lane"
+                )
             raise NotImplementedError
 
         def _reasoning_request(
