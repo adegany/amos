@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-import json
 import hmac
+import json
+import queue
 import sqlite3
 import threading
+import time
+from collections.abc import Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Mapping, cast
+from typing import Any, cast
 
 from .errors import (
     AccessDenied,
@@ -25,6 +28,10 @@ from .workers import BackgroundMemoryPolicyWorker
 
 
 class AmosHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 64
+    REQUEST_SERVICE_COUNT = 4
+
     def __init__(
         self,
         server_address: tuple[str, int],
@@ -44,6 +51,35 @@ class AmosHTTPServer(ThreadingHTTPServer):
             db_path,
             maintenance_processor_paths=self.maintenance_processor_paths,
         )
+        self.request_services = [
+            self.amos,
+            *[
+                Amos(
+                    db_path,
+                    maintenance_processor_paths=self.maintenance_processor_paths,
+                )
+                for _ in range(self.REQUEST_SERVICE_COUNT - 1)
+            ],
+        ]
+        self.request_service_pool: queue.LifoQueue[Amos] = queue.LifoQueue(
+            maxsize=self.REQUEST_SERVICE_COUNT
+        )
+        # Put the public primary service last so ordinary sequential requests
+        # retain the existing test/embedding seam while overlapping requests
+        # receive isolated SQLite connections.
+        for service in self.request_services[1:]:
+            self.request_service_pool.put(service)
+        self.request_service_pool.put(self.amos)
+        self.health_amos = Amos(
+            db_path,
+            maintenance_processor_paths=self.maintenance_processor_paths,
+        )
+        self.ready_amos = Amos(
+            db_path,
+            maintenance_processor_paths=self.maintenance_processor_paths,
+        )
+        self.health_lock = threading.Lock()
+        self.ready_lock = threading.Lock()
         self.maintenance_amos = Amos(
             db_path,
             maintenance_processor_paths=self.maintenance_processor_paths,
@@ -73,7 +109,10 @@ class AmosHTTPServer(ThreadingHTTPServer):
                 self.maintenance_amos.close()
             with self.service_lock:
                 self.policy_worker_amos.close()
-                self.amos.close()
+                self.health_amos.close()
+                self.ready_amos.close()
+                for service in self.request_services:
+                    service.close()
 
 
 def make_handler() -> type[BaseHTTPRequestHandler]:
@@ -91,6 +130,9 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
             return
 
         def _handle(self, method: str) -> None:
+            # A timed-out client must not leave a handler waiting for another
+            # request on a half-closed keep-alive socket.
+            self.close_connection = True
             try:
                 body = self._read_json() if method == "POST" else {}
                 server = cast(AmosHTTPServer, self.server)
@@ -118,8 +160,48 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                                 **body
                             )
                         )
-                with server.service_lock:
-                    if server.closing:
+                remaining = self._request_deadline_remaining()
+                if remaining <= 0:
+                    self._write_json(
+                        {
+                            "status": "error",
+                            "error": "request deadline exhausted before dispatch",
+                            "code": "request_deadline_exhausted",
+                            "retryable": True,
+                        },
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                    return
+                if method == "GET" and path == "/v1/ready":
+                    if not server.ready_lock.acquire(timeout=remaining):
+                        return self._write_saturated()
+                    try:
+                        return self._dispatch(
+                            server, method, body, amos=server.ready_amos
+                        )
+                    finally:
+                        server.ready_lock.release()
+                if method == "GET" and path in {
+                    "/v1/health/memory", "/v1/health/capacity",
+                }:
+                    if not server.health_lock.acquire(timeout=remaining):
+                        return self._write_saturated()
+                    try:
+                        return self._dispatch(
+                            server, method, body, amos=server.health_amos
+                        )
+                    finally:
+                        server.health_lock.release()
+                try:
+                    request_amos = server.request_service_pool.get(
+                        timeout=remaining
+                    )
+                except queue.Empty:
+                    return self._write_saturated()
+                try:
+                    with server.service_lock:
+                        closing = server.closing
+                    if closing:
                         self._write_json(
                             {
                                 "status": "error",
@@ -129,7 +211,9 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                             status=HTTPStatus.SERVICE_UNAVAILABLE,
                         )
                         return
-                    self._dispatch(server, method, body)
+                    self._dispatch(server, method, body, amos=request_amos)
+                finally:
+                    server.request_service_pool.put(request_amos)
             except StaleFrameError as exc:
                 self._write_json(
                     {
@@ -209,9 +293,14 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 )
 
         def _dispatch(
-            self, server: AmosHTTPServer, method: str, body: dict[str, Any]
+            self,
+            server: AmosHTTPServer,
+            method: str,
+            body: dict[str, Any],
+            *,
+            amos: Amos | None = None,
         ) -> None:
-            amos = server.amos
+            amos = amos or server.amos
             path = self.path.split("?", 1)[0]
             if method == "GET":
                 if path == "/v1/ready":
@@ -661,6 +750,27 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 raise json.JSONDecodeError("expected JSON object", raw.decode("utf-8"), 0)
             return data
 
+        def _request_deadline_remaining(self) -> float:
+            raw = str(self.headers.get("X-Request-Deadline-Epoch-Ms") or "")
+            if not raw:
+                return 30.0
+            try:
+                deadline = int(raw) / 1000.0
+            except ValueError:
+                return 0.0
+            return max(0.0, deadline - time.time())
+
+        def _write_saturated(self) -> None:
+            self._write_json(
+                {
+                    "status": "error",
+                    "error": "AMOS request capacity was unavailable before deadline",
+                    "code": "request_capacity_exhausted",
+                    "retryable": True,
+                },
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+
         def _authorization_context(
             self,
             server: AmosHTTPServer,
@@ -698,6 +808,7 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Connection", "close")
             request_id = self.headers.get("X-Request-ID")
             if (
                 request_id

@@ -304,6 +304,89 @@ def test_http_maintenance_does_not_block_health_reads(tmp_path):
         thread.join(timeout=2)
 
 
+def test_http_long_reasoning_request_does_not_block_readiness(tmp_path):
+    db_path = str(tmp_path / "http_reasoning_isolation.sqlite3")
+    try:
+        server = AmosHTTPServer(("127.0.0.1", 0), db_path)
+    except PermissionError as exc:
+        pytest.skip(f"loopback sockets unavailable in this sandbox: {exc}")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_reasoning(**_kwargs):
+        entered.set()
+        assert release.wait(timeout=3)
+        return {
+            "status": "compiled",
+            "frame_id": "frame:slow",
+            "revision": {"graph_version": 0, "journal_head": "genesis"},
+            "page_index": [],
+        }
+
+    server.amos.compile_memory_frame = slow_reasoning
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    reasoning_result: list[dict] = []
+    reasoning_thread = threading.Thread(
+        target=lambda: reasoning_result.append(http_json(
+            f"{base}/v1/reasoning-frames:compile",
+            {
+                "need": "bounded isolation test",
+                "purpose": "verify readiness isolation",
+                "run_policy": False,
+            },
+        )),
+        daemon=True,
+    )
+    try:
+        reasoning_thread.start()
+        assert entered.wait(timeout=1)
+        started = time.monotonic()
+        ready = http_json(f"{base}/v1/ready")
+        assert time.monotonic() - started < 1
+        assert ready["status"] == "ready"
+        release.set()
+        reasoning_thread.join(timeout=3)
+        assert reasoning_result[0]["frame_id"] == "frame:slow"
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_expired_request_deadline_fails_before_dispatch(tmp_path):
+    db_path = str(tmp_path / "http_expired_deadline.sqlite3")
+    try:
+        server = AmosHTTPServer(("127.0.0.1", 0), db_path)
+    except PermissionError as exc:
+        pytest.skip(f"loopback sockets unavailable in this sandbox: {exc}")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    request = urllib.request.Request(
+        f"{base}/v1/atoms:get",
+        data=json.dumps({"atom_id": "never-dispatched"}).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-Request-Deadline-Epoch-Ms": str(int((time.time() - 1) * 1000)),
+        },
+        method="POST",
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            urllib.request.urlopen(request, timeout=2)
+        assert excinfo.value.code == 503
+        payload = json.loads(excinfo.value.read().decode("utf-8"))
+        assert payload["code"] == "request_deadline_exhausted"
+        assert payload["retryable"] is True
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_http_constitutional_governance_endpoints(tmp_path):
     from .test_constitutional_governance import (
         RATIFICATION,
