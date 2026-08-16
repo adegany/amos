@@ -337,11 +337,19 @@ def test_project_work_heads_are_typed_versioned_and_cas_guarded(amos):
         )],
     )
     assert second["heads"][0]["head_version"] == 2
-    assert amos.get_memory_head(
+    head = amos.get_memory_head(
         scope=SCOPE,
         series_kind="project_work",
         series_id="project:continuity",
-    )["head_ref"] == "project_state_2"
+    )
+    stored_head = amos.store.get_memory_head(
+        scope=SCOPE,
+        series_kind="project_work",
+        series_id="project:continuity",
+    )
+    assert head["head_ref"] == "project_state_2"
+    assert head["journal_event_id"] == stored_head["journal_event_id"]
+    assert head["updated_at"] == stored_head["updated_at"]
     assert amos.store.get_atom("project_state_1")["lifecycle_state"] == "superseded"
 
 
@@ -1440,6 +1448,8 @@ def test_http_memory_transaction_workspace_and_cas_conflict(tmp_path):
         assert head["status"] == "found"
         assert head["head_ref"] == "event_http_1"
         assert head["head_version"] == 1
+        assert head["journal_event_id"] == committed["journal_event_id"]
+        assert head["updated_at"]
 
         with pytest.raises(urllib.error.HTTPError) as captured:
             post(

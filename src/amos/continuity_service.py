@@ -1995,6 +1995,8 @@ class ContinuityService:
             "series_id": series_id,
             "head_ref": str(head["head_ref"]),
             "head_version": int(head["head_version"]),
+            "journal_event_id": str(head["journal_event_id"]),
+            "updated_at": str(head["updated_at"]),
             "revision": self.store.memory_revision(),
         }
 
