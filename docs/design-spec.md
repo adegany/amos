@@ -2190,12 +2190,16 @@ V1-local maintains a disposable SQLite token candidate index populated from the
 same canonical payload-value search text. When cue or attention tokens are
 present, retrieval prefilters atom ids through this token table and then expands
 the candidate set to graph neighbors so edge activation can still surface linked
-memories that do not repeat the query wording. Empty-cue retrieval with
-attention terms uses the same token prefilter; empty-cue retrieval without
-attention terms remains an unprefiltered browse over visible eligible memory.
-If token prefiltering finds no direct candidates, v1-local falls back to bounded
-semantic scoring over visible eligible memory so morphology, spelling variants,
-and latent token relationships can still admit relevant atoms.
+memories that do not repeat the query wording. It materializes only a bounded
+lifecycle/type-filtered hot payload set, then unions direct lexical and graph
+candidates from the full token index. Empty-cue retrieval with attention terms
+uses the same token prefilter; empty-cue retrieval without attention terms is a
+bounded browse over visible eligible memory. If token prefiltering finds no
+direct candidates, v1-local falls back to semantic scoring over the bounded hot
+set so morphology, spelling variants, and latent token relationships can still
+admit relevant atoms. The packet reports `candidate_scan_truncated` whenever
+this bound may reduce independent latent recall. Exact-ID retrieval is not
+subject to the candidate bound.
 Once candidates are selected, edge degree, supersession, and activation reads
 must be scoped to the candidate refs through indexed `source_ref`/`target_ref`
 lookups. Retrieval must not scan the full edge table for every packet when a
@@ -3149,11 +3153,15 @@ above remains the stable client contract target for generated clients and later
 production adapters.
 
 The same adapter is the first usable single-process deployment profile. It owns
-one SQLite store and serializes service calls behind one process-local lock. That
-is correctness-first and simple, but it provides no parallel read throughput for
-concurrent retrieval calls. Higher-load deployments should move to a
-reader/writer concurrency model, SQLite WAL read parallelism, or a production
-database adapter while preserving one linearizable writer per shard.
+one SQLite database and a bounded pool of isolated WAL connections. Composite
+reads hold a revision-pinned snapshot and do not acquire a process-global read
+lock. Strong writes remain linearizable through database-scoped FIFO admission;
+maintenance cleanup and index refresh yield between bounded batches. Expensive
+steward, decay, and derived-index computation runs as snapshot read work and
+publishes only after a base-revision check. HTTP reads enqueue due maintenance
+on the background lane rather than running it inline. Higher-load,
+multi-process deployments should move to a production database adapter while
+preserving one linearizable writer per shard.
 
 V1 endpoint contracts:
 
@@ -3734,10 +3742,12 @@ If Amos is deployed as a cluster, the spec requires one linearizable writer per 
 V1-local packet caches are valid only for the exact request signature and
 `graph_version` that produced them. Retrieval should check the packet cache
 before ranking atoms, but cache misses must produce the same correctness
-semantics as an uncached retrieval. Cache entries and materialized search
-metadata are discarded or rebuilt after canonical graph mutations, deletion
-requests, merges, health transitions, and policy maintenance that changes
-retrieval eligibility.
+semantics as an uncached retrieval. A canonical graph mutation therefore
+invalidates every older entry immediately by version while retiring only a
+bounded number of stale rows in that write transaction. Strong deletion paths
+physically purge packet copies before acknowledgement; materialized search
+metadata is discarded or rebuilt after mutations that change retrieval
+eligibility.
 
 Stored search vectors are derived caches. Request-time retrieval may use a
 stored vector whose IDF or latent-vector model lags the current graph version so

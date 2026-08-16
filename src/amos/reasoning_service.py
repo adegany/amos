@@ -140,6 +140,7 @@ class ReasoningFrameService:
         memory_mode: str = "operational_recall",
         token_or_byte_budget: int | Mapping[str, int] | None = None,
         run_policy: bool = True,
+        _policy_already_run: bool = False,
     ) -> dict[str, Any]:
         need = self._required_text(need, "need")
         purpose = self._required_text(purpose, "purpose")
@@ -156,7 +157,7 @@ class ReasoningFrameService:
             default_tokens=DEFAULT_FRAME_TOKEN_BUDGET,
         )
         self._mark_foreground_activity(requester)
-        if run_policy:
+        if run_policy and not _policy_already_run:
             self.run_memory_policy(trigger="compile_memory_frame", scope=request_scope)
 
         last_start = self.store.memory_revision()
@@ -201,6 +202,7 @@ class ReasoningFrameService:
         memory_mode: str = "operational_recall",
         token_or_byte_budget: int | Mapping[str, int] | None = None,
         run_policy: bool = True,
+        _policy_already_run: bool = False,
     ) -> dict[str, Any]:
         frame_id = self._required_text(frame_id, "frame_id")
         requester = self._required_text(requester, "requester")
@@ -219,7 +221,7 @@ class ReasoningFrameService:
             default_tokens=DEFAULT_PAGE_TOKEN_BUDGET,
         )
         self._mark_foreground_activity(requester)
-        if run_policy:
+        if run_policy and not _policy_already_run:
             self.run_memory_policy(trigger="load_memory_page", scope=request_scope)
 
         current = self.store.memory_revision()
@@ -831,18 +833,16 @@ class ReasoningFrameService:
         # Reasoning frames are retrieval products too. Cache a compact feedback
         # projection under frame_id so clients can report exact material use
         # through the existing retrieval-outcome contract.
-        with self.store.transaction() as conn:
-            self.store.cache_packet(
-                conn,
-                packet_id=frame_id,
-                request=dict(frame.get("request") or {}),
-                response={
-                    "packet_id": frame_id,
-                    "request": dict(frame.get("request") or {}),
-                    "items": feedback_items,
-                },
-                graph_version=self.store.graph_version(),
-            )
+        self.store.persist_packet_after_read(
+            packet_id=frame_id,
+            request=dict(frame.get("request") or {}),
+            response={
+                "packet_id": frame_id,
+                "request": dict(frame.get("request") or {}),
+                "items": feedback_items,
+            },
+            graph_version=self.store.graph_version(),
+        )
         return frame
 
     def _frame_payload(

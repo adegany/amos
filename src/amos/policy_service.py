@@ -43,7 +43,9 @@ class PolicyService:
     ):
         self.store = store
         self.smp = smp
-        self._memory_policy_lock = threading.Lock()
+        self._memory_policy_lock = getattr(
+            store, "memory_policy_lock", threading.Lock()
+        )
         self._memory_policy_running = False
         self.distill_memories = mutations.distill_memories
         self._attach_search_index = indexes._attach_search_index
@@ -181,12 +183,36 @@ class PolicyService:
                 "graph_version": self.store.graph_version(),
             }
 
+        previous_write_lane = self.store.set_write_lane("maintenance")
         self._memory_policy_running = True
-        started_graph_version = self.store.graph_version()
-        scope = dict(scope or {})
-        results: dict[str, Any] = {}
-        target_refs: list[str] = []
         try:
+            # The due check above is an optimistic fast path. Another service
+            # connection may finish a policy pass between that check and this
+            # shared single-flight admission, so refresh the policy clock once
+            # admitted and avoid a duplicate maintenance pass.
+            policy = self.memory_policy()
+            state = self._memory_policy_state()
+            due = self._memory_policy_due(policy, state, force=force)
+            if not due["due"]:
+                return {
+                    "status": "skipped",
+                    "reason": "not_due",
+                    "trigger": trigger,
+                    "due": due,
+                    "graph_version": self.store.graph_version(),
+                }
+            if not policy["enabled"] and not force:
+                return {
+                    "status": "skipped",
+                    "reason": "policy_disabled",
+                    "trigger": trigger,
+                    "due": due,
+                    "graph_version": self.store.graph_version(),
+                }
+            started_graph_version = self.store.graph_version()
+            scope = dict(scope or {})
+            results: dict[str, Any] = {}
+            target_refs: list[str] = []
             maintenance = policy["maintenance"]
             if maintenance["enabled"] and maintenance["repair_reference_contracts"]:
                 results["reference_contracts"] = (
@@ -284,7 +310,8 @@ class PolicyService:
             policy_event_graph_version = self.store.graph_version() + 1
             if maintenance["enabled"] and maintenance["rebuild_indexes"]:
                 results["index"] = self._rebuild_derived_indexes(
-                    graph_version=policy_event_graph_version
+                    graph_version=policy_event_graph_version,
+                    publish_revision_offset=1,
                 )
             if maintenance["enabled"] and maintenance["invalidate_packet_cache"]:
                 results["packet_cache"] = self._invalidate_packet_cache(
@@ -292,17 +319,42 @@ class PolicyService:
                 )
 
             completed_at = utc_now()
-            event_payload = {
-                "operation": "run_memory_policy",
-                "trigger": trigger,
-                "force": force,
-                "due": due,
-                "policy": policy,
-                "started_graph_version": started_graph_version,
-                "completed_graph_version": policy_event_graph_version,
-                "results": self._memory_policy_journal_results(results),
-            }
             with self.store.transaction() as conn:
+                # Foreground commits may run between bounded maintenance
+                # phases. Derive the final event revision only after this
+                # transaction owns the writer so journal metadata never
+                # reports the earlier optimistic prediction as completed.
+                completed_graph_version = self.store.graph_version() + 1
+                if isinstance(results.get("index"), Mapping):
+                    index_result = dict(results["index"])
+                    if int(index_result.get("graph_version", -1)) != int(
+                        completed_graph_version
+                    ):
+                        index_result["status"] = "stale"
+                        index_result["reason"] = (
+                            "canonical_revision_advanced_after_index_publish"
+                        )
+                        index_result["indexes"] = [
+                            {**dict(index), "freshness": "stale"}
+                            for index in index_result.get("indexes", [])
+                            if isinstance(index, Mapping)
+                        ]
+                    results["index"] = index_result
+                if isinstance(results.get("packet_cache"), Mapping):
+                    results["packet_cache"] = {
+                        **dict(results["packet_cache"]),
+                        "graph_version": completed_graph_version,
+                    }
+                event_payload = {
+                    "operation": "run_memory_policy",
+                    "trigger": trigger,
+                    "force": force,
+                    "due": due,
+                    "policy": policy,
+                    "started_graph_version": started_graph_version,
+                    "completed_graph_version": completed_graph_version,
+                    "results": self._memory_policy_journal_results(results),
+                }
                 event = self.store.append_event(
                     conn,
                     event_type="memory_policy_run",
@@ -346,7 +398,7 @@ class PolicyService:
                     ),
                 )
                 if maintenance["enabled"] and maintenance["invalidate_packet_cache"]:
-                    self.store.clear_packet_cache(conn)
+                    self.store.retire_packet_cache(conn)
             return {
                 "status": "completed",
                 "trigger": trigger,
@@ -358,6 +410,7 @@ class PolicyService:
             }
         finally:
             self._memory_policy_running = False
+            self.store.set_write_lane(previous_write_lane)
             self._memory_policy_lock.release()
 
 
@@ -431,6 +484,10 @@ class PolicyService:
             maintenance["lsa_dimensions"],
             int(maintenance.get("lsa_max_terms", 300) or 300),
         )
+        maintenance["index_write_batch_size"] = max(
+            1,
+            int(maintenance.get("index_write_batch_size", 64) or 64),
+        )
         distillation = normalized["distillation"]
         distillation["enabled"] = bool(distillation.get("enabled", True))
         distillation["min_source_atoms"] = max(
@@ -472,6 +529,9 @@ class PolicyService:
         decay = normalized["decay"]
         decay["enabled"] = bool(decay.get("enabled", True))
         decay["max_atoms"] = max(1, int(decay.get("max_atoms", 256) or 256))
+        decay["write_batch_size"] = max(
+            1, int(decay.get("write_batch_size", 32) or 32)
+        )
         decay["max_active_atoms"] = max(
             1,
             int(decay.get("max_active_atoms", decay["max_atoms"]) or decay["max_atoms"]),
@@ -548,8 +608,11 @@ class PolicyService:
             ("min_interval_seconds", 900),
             ("max_deletions_per_tick", 256),
             ("max_idempotency_compactions_per_tick", 512),
+            ("write_batch_size", 32),
+            ("max_index_prune_atoms_per_tick", 512),
         ):
             cleanup[key] = max(0, int(cleanup.get(key, default) or 0))
+        cleanup["write_batch_size"] = max(1, cleanup["write_batch_size"])
         for key, default in (
             ("delete_archived_after_seconds", 604800),
             ("delete_stale_after_seconds", 1209600),
@@ -568,13 +631,13 @@ class PolicyService:
             | GOVERNANCE_MAINTENANCE_PROTECTED_TYPES
         )
         sqlite_compaction = dict(cleanup.get("sqlite_compaction") or {})
-        checkpoint_mode = str(sqlite_compaction.get("checkpoint_mode") or "TRUNCATE").upper()
+        checkpoint_mode = str(sqlite_compaction.get("checkpoint_mode") or "PASSIVE").upper()
         if checkpoint_mode not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
-            checkpoint_mode = "TRUNCATE"
+            checkpoint_mode = "PASSIVE"
         cleanup["sqlite_compaction"] = {
             "checkpoint_wal": bool(sqlite_compaction.get("checkpoint_wal", True)),
             "checkpoint_mode": checkpoint_mode,
-            "vacuum_enabled": bool(sqlite_compaction.get("vacuum_enabled", True)),
+            "vacuum_enabled": bool(sqlite_compaction.get("vacuum_enabled", False)),
             "vacuum_idle_after_seconds": max(
                 0, int(sqlite_compaction.get("vacuum_idle_after_seconds", 1800) or 0)
             ),
@@ -1432,11 +1495,13 @@ class PolicyService:
         now = utc_now()
         protected_types = {str(item) for item in cleanup.get("protected_types", [])}
         max_deletions = max(0, int(cleanup.get("max_deletions_per_tick", 256) or 0))
+        write_batch_size = max(1, int(cleanup.get("write_batch_size", 32) or 32))
         projected_atoms: list[dict[str, Any]] = []
         projected_edges: list[dict[str, Any]] = []
         tombstones: list[dict[str, Any]] = []
         actions: list[dict[str, Any]] = []
         deleted_refs: list[str] = []
+        events: list[dict[str, Any]] = []
         index_lifecycle_states = (
             ["archived"] if cleanup.get("remove_archived_from_hot_index", True) else []
         )
@@ -1444,83 +1509,224 @@ class PolicyService:
             ["stale"] if cleanup.get("remove_stale_from_hot_index", True) else []
         )
         compact_after = cleanup.get("compact_idempotency_after_seconds")
-        with self.store.transaction() as conn:
-            index_prune = self.store.prune_atom_text_index(
-                conn,
-                lifecycle_states=index_lifecycle_states,
-                health_statuses=index_health_statuses,
-            )
-            atoms = self.store.list_atoms_filtered(
-                include_deleted=False,
-                lifecycle_states=["active", "archived", "proposed"],
-            )
-            for atom in atoms:
-                if len(actions) >= max_deletions:
-                    break
-                if not maintenance_scope_visible(atom["scope"], scope):
-                    continue
-                if atom["type"] in protected_types:
-                    continue
-                reason = self._storage_deletion_reason(atom, cleanup)
-                if reason is None:
-                    continue
-                updated = dict(atom)
-                updated["lifecycle_state"] = "deleted"
-                updated["health_status"] = "deleted"
-                updated["deleted"] = 1
-                updated["version"] = int(atom["version"]) + 1
-                updated["updated_at"] = now
-                updated["revision_history"] = list(updated["revision_history"])
-                updated["revision_history"].append(
-                    {
-                        "version": atom["version"],
-                        "digest": digest(self._atom_projection(atom)),
-                        "changed_at": now,
-                        "actor": actor,
-                        "reason": reason,
-                    }
+
+        # Plan from a coherent read, then revalidate each candidate immediately
+        # before mutation. The plan never holds SQLite's single-writer slot.
+        candidates: list[dict[str, Any]] = []
+        if max_deletions:
+            with self.store.read_snapshot():
+                atoms = self.store.list_atoms_filtered(
+                    include_deleted=False,
+                    lifecycle_states=["active", "archived", "proposed"],
                 )
-                updated = normalize_atom(
-                    self._attach_search_index(updated), require_id=True
-                )
-                updated["deleted"] = 1
-                tombstone = self.store.insert_tombstone(
+                for atom in atoms:
+                    if len(candidates) >= max_deletions:
+                        break
+                    if not maintenance_scope_visible(atom["scope"], scope):
+                        continue
+                    if atom["type"] in protected_types:
+                        continue
+                    if self._storage_deletion_reason(atom, cleanup) is not None:
+                        candidates.append(atom)
+
+        # Derived-index pruning is bounded by atom and yields between batches.
+        # Keep it separate from canonical deletion batches so clients can enter
+        # the FIFO between every maintenance phase.
+        index_prune = {
+            "status": "completed",
+            "rows": 0,
+            "atom_count": 0,
+            "write_batch_size": write_batch_size,
+            "write_batch_count": 0,
+            "lifecycle_states": index_lifecycle_states,
+            "health_statuses": index_health_statuses,
+        }
+        remaining_prune_atoms = max(
+            0,
+            int(cleanup.get("max_index_prune_atoms_per_tick", 512) or 0),
+        )
+        while remaining_prune_atoms > 0:
+            prune_batch_size = min(write_batch_size, remaining_prune_atoms)
+            with self.store.transaction() as conn:
+                pruned = self.store.prune_atom_text_index(
                     conn,
-                    target_ref=atom["id"],
-                    content_digest=self._memory_identity_digest(atom),
-                    recreation_policy="block_recreate",
-                    reason=reason,
+                    lifecycle_states=index_lifecycle_states,
+                    health_statuses=index_health_statuses,
+                    max_atoms=prune_batch_size,
                 )
-                deleted_edges = self.store.mark_edges_deleted_for_ref(conn, atom["id"])
-                self.store.replace_atom(conn, updated)
-                projected_atoms.append(updated)
-                projected_edges.extend(deleted_edges)
-                tombstones.append(tombstone)
-                deleted_refs.append(atom["id"])
-                actions.append(
-                    {
+            if pruned.get("status") == "skipped":
+                index_prune = {
+                    **pruned,
+                    "write_batch_size": write_batch_size,
+                    "write_batch_count": 0,
+                }
+                break
+            pruned_atoms = int(pruned.get("atom_count", 0) or 0)
+            index_prune["rows"] += int(pruned.get("rows", 0) or 0)
+            index_prune["atom_count"] += pruned_atoms
+            if pruned_atoms:
+                index_prune["write_batch_count"] += 1
+            remaining_prune_atoms -= pruned_atoms
+            if pruned_atoms < prune_batch_size:
+                break
+        index_prune["limit_reached"] = remaining_prune_atoms == 0 and bool(
+            index_prune.get("atom_count")
+        )
+
+        if compact_after is None:
+            idempotency = {
+                "status": "skipped",
+                "reason": "idempotency_compaction_disabled",
+                "rows": 0,
+            }
+        else:
+            remaining = max(
+                0,
+                int(cleanup.get("max_idempotency_compactions_per_tick", 512) or 0),
+            )
+            idempotency = {
+                "status": "completed",
+                "rows": 0,
+                "original_response_bytes": 0,
+                "compacted_response_bytes": 0,
+                "saved_bytes": 0,
+            }
+            older_than = self._iso_before_seconds(int(compact_after))
+            while remaining > 0:
+                batch_limit = min(write_batch_size, remaining)
+                with self.store.transaction() as conn:
+                    compacted = self.store.compact_idempotency_responses(
+                        conn,
+                        older_than=older_than,
+                        max_rows=batch_limit,
+                    )
+                compacted_rows = int(compacted.get("rows", 0) or 0)
+                for key in (
+                    "rows",
+                    "original_response_bytes",
+                    "compacted_response_bytes",
+                    "saved_bytes",
+                ):
+                    idempotency[key] += int(compacted.get(key, 0) or 0)
+                remaining -= compacted_rows
+                if compacted_rows < batch_limit:
+                    break
+
+        for batch_number, batch in enumerate(
+            (
+                candidates[offset : offset + write_batch_size]
+                for offset in range(0, len(candidates), write_batch_size)
+            ),
+            start=1,
+        ):
+            batch_actions: list[dict[str, Any]] = []
+            batch_atoms: list[dict[str, Any]] = []
+            batch_edges: list[dict[str, Any]] = []
+            batch_tombstones: list[dict[str, Any]] = []
+            batch_refs: list[str] = []
+            with self.store.transaction() as conn:
+                for planned_atom in batch:
+                    atom = self.store.get_atom(str(planned_atom["id"]))
+                    if (
+                        atom is None
+                        or atom.get("deleted")
+                        or int(atom.get("version", 0))
+                        != int(planned_atom.get("version", 0))
+                        or not maintenance_scope_visible(atom["scope"], scope)
+                        or atom["type"] in protected_types
+                    ):
+                        continue
+                    reason = self._storage_deletion_reason(atom, cleanup)
+                    if reason is None:
+                        continue
+                    updated = dict(atom)
+                    updated["lifecycle_state"] = "deleted"
+                    updated["health_status"] = "deleted"
+                    updated["deleted"] = 1
+                    updated["version"] = int(atom["version"]) + 1
+                    updated["updated_at"] = now
+                    updated["revision_history"] = list(updated["revision_history"])
+                    updated["revision_history"].append(
+                        {
+                            "version": atom["version"],
+                            "digest": digest(self._atom_projection(atom)),
+                            "changed_at": now,
+                            "actor": actor,
+                            "reason": reason,
+                        }
+                    )
+                    # Deleted atoms leave the hot index; rebuilding their
+                    # semantic vector while holding the writer is pure waste.
+                    updated["index_refs"] = {}
+                    updated = normalize_atom(updated, require_id=True)
+                    updated["deleted"] = 1
+                    tombstone = self.store.insert_tombstone(
+                        conn,
+                        target_ref=atom["id"],
+                        content_digest=self._memory_identity_digest(atom),
+                        recreation_policy="block_recreate",
+                        reason=reason,
+                    )
+                    deleted_edges = self.store.mark_edges_deleted_for_ref(
+                        conn, atom["id"]
+                    )
+                    self.store.replace_atom(conn, updated)
+                    action = {
                         "atom_ref": atom["id"],
                         "action": "delete",
                         "reason": reason,
                         "lifecycle_state_before": atom["lifecycle_state"],
                         "health_status_before": atom["health_status"],
                     }
-                )
-            if compact_after is None:
-                idempotency = {
-                    "status": "skipped",
-                    "reason": "idempotency_compaction_disabled",
-                    "rows": 0,
-                }
-            else:
-                idempotency = self.store.compact_idempotency_responses(
-                    conn,
-                    older_than=self._iso_before_seconds(int(compact_after)),
-                    max_rows=int(
-                        cleanup.get("max_idempotency_compactions_per_tick", 512) or 0
-                    ),
-                )
-            if actions or index_prune.get("rows") or idempotency.get("rows"):
+                    batch_atoms.append(updated)
+                    batch_edges.extend(deleted_edges)
+                    batch_tombstones.append(tombstone)
+                    batch_refs.append(atom["id"])
+                    batch_actions.append(action)
+                if batch_actions:
+                    report_housekeeping = not events
+                    batch_event = self.store.append_event(
+                        conn,
+                        event_type="storage_cleanup_run",
+                        actor=actor,
+                        payload={
+                            "operation": "run_storage_cleanup",
+                            "policy": dict(cleanup),
+                            "due": dict(due),
+                            "batch": {
+                                "number": batch_number,
+                                "size": len(batch_actions),
+                                "write_batch_size": write_batch_size,
+                            },
+                            "actions": batch_actions,
+                            "index_prune": index_prune
+                            if report_housekeeping
+                            else {"status": "reported_in_first_batch"},
+                            "idempotency": idempotency
+                            if report_housekeeping
+                            else {"status": "reported_in_first_batch"},
+                            "projected_atoms": batch_atoms,
+                            "projected_edges": batch_edges,
+                            "tombstones": batch_tombstones,
+                        },
+                        target_refs=batch_refs,
+                    )
+                    # Storage cleanup physically deletes canonical payloads,
+                    # so retain the strong deletion contract and purge packet
+                    # copies before committing each bounded delete batch.
+                    self.store.clear_packet_cache(conn)
+                    events.append(batch_event)
+            actions.extend(batch_actions)
+            projected_atoms.extend(batch_atoms)
+            projected_edges.extend(batch_edges)
+            tombstones.extend(batch_tombstones)
+            deleted_refs.extend(batch_refs)
+
+        housekeeping_changed = bool(
+            index_prune.get("rows") or idempotency.get("rows")
+        )
+        with self.store.transaction() as conn:
+            if not events and housekeeping_changed:
                 event = self.store.append_event(
                     conn,
                     event_type="storage_cleanup_run",
@@ -1529,25 +1735,30 @@ class PolicyService:
                         "operation": "run_storage_cleanup",
                         "policy": dict(cleanup),
                         "due": dict(due),
-                        "actions": actions,
+                        "batch": {
+                            "number": 1,
+                            "size": 0,
+                            "write_batch_size": write_batch_size,
+                        },
+                        "actions": [],
                         "index_prune": index_prune,
                         "idempotency": idempotency,
-                        "projected_atoms": projected_atoms,
-                        "projected_edges": projected_edges,
-                        "tombstones": tombstones,
+                        "projected_atoms": [],
+                        "projected_edges": [],
+                        "tombstones": [],
                     },
-                    target_refs=deleted_refs,
+                    target_refs=[],
                 )
-                self.store.clear_packet_cache(conn)
-            else:
-                event = None
+                self.store.retire_packet_cache(conn)
+                events.append(event)
             self.store._set_meta(conn, "last_storage_cleanup_at", now)
+        event = events[-1] if events else None
         sqlite_compaction = dict(cleanup.get("sqlite_compaction") or {})
         checkpoint = {"status": "skipped", "reason": "checkpoint_disabled"}
         if sqlite_compaction.get("checkpoint_wal", True):
             try:
                 checkpoint = self.store.checkpoint_wal(
-                    mode=str(sqlite_compaction.get("checkpoint_mode") or "TRUNCATE")
+                    mode=str(sqlite_compaction.get("checkpoint_mode") or "PASSIVE")
                 )
             except Exception as exc:
                 checkpoint = {"status": "error", "error": str(exc)}
@@ -1563,7 +1774,7 @@ class PolicyService:
         ):
             try:
                 checkpoint_after_vacuum = self.store.checkpoint_wal(
-                    mode=str(sqlite_compaction.get("checkpoint_mode") or "TRUNCATE")
+                    mode=str(sqlite_compaction.get("checkpoint_mode") or "PASSIVE")
                 )
             except Exception as exc:
                 checkpoint_after_vacuum = {"status": "error", "error": str(exc)}
@@ -1573,11 +1784,14 @@ class PolicyService:
             "index_prune": index_prune,
             "deleted_atom_count": len(actions),
             "deleted_atom_refs": deleted_refs,
+            "write_batch_size": write_batch_size,
+            "write_batch_count": len(events),
             "idempotency": idempotency,
             "checkpoint": checkpoint,
             "vacuum": vacuum,
             "checkpoint_after_vacuum": checkpoint_after_vacuum,
             "event": event,
+            "events": events,
         }
 
 
@@ -1615,7 +1829,7 @@ class PolicyService:
         state: Mapping[str, Any],
         force: bool,
     ) -> dict[str, Any]:
-        if not sqlite_compaction.get("vacuum_enabled", True):
+        if not sqlite_compaction.get("vacuum_enabled", False):
             return {"status": "skipped", "reason": "vacuum_disabled"}
         idle_after = int(sqlite_compaction.get("vacuum_idle_after_seconds", 1800) or 0)
         last_foreground = (
@@ -1857,7 +2071,7 @@ class PolicyService:
                     },
                     target_refs=[action["record_ref"] for action in actions],
                 )
-                self.store.clear_packet_cache(conn)
+                self.store.retire_packet_cache(conn)
             else:
                 event = None
 
@@ -1891,6 +2105,7 @@ class PolicyService:
         projected_atoms: list[dict[str, Any]] = []
         projected_edges: list[dict[str, Any]] = []
         now = utc_now()
+        planning_revision = self.store.memory_revision()
         current_head_refs = {
             str(head.get("head_ref") or "")
             for head in self.store.list_memory_heads()
@@ -1898,44 +2113,27 @@ class PolicyService:
             and maintenance_scope_visible(head.get("scope", {}), scope)
         }
         # Older pressure policies could archive the atom still named by a
-        # canonical memory head. Repair that structural contradiction before
-        # considering decay, then protect all current heads dynamically. The
-        # protection follows the head and therefore does not pin predecessors.
-        with self.store.transaction() as conn:
-            for head_ref in sorted(current_head_refs):
-                atom = self.store.get_atom(head_ref)
-                if atom is None or atom.get("deleted"):
-                    continue
-                if atom.get("lifecycle_state") != "archived":
-                    continue
-                changed = dict(atom)
-                changed["version"] = int(changed["version"]) + 1
-                changed["updated_at"] = now
-                changed["lifecycle_state"] = "active"
-                changed["health_status"] = "healthy"
-                changed["decay_policy"] = {
-                    **dict(changed.get("decay_policy") or {}),
-                    "last_decay": {
+        # canonical memory head. Plan that structural repair here, but publish
+        # it only in the same version-revalidated transaction as its journal
+        # event. The protection follows the current head dynamically and does
+        # not pin predecessors.
+        restoration_plans: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for head_ref in sorted(current_head_refs):
+            atom = self.store.get_atom(head_ref)
+            if atom is None or atom.get("deleted"):
+                continue
+            if atom.get("lifecycle_state") != "archived":
+                continue
+            restoration_plans.append(
+                (
+                    atom,
+                    {
                         "action": "restore",
                         "reason": "current_memory_head_protection",
-                        "applied_at": now,
+                        "health_status": "healthy",
                     },
-                }
-                changed = normalize_atom(
-                    self._attach_search_index(changed), require_id=True
                 )
-                self.store.replace_atom(conn, changed)
-                restored_edges = self.store.restore_edges_for_ref(conn, head_ref)
-                projected_atoms.append(changed)
-                projected_edges.extend(restored_edges)
-                actions.append({
-                    "atom_ref": head_ref,
-                    "action": "restore",
-                    "reason": "current_memory_head_protection",
-                    "health_status": "healthy",
-                    "lifecycle_state": "active",
-                    "restored_edge_count": len(restored_edges),
-                })
+            )
         superseded_refs = (
             self._active_superseded_refs()
             if decay.get("archive_superseded", True)
@@ -2164,77 +2362,180 @@ class PolicyService:
             ),
         }
 
-        with self.store.transaction() as conn:
-            for atom, action in planned:
-                atom_policy = (
-                    dict(atom.get("decay_policy") or {})
-                    if isinstance(atom.get("decay_policy"), Mapping)
-                    else {}
-                )
-                changed = dict(atom)
-                changed["version"] = int(changed["version"]) + 1
-                changed["updated_at"] = now
-                if action["action"] == "archive":
-                    changed["lifecycle_state"] = "archived"
-                    changed["health_status"] = action.get("health_status", "stale")
-                    projected_edges.extend(
-                        self.store.mark_edges_deleted_for_ref(conn, str(atom["id"]))
-                    )
-                elif action["action"] == "mark_stale":
-                    changed["health_status"] = "stale"
-                elif action["action"] == "mark_low_utility":
-                    changed["health_status"] = "low_utility"
-                changed["decay_policy"] = {
-                    **atom_policy,
-                    "last_decay": {
-                        "action": action["action"],
-                        "reason": action["reason"],
-                        "applied_at": now,
-                    },
+        write_batch_size = max(1, int(decay.get("write_batch_size", 32) or 32))
+        # Vector preparation is deterministic read/CPU work. Keep it out of the
+        # single-writer transaction, then use atom version as the publish CAS.
+        prepared: list[
+            tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
+        ] = []
+        stale_revision: dict[str, Any] | None = None
+        with self.store.read_snapshot():
+            prepared_revision = self.store.memory_revision()
+            if prepared_revision != planning_revision:
+                stale_revision = {
+                    "reason": "canonical_revision_advanced_during_decay_planning",
+                    "planned_revision": planning_revision,
+                    "current_revision": prepared_revision,
                 }
-                changed = normalize_atom(
-                    self._attach_search_index(changed), require_id=True
-                )
-                self.store.replace_atom(conn, changed)
-                projected_atoms.append(changed)
-                actions.append(
-                    {
-                        "atom_ref": changed["id"],
-                        "action": action["action"],
-                        "reason": action["reason"],
-                        **(
-                            {"superseded_by": action["superseded_by"]}
-                            if action.get("superseded_by")
-                            else {}
-                        ),
-                        "health_status": changed["health_status"],
-                        "lifecycle_state": changed["lifecycle_state"],
-                    }
-                )
-            if actions:
-                event = self.store.append_event(
-                    conn,
-                    event_type="decay_policy_applied",
-                    actor=actor,
-                    payload={
-                        "operation": "run_decay_policy",
-                        "policy": dict(decay),
-                        "actions": actions,
-                        "projected_atoms": projected_atoms,
-                        "projected_edges": projected_edges,
-                    },
-                    target_refs=[action["atom_ref"] for action in actions],
-                )
-                self.store.clear_packet_cache(conn)
             else:
-                event = None
+                for atom, action in [*restoration_plans, *planned]:
+                    atom_policy = (
+                        dict(atom.get("decay_policy") or {})
+                        if isinstance(atom.get("decay_policy"), Mapping)
+                        else {}
+                    )
+                    changed = dict(atom)
+                    changed["version"] = int(changed["version"]) + 1
+                    changed["updated_at"] = now
+                    if action["action"] == "restore":
+                        changed["lifecycle_state"] = "active"
+                        changed["health_status"] = "healthy"
+                    elif action["action"] == "archive":
+                        changed["lifecycle_state"] = "archived"
+                        changed["health_status"] = action.get(
+                            "health_status", "stale"
+                        )
+                    elif action["action"] == "mark_stale":
+                        changed["health_status"] = "stale"
+                    elif action["action"] == "mark_low_utility":
+                        changed["health_status"] = "low_utility"
+                    changed["decay_policy"] = {
+                        **atom_policy,
+                        "last_decay": {
+                            "action": action["action"],
+                            "reason": action["reason"],
+                            "applied_at": now,
+                        },
+                    }
+                    changed = normalize_atom(
+                        self._attach_search_index(changed), require_id=True
+                    )
+                    prepared.append((atom, action, changed))
+
+        events: list[dict[str, Any]] = []
+        skipped_stale_plans = (
+            len(restoration_plans) + len(planned) if stale_revision else 0
+        )
+        expected_revision = prepared_revision
+        for batch_number, offset in enumerate(
+            range(0, len(prepared), write_batch_size), start=1
+        ):
+            batch_actions: list[dict[str, Any]] = []
+            batch_atoms: list[dict[str, Any]] = []
+            batch_edges: list[dict[str, Any]] = []
+            batch = prepared[offset : offset + write_batch_size]
+            with self.store.transaction() as conn:
+                current_revision = self.store.memory_revision()
+                if current_revision != expected_revision:
+                    skipped_stale_plans += len(prepared) - offset
+                    stale_revision = {
+                        "reason": "canonical_revision_advanced_before_decay_publish",
+                        "planned_revision": expected_revision,
+                        "current_revision": current_revision,
+                    }
+                    break
+                current_head_refs_for_batch = {
+                    str(head.get("head_ref") or "")
+                    for head in self.store.list_memory_heads_from_connection(conn)
+                    if str(head.get("head_ref") or "")
+                }
+                for atom, action, changed in batch:
+                    current = self.store.get_atom(str(atom["id"]))
+                    is_current_head = str(atom["id"]) in current_head_refs_for_batch
+                    if (
+                        current is None
+                        or current.get("deleted")
+                        or int(current.get("version", 0))
+                        != int(atom.get("version", 0))
+                        or (
+                            action["action"] == "restore"
+                            and (
+                                not is_current_head
+                                or current.get("lifecycle_state") != "archived"
+                            )
+                        )
+                        or (action["action"] != "restore" and is_current_head)
+                    ):
+                        skipped_stale_plans += 1
+                        continue
+                    restored_edge_count = 0
+                    if action["action"] == "restore":
+                        restored_edges = self.store.restore_edges_for_ref(
+                            conn, str(atom["id"])
+                        )
+                        restored_edge_count = len(restored_edges)
+                        batch_edges.extend(restored_edges)
+                    elif action["action"] == "archive":
+                        batch_edges.extend(
+                            self.store.mark_edges_deleted_for_ref(
+                                conn, str(atom["id"])
+                            )
+                        )
+                    self.store.replace_atom(conn, changed)
+                    batch_atoms.append(changed)
+                    batch_actions.append(
+                        {
+                            "atom_ref": changed["id"],
+                            "action": action["action"],
+                            "reason": action["reason"],
+                            **(
+                                {"superseded_by": action["superseded_by"]}
+                                if action.get("superseded_by")
+                                else {}
+                            ),
+                            **(
+                                {"restored_edge_count": restored_edge_count}
+                                if action["action"] == "restore"
+                                else {}
+                            ),
+                            "health_status": changed["health_status"],
+                            "lifecycle_state": changed["lifecycle_state"],
+                        }
+                    )
+                if batch_actions:
+                    event = self.store.append_event(
+                        conn,
+                        event_type="decay_policy_applied",
+                        actor=actor,
+                        payload={
+                            "operation": "run_decay_policy",
+                            "policy": dict(decay),
+                            "batch": {
+                                "number": batch_number,
+                                "size": len(batch_actions),
+                                "write_batch_size": write_batch_size,
+                            },
+                            "actions": batch_actions,
+                            "projected_atoms": batch_atoms,
+                            "projected_edges": batch_edges,
+                        },
+                        target_refs=[
+                            action_item["atom_ref"]
+                            for action_item in batch_actions
+                        ],
+                    )
+                    self.store.retire_packet_cache(conn)
+                    events.append(event)
+                    expected_revision = {
+                        "graph_version": int(event["graph_version"]),
+                        "journal_head": str(event["checksum"]),
+                    }
+            actions.extend(batch_actions)
+            projected_atoms.extend(batch_atoms)
+            projected_edges.extend(batch_edges)
+        event = events[-1] if events else None
         return {
             "status": "completed",
             "action_count": len(actions),
             "actions": actions,
             "projected_edges": projected_edges,
             "pressure": pressure,
+            "write_batch_size": write_batch_size,
+            "write_batch_count": len(events),
+            "skipped_stale_plans": skipped_stale_plans,
+            "stale_revision": stale_revision,
             "event": event,
+            "events": events,
         }
 
 

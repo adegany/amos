@@ -6,7 +6,10 @@ import sqlite3
 import uuid
 import json
 import math
+import threading
+from collections import Counter
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -53,6 +56,89 @@ LEGACY_STRUCTURAL_RELATIONS = {
 }
 
 
+class _FairWriteCoordinator:
+    """Database-scoped FIFO admission for SQLite write transactions.
+
+    SQLite still provides the authoritative locking and durability semantics.
+    This coordinator keeps in-process writers out of busy-spin/backoff races and
+    gives maintenance and foreground work the same bounded place in line.
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._next_ticket = 0
+        self._serving_ticket = 0
+        self._waiting_by_lane: Counter[str] = Counter()
+        self._active_lane: str | None = None
+
+    @contextmanager
+    def acquire(self, lane: str) -> Iterator[None]:
+        lane = str(lane or "foreground")
+        with self._condition:
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            self._waiting_by_lane[lane] += 1
+            while ticket != self._serving_ticket:
+                self._condition.wait()
+            self._waiting_by_lane[lane] -= 1
+            if self._waiting_by_lane[lane] <= 0:
+                self._waiting_by_lane.pop(lane, None)
+            self._active_lane = lane
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active_lane = None
+                self._serving_ticket += 1
+                self._condition.notify_all()
+
+    def status(self) -> dict[str, Any]:
+        with self._condition:
+            return {
+                "policy": "fifo",
+                "active_lane": self._active_lane,
+                "waiting": sum(self._waiting_by_lane.values()),
+                "waiting_by_lane": dict(self._waiting_by_lane),
+                "next_ticket": self._next_ticket,
+                "serving_ticket": self._serving_ticket,
+            }
+
+
+@dataclass
+class _SharedSQLiteRuntime:
+    writer: _FairWriteCoordinator = field(default_factory=_FairWriteCoordinator)
+    schema_lock: threading.Lock = field(default_factory=threading.Lock)
+    memory_policy_lock: threading.Lock = field(default_factory=threading.Lock)
+    activity_lock: threading.Lock = field(default_factory=threading.Lock)
+    last_foreground_activity_at: str = field(default_factory=utc_now)
+    references: int = 0
+
+
+_SQLITE_RUNTIME_REGISTRY_LOCK = threading.Lock()
+_SQLITE_RUNTIME_REGISTRY: dict[str, _SharedSQLiteRuntime] = {}
+
+
+def _sqlite_runtime(path: Path) -> tuple[str, _SharedSQLiteRuntime]:
+    if path == Path(":memory:"):
+        key = f":memory:{uuid.uuid4()}"
+    else:
+        key = str(path.expanduser().resolve())
+    with _SQLITE_RUNTIME_REGISTRY_LOCK:
+        runtime = _SQLITE_RUNTIME_REGISTRY.get(key)
+        if runtime is None:
+            runtime = _SharedSQLiteRuntime()
+            _SQLITE_RUNTIME_REGISTRY[key] = runtime
+        runtime.references += 1
+    return key, runtime
+
+
+def _release_sqlite_runtime(key: str, runtime: _SharedSQLiteRuntime) -> None:
+    with _SQLITE_RUNTIME_REGISTRY_LOCK:
+        runtime.references = max(0, runtime.references - 1)
+        if runtime.references == 0 and _SQLITE_RUNTIME_REGISTRY.get(key) is runtime:
+            _SQLITE_RUNTIME_REGISTRY.pop(key, None)
+
+
 def migrated_edge_derivation(relation: str) -> dict[str, Any]:
     """Return the conservative provenance assigned to a legacy edge.
 
@@ -83,45 +169,181 @@ class SQLiteStore:
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
+        self._runtime_key, self._runtime = _sqlite_runtime(self.path)
+        self._connection_lock = threading.RLock()
+        self._local = threading.local()
+        self._closed = False
         if self.path != Path(":memory:"):
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(
-            str(self.path), isolation_level=None, check_same_thread=False
-        )
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys = ON")
-        self.conn.execute("PRAGMA busy_timeout = 5000")
-        if self.path != Path(":memory:"):
-            self.conn.execute("PRAGMA journal_mode = WAL")
-            self.conn.execute("PRAGMA synchronous = NORMAL")
-        self.init_schema()
+        try:
+            self.conn = sqlite3.connect(
+                str(self.path), isolation_level=None, check_same_thread=False
+            )
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA foreign_keys = ON")
+            self.conn.execute("PRAGMA busy_timeout = 5000")
+            with self._runtime.schema_lock:
+                if self.path != Path(":memory:"):
+                    self.conn.execute("PRAGMA journal_mode = WAL")
+                    self.conn.execute("PRAGMA synchronous = NORMAL")
+                self.init_schema()
+        except Exception:
+            if hasattr(self, "conn"):
+                self.conn.close()
+            _release_sqlite_runtime(self._runtime_key, self._runtime)
+            raise
 
     def close(self) -> None:
-        self.conn.close()
+        with self._connection_lock:
+            if self._closed:
+                return
+            self.conn.close()
+            self._closed = True
+        _release_sqlite_runtime(self._runtime_key, self._runtime)
+
+    @property
+    def memory_policy_lock(self) -> threading.Lock:
+        return self._runtime.memory_policy_lock
+
+    @property
+    def in_read_snapshot(self) -> bool:
+        return int(getattr(self._local, "read_depth", 0) or 0) > 0
+
+    def writer_status(self) -> dict[str, Any]:
+        return self._runtime.writer.status()
+
+    def set_write_lane(self, lane: str) -> str:
+        previous = str(getattr(self._local, "write_lane", "foreground"))
+        self._local.write_lane = str(lane or "foreground")
+        return previous
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield self.conn
-        except Exception:
-            self.conn.rollback()
-            raise
-        else:
-            self.conn.commit()
+    def transaction(
+        self, *, lane: str | None = None
+    ) -> Iterator[sqlite3.Connection]:
+        """Run one canonical write with fair database-scoped admission."""
+
+        if self.in_read_snapshot:
+            raise RuntimeError(
+                "a read snapshot cannot be upgraded to a write transaction"
+            )
+        if int(getattr(self._local, "write_depth", 0) or 0) > 0:
+            self._local.write_depth += 1
+            try:
+                yield self.conn
+            finally:
+                self._local.write_depth -= 1
+            return
+        selected_lane = str(
+            lane or getattr(self._local, "write_lane", "foreground")
+        )
+        with self._connection_lock:
+            with self._runtime.writer.acquire(selected_lane):
+                self.conn.execute("BEGIN IMMEDIATE")
+                self._local.write_depth = 1
+                try:
+                    yield self.conn
+                    self.conn.commit()
+                except Exception:
+                    if self.conn.in_transaction:
+                        self.conn.rollback()
+                    raise
+                finally:
+                    self._local.write_depth = 0
 
     @contextmanager
     def read_snapshot(self) -> Iterator[sqlite3.Connection]:
-        """Hold one consistent SQLite snapshot across related diagnostic reads."""
+        """Hold one revision-pinned snapshot across a complete logical read."""
 
-        if self.conn.in_transaction:
+        if int(getattr(self._local, "write_depth", 0) or 0) > 0:
             yield self.conn
             return
-        self.conn.execute("BEGIN")
-        try:
-            yield self.conn
-        finally:
-            self.conn.rollback()
+        if self.in_read_snapshot:
+            self._local.read_depth += 1
+            try:
+                yield self.conn
+            finally:
+                self._local.read_depth -= 1
+            return
+
+        deferred_writes: list[tuple[str, dict[str, Any]]] = []
+        completed = False
+        with self._connection_lock:
+            self.conn.execute("BEGIN")
+            self._local.read_depth = 1
+            self._local.deferred_writes = deferred_writes
+            try:
+                # BEGIN is deferred in SQLite. This first read is what pins the
+                # WAL snapshot before any service composes a multi-query view.
+                self.memory_revision()
+                yield self.conn
+                completed = True
+            finally:
+                self.conn.rollback()
+                self._local.read_depth = 0
+                self._local.deferred_writes = []
+        if completed and deferred_writes:
+            self._flush_deferred_writes(deferred_writes)
+
+    def mark_foreground_activity(self, occurred_at: str | None = None) -> None:
+        """Coalesce read telemetry in memory instead of turning reads into writes."""
+
+        timestamp = str(occurred_at or utc_now())
+        with self._runtime.activity_lock:
+            if timestamp > self._runtime.last_foreground_activity_at:
+                self._runtime.last_foreground_activity_at = timestamp
+
+    def persist_packet_after_read(
+        self,
+        *,
+        packet_id: str,
+        request: Mapping[str, Any],
+        response: Mapping[str, Any],
+        graph_version: int,
+        feedback_only: bool = False,
+    ) -> None:
+        effect = (
+            "feedback" if feedback_only else "packet",
+            {
+                "packet_id": str(packet_id),
+                "request": json.loads(canonical_json(request)),
+                "response": json.loads(canonical_json(response)),
+                "graph_version": int(graph_version),
+            },
+        )
+        deferred = getattr(self._local, "deferred_writes", None)
+        if self.in_read_snapshot and isinstance(deferred, list):
+            deferred.append(effect)
+            return
+        self._flush_deferred_writes([effect])
+
+    def _flush_deferred_writes(
+        self, effects: Sequence[tuple[str, Mapping[str, Any]]]
+    ) -> None:
+        """Persist all read effects in one short post-snapshot transaction."""
+
+        with self.transaction(lane="read_effect") as conn:
+            current_graph_version = self.graph_version()
+            for effect_kind, payload in effects:
+                graph_version = int(payload["graph_version"])
+                if effect_kind == "packet" and graph_version == current_graph_version:
+                    self.cache_packet(
+                        conn,
+                        packet_id=str(payload["packet_id"]),
+                        request=payload["request"],
+                        response=payload["response"],
+                        graph_version=graph_version,
+                    )
+                else:
+                    # A concurrent canonical write can advance the graph after
+                    # the read snapshot. Keep delayed-feedback membership, but
+                    # never reintroduce a stale hot-cache entry after mutation.
+                    self.cache_packet_feedback_receipt(
+                        conn,
+                        packet_id=str(payload["packet_id"]),
+                        response=payload["response"],
+                        graph_version=graph_version,
+                    )
 
     def init_schema(self) -> None:
         self.conn.executescript(
@@ -612,7 +834,14 @@ class SQLiteStore:
             return self._rebuild_memory_heads(conn)
 
     def get_meta(self, key: str) -> str | None:
-        return self._get_meta(self.conn, key)
+        persisted = self._get_meta(self.conn, key)
+        if key != "last_foreground_activity_at":
+            return persisted
+        with self._runtime.activity_lock:
+            recent = self._runtime.last_foreground_activity_at
+        if persisted is None:
+            return recent
+        return max(str(persisted), recent)
 
     def set_meta(self, key: str, value: str) -> None:
         with self.transaction() as conn:
@@ -1000,6 +1229,7 @@ class SQLiteStore:
         *,
         lifecycle_states: list[str] | None = None,
         health_statuses: list[str] | None = None,
+        max_atoms: int | None = None,
     ) -> dict[str, Any]:
         predicates = []
         params: list[Any] = []
@@ -1014,24 +1244,43 @@ class SQLiteStore:
             predicates.append(f"a.health_status IN ({placeholders})")
             params.extend(health_statuses)
         if not predicates:
-            return {"status": "skipped", "reason": "no_prune_criteria", "rows": 0}
-        cursor = conn.execute(
-            f"""
-            DELETE FROM amos_atom_text_index
-            WHERE atom_id IN (
-                SELECT i.atom_id
-                FROM amos_atom_text_index i
-                JOIN amos_atoms a ON a.id = i.atom_id
-                WHERE {' OR '.join(predicates)}
+            return {
+                "status": "skipped",
+                "reason": "no_prune_criteria",
+                "rows": 0,
+                "atom_count": 0,
+            }
+        query = f"""
+            SELECT DISTINCT i.atom_id
+            FROM amos_atom_text_index i
+            JOIN amos_atoms a ON a.id = i.atom_id
+            WHERE {' OR '.join(predicates)}
+            ORDER BY i.atom_id ASC
+            """
+        if max_atoms is not None:
+            query += " LIMIT ?"
+            params.append(max(0, int(max_atoms)))
+        atom_ids = [
+            str(row["atom_id"])
+            for row in conn.execute(query, tuple(params)).fetchall()
+        ]
+        if atom_ids:
+            cursor = conn.execute(
+                "DELETE FROM amos_atom_text_index WHERE atom_id IN ("
+                + ",".join("?" for _ in atom_ids)
+                + ")",
+                tuple(atom_ids),
             )
-            """,
-            tuple(params),
-        )
+            deleted_rows = int(cursor.rowcount or 0)
+        else:
+            deleted_rows = 0
         return {
             "status": "completed",
-            "rows": int(cursor.rowcount or 0),
+            "rows": deleted_rows,
+            "atom_count": len(atom_ids),
             "lifecycle_states": lifecycle_states,
             "health_statuses": health_statuses,
+            "max_atoms": max_atoms,
         }
 
     def _atom_text_index_tokens(self, atom: Mapping[str, Any]) -> set[str]:
@@ -1250,6 +1499,37 @@ class SQLiteStore:
         if not include_deleted:
             query += " WHERE deleted = 0"
         row = self.conn.execute(query, params).fetchone()
+        return int(row["count"])
+
+    def atom_count_filtered(
+        self,
+        *,
+        types: Sequence[str] | None = None,
+        lifecycle_states: Sequence[str] | None = None,
+        include_deleted: bool = False,
+    ) -> int:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if not include_deleted:
+            clauses.append("deleted = 0")
+        normalized_types = [str(item) for item in types or []]
+        if normalized_types:
+            clauses.append(
+                f"type IN ({','.join('?' for _ in normalized_types)})"
+            )
+            params.extend(normalized_types)
+        normalized_lifecycle = [str(item) for item in lifecycle_states or []]
+        if normalized_lifecycle:
+            clauses.append(
+                "lifecycle_state IN ("
+                + ",".join("?" for _ in normalized_lifecycle)
+                + ")"
+            )
+            params.extend(normalized_lifecycle)
+        query = "SELECT COUNT(*) AS count FROM amos_atoms"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        row = self.conn.execute(query, tuple(params)).fetchone()
         return int(row["count"])
 
     def active_atom_ids(
@@ -1770,6 +2050,41 @@ class SQLiteStore:
     def clear_packet_cache(self, conn: sqlite3.Connection) -> None:
         conn.execute("DELETE FROM amos_packet_cache")
 
+    def retire_packet_cache(
+        self, conn: sqlite3.Connection, *, max_rows: int = 128
+    ) -> dict[str, Any]:
+        """Logically invalidate by revision and physically prune a bounded tail."""
+
+        max_rows = max(0, int(max_rows))
+        if max_rows == 0:
+            return {"status": "retired", "rows": 0, "max_rows": 0}
+        current_graph_version = self.graph_version()
+        rows = conn.execute(
+            """
+            SELECT packet_id
+            FROM amos_packet_cache
+            WHERE graph_version <> ?
+            ORDER BY graph_version ASC, created_at ASC
+            LIMIT ?
+            """,
+            (current_graph_version, max_rows),
+        ).fetchall()
+        packet_ids = [str(row["packet_id"]) for row in rows]
+        if packet_ids:
+            conn.execute(
+                "DELETE FROM amos_packet_cache WHERE packet_id IN ("
+                + ",".join("?" for _ in packet_ids)
+                + ")",
+                tuple(packet_ids),
+            )
+        return {
+            "status": "retired",
+            "rows": len(packet_ids),
+            "max_rows": max_rows,
+            "current_graph_version": current_graph_version,
+            "logical_invalidation": "graph_version_key",
+        }
+
     def list_packet_cache(self) -> list[dict[str, Any]]:
         rows = self.conn.execute("SELECT * FROM amos_packet_cache").fetchall()
         return [self._row_dict(row) for row in rows]
@@ -1931,11 +2246,21 @@ class SQLiteStore:
         rows = self.conn.execute(query, params).fetchall()
         return [self._row_dict(row) for row in rows]
 
-    def checkpoint_wal(self, *, mode: str = "TRUNCATE") -> dict[str, Any]:
-        safe_mode = str(mode or "TRUNCATE").upper()
+    def checkpoint_wal(self, *, mode: str = "PASSIVE") -> dict[str, Any]:
+        safe_mode = str(mode or "PASSIVE").upper()
         if safe_mode not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
-            safe_mode = "TRUNCATE"
-        row = self.conn.execute(f"PRAGMA wal_checkpoint({safe_mode})").fetchone()
+            safe_mode = "PASSIVE"
+        if safe_mode == "PASSIVE":
+            with self._connection_lock:
+                row = self.conn.execute(
+                    f"PRAGMA wal_checkpoint({safe_mode})"
+                ).fetchone()
+        else:
+            with self._connection_lock:
+                with self._runtime.writer.acquire("maintenance"):
+                    row = self.conn.execute(
+                        f"PRAGMA wal_checkpoint({safe_mode})"
+                    ).fetchone()
         values = list(row) if row is not None else []
         return {
             "status": "completed",
@@ -1948,11 +2273,13 @@ class SQLiteStore:
         }
 
     def vacuum(self) -> dict[str, Any]:
-        before_page_count = self.conn.execute("PRAGMA page_count").fetchone()[0]
-        before_freelist = self.conn.execute("PRAGMA freelist_count").fetchone()[0]
-        self.conn.execute("VACUUM")
-        after_page_count = self.conn.execute("PRAGMA page_count").fetchone()[0]
-        after_freelist = self.conn.execute("PRAGMA freelist_count").fetchone()[0]
+        with self._connection_lock:
+            with self._runtime.writer.acquire("maintenance"):
+                before_page_count = self.conn.execute("PRAGMA page_count").fetchone()[0]
+                before_freelist = self.conn.execute("PRAGMA freelist_count").fetchone()[0]
+                self.conn.execute("VACUUM")
+                after_page_count = self.conn.execute("PRAGMA page_count").fetchone()[0]
+                after_freelist = self.conn.execute("PRAGMA freelist_count").fetchone()[0]
         return {
             "status": "completed",
             "page_count_before": int(before_page_count),

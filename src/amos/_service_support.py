@@ -80,6 +80,7 @@ DEFAULT_MEMORY_POLICY = {
         "rebuild_lsa": True,
         "lsa_dimensions": 32,
         "lsa_max_terms": 300,
+        "index_write_batch_size": 64,
         "invalidate_packet_cache": True,
     },
     "distillation": {
@@ -112,6 +113,7 @@ DEFAULT_MEMORY_POLICY = {
     },
     "decay": {
         "enabled": True,
+        "write_batch_size": 32,
         "max_atoms": 256,
         "max_active_atoms": 256,
         "max_proposed_atoms": 256,
@@ -143,6 +145,8 @@ DEFAULT_MEMORY_POLICY = {
         "idle_after_seconds": 300,
         "min_interval_seconds": 900,
         "max_deletions_per_tick": 256,
+        "write_batch_size": 32,
+        "max_index_prune_atoms_per_tick": 512,
         "remove_archived_from_hot_index": True,
         "remove_stale_from_hot_index": True,
         "delete_archived_after_seconds": 604800,
@@ -159,8 +163,8 @@ DEFAULT_MEMORY_POLICY = {
         "max_idempotency_compactions_per_tick": 512,
         "sqlite_compaction": {
             "checkpoint_wal": True,
-            "checkpoint_mode": "TRUNCATE",
-            "vacuum_enabled": True,
+            "checkpoint_mode": "PASSIVE",
+            "vacuum_enabled": False,
             "vacuum_idle_after_seconds": 1800,
             "vacuum_min_interval_seconds": 86400,
         },

@@ -194,67 +194,172 @@ class IndexService:
 
 
     def _rebuild_derived_indexes(
-        self, *, graph_version: int | None = None
+        self,
+        *,
+        graph_version: int | None = None,
+        publish_revision_offset: int = 0,
     ) -> dict[str, Any]:
-        graph_version = (
+        requested_graph_version = (
             graph_version if graph_version is not None else self.store.graph_version()
         )
+        publish_revision_offset = max(0, int(publish_revision_offset))
         policy = self.memory_policy()
         maintenance = policy.get("maintenance", {})
-        with self.store.transaction() as conn:
-            for atom in self.store.list_atoms_filtered(include_deleted=True):
-                self.store.replace_atom_text_index(conn, atom)
-            cleanup = policy.get("storage_cleanup", {})
-            pruned_index = {"status": "skipped", "reason": "storage_cleanup_disabled"}
-            if cleanup.get("enabled", True):
-                pruned_index = self.store.prune_atom_text_index(
-                    conn,
-                    lifecycle_states=["archived"]
-                    if cleanup.get("remove_archived_from_hot_index", True)
-                    else [],
-                    health_statuses=["stale"]
-                    if cleanup.get("remove_stale_from_hot_index", True)
-                    else [],
+        write_batch_size = max(
+            1, int(maintenance.get("index_write_batch_size", 64) or 64)
+        )
+
+        # Refresh the rebuildable lexical projection in short transactions.
+        # Each batch re-reads its atoms under the writer, so a foreground
+        # mutation that lands after planning is never overwritten by stale
+        # maintenance input.
+        with self.store.read_snapshot():
+            planned_atom_ids = [
+                str(atom["id"])
+                for atom in self.store.list_atoms_filtered(include_deleted=True)
+            ]
+        rebuilt_atoms = 0
+        write_batch_count = 0
+        for offset in range(0, len(planned_atom_ids), write_batch_size):
+            atom_ids = planned_atom_ids[offset : offset + write_batch_size]
+            with self.store.transaction() as conn:
+                for atom_id in atom_ids:
+                    atom = self.store.get_atom(atom_id)
+                    if atom is None:
+                        self.store.delete_atom_text_index(conn, atom_id)
+                        continue
+                    self.store.replace_atom_text_index(conn, atom)
+                    rebuilt_atoms += 1
+            write_batch_count += 1
+
+        cleanup = policy.get("storage_cleanup", {})
+        pruned_index = {"status": "skipped", "reason": "storage_cleanup_disabled"}
+        if cleanup.get("enabled", True):
+            lifecycle_states = (
+                ["archived"]
+                if cleanup.get("remove_archived_from_hot_index", True)
+                else []
+            )
+            health_statuses = (
+                ["stale"]
+                if cleanup.get("remove_stale_from_hot_index", True)
+                else []
+            )
+            pruned_index = {
+                "status": "completed",
+                "rows": 0,
+                "atom_count": 0,
+                "write_batch_size": write_batch_size,
+                "write_batch_count": 0,
+                "lifecycle_states": lifecycle_states,
+                "health_statuses": health_statuses,
+            }
+            remaining_prune_atoms = max(write_batch_size, len(planned_atom_ids))
+            while remaining_prune_atoms > 0:
+                prune_batch_size = min(
+                    write_batch_size, remaining_prune_atoms
                 )
+                with self.store.transaction() as conn:
+                    pruned = self.store.prune_atom_text_index(
+                        conn,
+                        lifecycle_states=lifecycle_states,
+                        health_statuses=health_statuses,
+                        max_atoms=prune_batch_size,
+                    )
+                if pruned.get("status") == "skipped":
+                    pruned_index = {
+                        **pruned,
+                        "write_batch_size": write_batch_size,
+                        "write_batch_count": 0,
+                    }
+                    break
+                pruned_atoms = int(pruned.get("atom_count", 0) or 0)
+                pruned_index["rows"] += int(pruned.get("rows", 0) or 0)
+                pruned_index["atom_count"] += pruned_atoms
+                if pruned_atoms:
+                    pruned_index["write_batch_count"] += 1
+                remaining_prune_atoms -= pruned_atoms
+                if pruned_atoms < prune_batch_size:
+                    break
+
+        # The O(terms^2) LSA build is CPU/read work. Hold a WAL snapshot, not
+        # SQLite's single-writer slot, and publish only if the base revision is
+        # still current when the final short write transaction begins.
+        with self.store.read_snapshot():
+            build_revision = self.store.memory_revision()
+            planned_graph_version = (
+                int(build_revision["graph_version"]) + publish_revision_offset
+            )
             lsa = self._build_lsa_token_vectors(
-                graph_version=graph_version,
+                graph_version=planned_graph_version,
                 enabled=bool(maintenance.get("rebuild_lsa", True)),
                 dimensions=int(maintenance.get("lsa_dimensions", 32) or 0),
                 max_terms=int(maintenance.get("lsa_max_terms", 300) or 300),
             )
+            atom_count = self.store.atom_count()
+            token_count = self.store.atom_text_index_count()
+            edge_count = self.store.edge_count()
+
+        with self.store.transaction() as conn:
+            publish_revision = self.store.memory_revision()
+            coherent = publish_revision == build_revision
+            published_graph_version = (
+                planned_graph_version
+                if coherent
+                else int(publish_revision["graph_version"])
+            )
+            published_lsa = dict(lsa)
+            if not coherent:
+                published_lsa.update(
+                    {
+                        "status": "stale",
+                        "freshness": "stale",
+                        "reason": "canonical_revision_advanced_during_rebuild",
+                        "planned_dimensions": int(
+                            published_lsa.get("dimensions", 0) or 0
+                        ),
+                        "dimensions": 0,
+                        "base_revision": build_revision,
+                        "current_revision": publish_revision,
+                        "vectors": {},
+                    }
+                )
             latent_store = self.store.replace_token_latent_vectors(
                 conn,
-                graph_version=graph_version,
-                dimensions=int(lsa.get("dimensions", 0) or 0),
-                vectors=lsa.get("vectors", {})
-                if isinstance(lsa.get("vectors"), Mapping)
+                graph_version=published_graph_version,
+                dimensions=int(published_lsa.get("dimensions", 0) or 0)
+                if coherent
+                else 0,
+                vectors=published_lsa.get("vectors", {})
+                if isinstance(published_lsa.get("vectors"), Mapping)
                 else {},
             )
-            self._sync_smp_vector_model(graph_version=graph_version, force=True)
             lexical = self.store.upsert_derived_index_metadata(
                 conn,
                 index_name="semantic_lexical_vectors",
-                graph_version=graph_version,
-                freshness="fresh",
+                graph_version=published_graph_version,
+                freshness="fresh" if coherent else "stale",
                 details={
-                    "atom_count": self.store.atom_count(),
-                    "token_count": self.store.atom_text_index_count(),
+                    "atom_count": atom_count,
+                    "token_count": token_count,
                     "processor_id": self.smp.processor_id,
                     "processor_version": self.smp.processor_version,
                     "vector_model": self.smp.vector_model_info(),
                     "rebuildable_from_canonical": True,
                     "maintained_by": "memory_policy",
                     "hot_index_prune": pruned_index,
+                    "write_batch_size": write_batch_size,
+                    "write_batch_count": write_batch_count,
                 },
             )
             lsa_index = self.store.upsert_derived_index_metadata(
                 conn,
                 index_name="semantic_lsa_vectors",
-                graph_version=graph_version,
-                freshness=lsa.get("freshness", "fresh"),
+                graph_version=published_graph_version,
+                freshness=published_lsa.get("freshness", "fresh"),
                 details={
                     key: value
-                    for key, value in lsa.items()
+                    for key, value in published_lsa.items()
                     if key != "vectors"
                 }
                 | {
@@ -266,17 +371,27 @@ class IndexService:
             graph = self.store.upsert_derived_index_metadata(
                 conn,
                 index_name="graph_adjacency",
-                graph_version=graph_version,
-                freshness="fresh",
+                graph_version=published_graph_version,
+                freshness="fresh" if coherent else "stale",
                 details={
-                    "edge_count": self.store.edge_count(),
+                    "edge_count": edge_count,
                     "rebuildable_from_canonical": True,
                     "maintained_by": "memory_policy",
                 },
             )
+        self._sync_smp_vector_model(
+            graph_version=published_graph_version, force=True
+        )
         return {
-            "status": "rebuilt",
-            "graph_version": graph_version,
+            "status": "rebuilt" if coherent else "stale",
+            "graph_version": published_graph_version,
+            "base_revision": build_revision,
+            "publish_revision": publish_revision,
+            "requested_graph_version": int(requested_graph_version),
+            "publish_revision_offset": publish_revision_offset,
+            "write_batch_size": write_batch_size,
+            "write_batch_count": write_batch_count,
+            "rebuilt_atom_count": rebuilt_atoms,
             "indexes": [lexical, lsa_index, graph],
         }
 
@@ -430,9 +545,10 @@ class IndexService:
         self, *, graph_version: int | None = None
     ) -> dict[str, Any]:
         with self.store.transaction() as conn:
-            self.store.clear_packet_cache(conn)
+            retired = self.store.retire_packet_cache(conn)
         return {
             "status": "invalidated",
+            "retired": retired,
             "graph_version": (
                 graph_version
                 if graph_version is not None

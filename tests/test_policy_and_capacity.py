@@ -793,6 +793,7 @@ def test_memory_policy_protects_and_repairs_current_memory_heads(amos):
         and edge["target_ref"] == "protected_goal_context"
         for edge in amos.store.list_edges()
     )
+    assert amos.verify_replay()["status"] == "ok"
 
 
 def test_memory_policy_archives_proposal_after_explicit_retention_window(amos):

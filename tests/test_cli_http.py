@@ -304,6 +304,51 @@ def test_http_maintenance_does_not_block_health_reads(tmp_path):
         thread.join(timeout=2)
 
 
+def test_http_shared_view_queues_policy_instead_of_running_it_inline(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "http_shared_view_policy_lane.sqlite3")
+    try:
+        server = AmosHTTPServer(("127.0.0.1", 0), db_path)
+    except PermissionError as exc:
+        pytest.skip(f"loopback sockets unavailable in this sandbox: {exc}")
+    scheduled: list[dict] = []
+
+    def queue_tick(**request):
+        scheduled.append(dict(request))
+        return {"status": "queued", "trigger": request["trigger"]}
+
+    monkeypatch.setattr(server.memory_policy_worker, "request_tick", queue_tick)
+
+    def fail_inline_policy(**_kwargs):
+        raise AssertionError("shared-view HTTP read ran maintenance inline")
+
+    monkeypatch.setattr(server.amos.policy, "run_memory_policy", fail_inline_policy)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        view = http_json(
+            f"{base}/v1/shared-views:retrieve",
+            {"processor_ids": ["planner"], "scope": {"tenant": "test"}},
+        )
+        assert view["view"] == "shared_memory"
+        assert view["policy_schedule"] == {
+            "status": "queued",
+            "trigger": "retrieve_shared_view",
+        }
+        assert scheduled == [
+            {
+                "trigger": "retrieve_shared_view",
+                "scope": {"tenant": "test"},
+            }
+        ]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_http_long_reasoning_request_does_not_block_readiness(tmp_path):
     db_path = str(tmp_path / "http_reasoning_isolation.sqlite3")
     try:
@@ -382,6 +427,39 @@ def test_http_expired_request_deadline_fails_before_dispatch(tmp_path):
         assert payload["code"] == "request_deadline_exhausted"
         assert payload["retryable"] is True
     finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_maintenance_admission_respects_request_deadline(tmp_path):
+    db_path = str(tmp_path / "http_maintenance_deadline.sqlite3")
+    try:
+        server = AmosHTTPServer(("127.0.0.1", 0), db_path)
+    except PermissionError as exc:
+        pytest.skip(f"loopback sockets unavailable in this sandbox: {exc}")
+    assert server.maintenance_lock.acquire(blocking=False)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    request = urllib.request.Request(
+        f"{base}/v1/memory-policy:run",
+        data=b"{}",
+        headers={
+            "Content-Type": "application/json",
+            "X-Request-Deadline-Epoch-Ms": str(int((time.time() + 1.0) * 1000)),
+        },
+        method="POST",
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            urllib.request.urlopen(request, timeout=3)
+        assert excinfo.value.code == 503
+        payload = json.loads(excinfo.value.read().decode("utf-8"))
+        assert payload["code"] == "maintenance_capacity_exhausted"
+        assert payload["retryable"] is True
+    finally:
+        server.maintenance_lock.release()
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)

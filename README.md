@@ -188,7 +188,7 @@ back into the public service object.
 ### Included capabilities
 
 The first usable deployment profile is an AMOS HTTP service that owns one
-in-process SQLite store and serializes access through the service boundary:
+SQLite database and uses isolated request connections behind the service boundary:
 
 - Service-owned SQLite canonical store with an append-only event journal and
   checksum chain.
@@ -196,7 +196,9 @@ in-process SQLite store and serializes access through the service boundary:
   and retrieval outcomes.
 - Rebuildable, content-only SQLite token candidate index with document-frequency
   weighting, complemented by an independent bounded latent candidate pool before
-  deterministic in-Python ranking.
+  deterministic in-Python ranking. Associative retrieval bounds the hot atom
+  scan (512-4096 records according to response depth), unions direct lexical
+  and graph candidates from the full index, and discloses scan truncation.
 - Graph-versioned SMP vector model with dependency-free TF-IDF lexical hashing,
   hashed character 3/4-grams for morphology and typo tolerance, and a
   maintenance-built LSA token projection stored as disposable derived state.
@@ -284,8 +286,21 @@ in-process SQLite store and serializes access through the service boundary:
 - Capacity pressure reporting and degraded packet disclosure.
 - Idle-triggered storage cleanup that prunes archived/stale atoms from the hot
   token index, deletes expired archived/stale atoms through journaled
-  tombstones, compacts old idempotency responses, checkpoints WAL, and runs
-  SQLite `VACUUM` on a bounded interval.
+  tombstones in bounded write batches, compacts old idempotency responses, and
+  performs non-blocking WAL checkpoints. Full SQLite `VACUUM` is opt-in and
+  remains gated by idle and minimum-interval policy.
+- Revision-pinned WAL read snapshots for composite responses, plus FIFO
+  database-scoped admission for short foreground, read-effect, and maintenance
+  write transactions. Reads never upgrade their snapshot to a write; packet
+  cache and feedback effects flush in one post-snapshot transaction.
+- Expensive steward, decay-vector, and LSA planning runs on pinned read
+  snapshots. Publication revalidates the canonical revision and fails closed
+  when foreground work advanced it; decay, cleanup, and index writes yield
+  between bounded batches.
+- Graph-version cache keys provide immediate logical invalidation; ordinary
+  canonical mutations retire at most 128 stale cache rows per transaction
+  instead of performing an unbounded full-cache delete. Strong deletion paths
+  still purge packet copies before acknowledging the deletion.
 - Journal chain and replay verification.
 - An active background memory-policy worker plus in-process adapters for journal
   verification, index maintenance, packet-cache invalidation, capacity
@@ -504,10 +519,15 @@ only those validated fields for semantic isolation: untagged/global memory
 remains eligible, while atoms explicitly tagged in their scope or payload for a
 different human, project, or thread are excluded from frames and pages.
 
-The stdlib HTTP adapter is the first single-process deployment profile: it owns
-one SQLite store and serializes service calls for correctness. Reader/writer
-parallelism with SQLite WAL or a production database adapter is the scale path
-for heavier concurrent retrieval workloads.
+The stdlib HTTP adapter is the first single-process deployment profile. Its
+request pool uses independent SQLite WAL connections, so concurrent reads do
+not share a process-global lock. Every multi-query response is pinned to one
+canonical revision. SQLite still has one physical writer; AMOS admits those
+transactions through a shared FIFO queue, and maintenance yields between
+bounded cleanup and index batches. Retrieval, reasoning, workspace, and shared
+view HTTP reads queue due policy work onto the isolated background maintenance
+lane instead of executing it inline. A production database adapter remains the
+scale-out path for multiple API processes or sustained write-heavy workloads.
 
 ### Verify journal replay
 
@@ -583,7 +603,7 @@ reports the complete SQLite DB, WAL, and SHM footprint. It measures the current
 in-process v1-local baseline, not HTTP, network, or background-worker scheduling
 overhead.
 
-Reference result from a local workstation run on 2026-07-24 with the forced
+Reference result from a local workstation run on 2026-08-16 with the forced
 memory policy enabled. These values are single-run evidence for the 100-atom
 v1-local profile, not an enforced performance gate:
 
@@ -592,29 +612,34 @@ v1-local profile, not an enforced performance gate:
 | Atoms committed | 100 |
 | Atoms with semantic facets / graph relations | 100 / 25 |
 | Exact lookups | 20 (20 found) |
-| Exact lookup latency p50 / p95 | 0.529 ms / 0.718 ms |
+| Exact lookup latency p50 / p95 | 0.622 ms / 0.698 ms |
 | Packet retrievals | 20 cold + 20 warm |
-| Commit throughput | 384.65 atoms/s |
-| Commit latency p50 / p95 | 2.514 ms / 3.229 ms |
-| Cold packet latency p50 / p95 | 29.89 ms / 33.527 ms |
-| Warm packet latency p50 / p95 | 0.368 ms / 0.499 ms |
-| Average packet items | 6.15 |
+| Commit throughput | 456.02 atoms/s |
+| Commit latency p50 / p95 | 2.113 ms / 2.763 ms |
+| Cold packet latency p50 / p95 | 29.826 ms / 34.685 ms |
+| Warm packet latency p50 / p95 | 0.288 ms / 0.403 ms |
+| Average packet items | 6.1 |
 | Deliberative candidate retrievals | 20 over 8 proposed atoms |
-| Deliberation latency p50 / p95 | 0.262 ms / 10.439 ms |
+| Deliberation latency p50 / p95 | 0.278 ms / 10.714 ms |
 | Root-provenance analyses | 20 |
-| Provenance-analysis latency p50 / p95 | 6.83 ms / 8.801 ms |
+| Provenance-analysis latency p50 / p95 | 5.502 ms / 6.444 ms |
 | Reasoning frame compiles | 5 at 1600 tokens |
-| Reasoning frame latency p50 / p95 | 390.521 ms / 395.629 ms |
+| Reasoning frame latency p50 / p95 | 617.911 ms / 623.648 ms |
 | Average resident units / page descriptors | 1 / 2 |
 | Demand-page loads | 5 at 1800 tokens |
-| Demand-page latency p50 / p95 | 3.551 ms / 3.875 ms |
-| Forced memory policy run | 23251.719 ms (completed) |
-| Maintenance proposals / committed / deferred | 112 / 87 / 25 |
-| Replay verification after policy | 40.131 ms (ok) |
+| Demand-page latency p50 / p95 | 4.775 ms / 4.858 ms |
+| Forced memory policy run | 21424.569 ms (completed) |
+| Maintenance proposals / committed / deferred | 137 / 112 / 25 |
+| Replay verification after policy | 34.259 ms (ok) |
 | Edges before policy / final | 72 / 147 |
 | Final atoms / edges | 109 / 147 |
-| SQLite DB / WAL / SHM / total footprint | 1802240 / 432632 / 32768 / 2267640 bytes |
+| SQLite DB / WAL / SHM / total footprint | 2195456 / 4210672 / 32768 / 6438896 bytes |
 | Environment | Python 3.12.2; 24 CPUs; Linux-7.0.0-28-generic-x86_64-with-glibc2.39 |
+
+The default passive checkpoint favors request availability over immediate WAL
+truncation, so the measured WAL footprint can be larger than under the former
+forced `TRUNCATE` policy. Operators can request an aggressive checkpoint during
+a controlled quiet window; it is not part of routine foreground maintenance.
 
 ## Integration boundary
 

@@ -54,7 +54,8 @@ V1 storage target:
 
 ```text
 service boundary:
-  HTTP API server owns one in-process SQLite database and is the shared Amos instance
+  HTTP API server owns one SQLite database and a bounded pool of isolated Amos
+  request connections
 
 primary database:
   SQLite
@@ -89,13 +90,24 @@ connection profile:
 
 canonical write profile:
   strong mutations use explicit transactions
+  all in-process connections share FIFO writer admission for the same database
+  maintenance reacquires admission for every bounded batch so queued foreground
+  writes can run between batches
   batch atom commits preflight duplicate ids before writing
   batch atom commits accept one operation-level idempotency key and replay the
   original all-or-nothing response without duplicating atoms or journal events
   atom rows, edge rows, and journal entries commit atomically
-  packet cache invalidation is performed once per successful mutation batch
+  packet cache lookup is graph-version keyed; each ordinary successful mutation
+  batch physically retires at most 128 stale rows while feedback receipts remain
+  strong deletion paths physically purge packet copies before acknowledgement
 
 read/query profile:
+  composite service reads use one revision-pinned WAL snapshot
+  a read snapshot never upgrades to a write transaction
+  cache and feedback writes are coalesced into one short post-snapshot effect
+  associative retrieval bounds its payload scan, unions full-index lexical and
+  graph candidates, and reports candidate_scan_truncated when latent recall is
+  operating over a bounded hot subset
   filtered atom queries support type, lifecycle, health, deletion, limit, and
   ordering constraints
   SQL count helpers back health and derived-index status without loading the
@@ -125,7 +137,9 @@ V1 strong-writer topology:
 
 ```text
 one HTTP API service process owns the SQLite database for a shared Amos instance
-service-level locking plus SQLite transactions for strong canonical mutations
+independent WAL connections serve concurrent reads without a global read lock
+database-scoped FIFO admission plus SQLite transactions serialize strong writes
+maintenance policy execution is single-flight across all connections for the database
 row-level expected_version checks for atoms and edges
 unique constraints for idempotency keys
 event journal as the transactional outbox for later projections
@@ -535,6 +549,7 @@ maintenance:
   run_smp: true
   run_steward: true
   rebuild_indexes: true
+  index_write_batch_size: 64
   invalidate_packet_cache: true
 
 distillation:
@@ -565,6 +580,7 @@ maintenance_distiller:
 
 decay:
   enabled: true
+  write_batch_size: 32
   max_atoms: 256
   max_active_atoms: 256
   max_proposed_atoms: 256
@@ -608,10 +624,12 @@ storage_cleanup:
     - primal_guidance
   compact_idempotency_after_seconds: 604800
   max_idempotency_compactions_per_tick: 512
+  write_batch_size: 32
+  max_index_prune_atoms_per_tick: 512
   sqlite_compaction:
     checkpoint_wal: true
-    checkpoint_mode: TRUNCATE
-    vacuum_enabled: true
+    checkpoint_mode: PASSIVE
+    vacuum_enabled: false
     vacuum_idle_after_seconds: 1800
     vacuum_min_interval_seconds: 86400
 ```
@@ -977,16 +995,30 @@ Supported v1-local rules include `expires_at`, `retain_until`,
 apply global stale/archive/low-utility thresholds.
 Applied decay actions are journaled as `decay_policy_applied`, update atom
 version/health/lifecycle state, refresh derived token rows, and invalidate packet
-cache.
+cache. Vector preparation occurs on a read snapshot; decay publishes in bounded
+write batches (default 32), rechecks the canonical revision, atom version, and
+current-head protection in each batch, and skips a stale plan rather than
+overwriting a concurrent update. Current-head repair is committed atomically
+with its journal event.
 
 Storage cleanup is deterministic and idle-triggered, not size-triggered by
 default. It removes archived/stale atoms from the hot token index immediately
 when the cleanup tick is due, then deletes archived/stale atoms only after their
-configured retention windows. Deletion uses the same deleted lifecycle,
+configured retention windows. Candidate planning occurs on a read snapshot;
+each bounded write batch revalidates atom version and eligibility before
+deletion, then yields writer admission before the next batch. Deletion uses the same deleted lifecycle,
 tombstones, edge deletion, packet-cache invalidation, and replay projection model
 as explicit `atom_deleted` operations. The event journal remains logically
 append-only; v1-local physical compaction trims derived/cache storage with
-idempotency-response slimming, `PRAGMA wal_checkpoint`, and SQLite `VACUUM`.
+idempotency-response slimming and a default `PASSIVE` WAL checkpoint. Full
+SQLite `VACUUM` is disabled by default and requires an explicit idle-gated policy.
+
+Derived-index maintenance similarly refreshes lexical rows in bounded write
+batches and performs LSA computation on a pinned read snapshot. Publication
+revalidates the base revision; if a canonical write advanced it, AMOS publishes
+stale metadata with no stale latent vectors rather than claiming freshness.
+Steward clustering and conflict planning also runs on a pinned read snapshot;
+its canonical publication fails closed when that base revision advances.
 
 V1-local policy execution profile:
 

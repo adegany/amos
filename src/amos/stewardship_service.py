@@ -560,7 +560,11 @@ class StewardshipService:
         actions: list[dict[str, Any]] = []
         projected_atoms: list[dict[str, Any]] = []
         projected_edges: list[dict[str, Any]] = []
-        with self.store.transaction() as conn:
+        # Clustering and conflict detection dominate steward cost. Compute
+        # them on a pinned WAL snapshot so foreground writers can continue,
+        # then fail closed if that canonical base moved before publication.
+        with self.store.read_snapshot():
+            planning_revision = self.store.memory_revision()
             atoms = [
                 atom
                 for atom in self.store.list_atoms_filtered(
@@ -570,6 +574,21 @@ class StewardshipService:
                 and atom.get("lifecycle_state") == "active"
                 and scope_visible(atom["scope"], scope)
             ]
+            smp_outputs = self.smp.cluster(atoms) + self.smp.detect_conflicts(
+                atoms
+            )
+        with self.store.transaction() as conn:
+            current_revision = self.store.memory_revision()
+            if current_revision != planning_revision:
+                return {
+                    "status": "stale",
+                    "reason": "canonical_revision_advanced_during_steward_planning",
+                    "actions": [],
+                    "event": None,
+                    "planned_revision": planning_revision,
+                    "current_revision": current_revision,
+                    "graph_version": int(current_revision["graph_version"]),
+                }
             live_attachment_relations = {
                 "rel:attributed_to",
                 "rel:has_capability",
@@ -635,7 +654,6 @@ class StewardshipService:
                         "policy": "proposed_atoms_do_not_participate_in_active_graph",
                     }
                 )
-            smp_outputs = self.smp.cluster(atoms) + self.smp.detect_conflicts(atoms)
             existing_edges = {
                 edge["edge_id"]: edge for edge in self.store.list_edges()
             }
@@ -876,7 +894,7 @@ class StewardshipService:
                 if approved_by
                 else {},
             )
-            self.store.clear_packet_cache(conn)
+            self.store.retire_packet_cache(conn)
         return {
             "status": "completed",
             "actions": actions,
@@ -1261,7 +1279,7 @@ class StewardshipService:
                     "auto_commit_gate": "low_risk_add_edge",
                 },
             )
-            self.store.clear_packet_cache(conn)
+            self.store.retire_packet_cache(conn)
         return {
             "status": "committed",
             "proposal_id": proposal["proposal_id"],

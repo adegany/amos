@@ -17,10 +17,7 @@ class AccessService:
     def _mark_foreground_activity(self, actor: str | None = None) -> None:
         if actor and str(actor).startswith("svc:"):
             return
-        try:
-            self.store.set_meta("last_foreground_activity_at", utc_now())
-        except Exception:
-            pass
+        self.store.mark_foreground_activity(utc_now())
 
 
     def _idempotency_hit(

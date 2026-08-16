@@ -26,61 +26,80 @@ class DiagnosticsService:
                 "graph_version": self.store.graph_version(),
             }
         )
-        indexes = self.store.list_derived_index_metadata()
-        by_type = self.store.atom_counts_by("type")
-        by_health = self.store.atom_counts_by("health_status")
-        by_lifecycle = self.store.atom_counts_by("lifecycle_state")
-        return {
-            "graph_version": self.store.graph_version(),
-            "journal_events": self.store.event_count(),
-            "memory_heads": len(self.store.list_memory_heads()),
-            "atoms": self.store.atom_count(),
-            "edges": self.store.edge_count(),
-            "by_type": by_type,
-            "by_health": by_health,
-            "by_lifecycle": by_lifecycle,
-            "journal_head": self.store.last_event_hash(),
-            "projection_lag": 0,
-            "index_freshness": {
-                index["index_name"]: {
-                    "graph_version": index["graph_version"],
-                    "freshness": index["freshness"],
-                    "rebuilt_at": index["rebuilt_at"],
-                }
-                for index in indexes
-            },
-            "retrieval_outcomes": self.store.retrieval_outcome_count(),
-            "deletion_residuals": {
-                "offline_backup_residual_window_days": 30,
-                "hot_packet_cache_policy": "purged_on_canonical_mutation",
-            },
-            "quality": self._memory_quality_diagnostics(
-                policy=self.memory_policy(),
-                indexes=indexes,
-            ),
-            "memory_policy": self.memory_policy_status(),
-            "last_policy_tick": policy_tick,
-        }
+        with self.store.read_snapshot():
+            graph_version = self.store.graph_version()
+            indexes = self.store.list_derived_index_metadata()
+            by_type = self.store.atom_counts_by("type")
+            by_health = self.store.atom_counts_by("health_status")
+            by_lifecycle = self.store.atom_counts_by("lifecycle_state")
+            return {
+                "graph_version": graph_version,
+                "journal_events": self.store.event_count(),
+                "memory_heads": len(self.store.list_memory_heads()),
+                "atoms": self.store.atom_count(),
+                "edges": self.store.edge_count(),
+                "by_type": by_type,
+                "by_health": by_health,
+                "by_lifecycle": by_lifecycle,
+                "journal_head": self.store.last_event_hash(),
+                "projection_lag": 0,
+                "index_freshness": {
+                    index["index_name"]: {
+                        "graph_version": index["graph_version"],
+                        "freshness": (
+                            index["freshness"]
+                            if int(index["graph_version"]) == graph_version
+                            else "stale"
+                        ),
+                        "rebuilt_at": index["rebuilt_at"],
+                    }
+                    for index in indexes
+                },
+                "retrieval_outcomes": self.store.retrieval_outcome_count(),
+                "deletion_residuals": {
+                    "offline_backup_residual_window_days": 30,
+                    "hot_packet_cache_policy": (
+                        "graph_version_keyed_bounded_retirement_with_delete_purge"
+                    ),
+                },
+                "quality": self._memory_quality_diagnostics(
+                    policy=self.memory_policy(),
+                    indexes=indexes,
+                ),
+                "memory_policy": self.memory_policy_status(),
+                "concurrency": {
+                    "read_consistency": "revision_pinned_wal_snapshot",
+                    "writer_admission": self.store.writer_status(),
+                },
+                "last_policy_tick": policy_tick,
+            }
 
 
     def health_capacity(self) -> dict[str, Any]:
         path = self.store.path
         size_bytes = path.stat().st_size if path.exists() and str(path) != ":memory:" else 0
-        budget = self._capacity_budget()
-        pressure_mode = self._capacity_pressure_mode(size_bytes=size_bytes, budget=budget)
-        return {
-            "store": getattr(self.store, "backend_name", "unknown"),
-            "path": str(path),
-            "size_bytes": size_bytes,
-            "capacity_budget": budget,
-            "pressure_mode": pressure_mode,
-            "graph_version": self.store.graph_version(),
-            "degradation": {
-                "vector_index_available": False,
-                "external_object_store_available": False,
-                "pressure_degraded": pressure_mode in {"orange", "red"},
-            },
-        }
+        with self.store.read_snapshot():
+            budget = self._capacity_budget()
+            pressure_mode = self._capacity_pressure_mode(
+                size_bytes=size_bytes, budget=budget
+            )
+            return {
+                "store": getattr(self.store, "backend_name", "unknown"),
+                "path": str(path),
+                "size_bytes": size_bytes,
+                "capacity_budget": budget,
+                "pressure_mode": pressure_mode,
+                "graph_version": self.store.graph_version(),
+                "concurrency": {
+                    "read_consistency": "revision_pinned_wal_snapshot",
+                    "writer_admission": self.store.writer_status(),
+                },
+                "degradation": {
+                    "vector_index_available": False,
+                    "external_object_store_available": False,
+                    "pressure_degraded": pressure_mode in {"orange", "red"},
+                },
+            }
 
 
     def verify_journal_chain(self) -> dict[str, Any]:

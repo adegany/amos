@@ -645,7 +645,11 @@ signal.
   model-derived memory changes through evidence-linked proposal review.
 
 For small deployments, the HTTP service plus SQLite is the intended v1 starting
-point. The stdlib HTTP adapter serializes service calls through one in-process
-lock for correctness with a single SQLite store. WAL-backed read parallelism,
-reader/writer lock splitting, Postgres, and external vector integration are
-roadmap items for larger multi-agent or higher-scale deployments.
+point. The stdlib HTTP adapter serves revision-pinned reads through isolated WAL
+connections and uses database-scoped FIFO admission only for SQLite write
+transactions. Cleanup and index refresh yield between bounded batches; LSA
+computation, decay preparation, and steward analysis are read-side work with
+revision revalidation at publish. HTTP reads schedule due policy work on the
+background maintenance lane. Monitor the `concurrency.writer_admission` health
+field for queued lanes. Postgres and external vector integration remain roadmap
+items for multi-process or larger write-heavy deployments.

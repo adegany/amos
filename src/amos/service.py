@@ -169,12 +169,14 @@ class Amos:
         )
 
     def memory_policy(self) -> dict[str, Any]:
-        return self.policy.memory_policy()
+        with self.store.read_snapshot():
+            return self.policy.memory_policy()
 
     def memory_policy_status(
         self, *, policy: Mapping[str, Any] | None = None
     ) -> dict[str, Any]:
-        return self.policy.memory_policy_status(policy=policy)
+        with self.store.read_snapshot():
+            return self.policy.memory_policy_status(policy=policy)
 
     def run_memory_policy(
         self,
@@ -215,12 +217,13 @@ class Amos:
         requester: str = "system",
         target_processor: str = "reasoner",
     ) -> dict[str, Any]:
-        return self.retrieval.classify_refs(
-            refs,
-            scope=scope,
-            requester=requester,
-            target_processor=target_processor,
-        )
+        with self.store.read_snapshot():
+            return self.retrieval.classify_refs(
+                refs,
+                scope=scope,
+                requester=requester,
+                target_processor=target_processor,
+            )
 
     def commit_atom(
         self,
@@ -310,9 +313,10 @@ class Amos:
     def analyze_provenance(
         self, *, atom_ref: str, max_depth: int = 64
     ) -> dict[str, Any]:
-        return self.governance.analyze_provenance(
-            atom_ref=atom_ref, max_depth=max_depth
-        )
+        with self.store.read_snapshot():
+            return self.governance.analyze_provenance(
+                atom_ref=atom_ref, max_depth=max_depth
+            )
 
     def diachronic_ratification_status(
         self,
@@ -323,13 +327,14 @@ class Amos:
         min_interval_seconds: int = 0,
         require_distinct_evidence: bool = False,
     ) -> dict[str, Any]:
-        return self.governance.diachronic_ratification_status(
-            subject_ref=subject_ref,
-            identity_ref=identity_ref,
-            required_confirmations=required_confirmations,
-            min_interval_seconds=min_interval_seconds,
-            require_distinct_evidence=require_distinct_evidence,
-        )
+        with self.store.read_snapshot():
+            return self.governance.diachronic_ratification_status(
+                subject_ref=subject_ref,
+                identity_ref=identity_ref,
+                required_confirmations=required_confirmations,
+                min_interval_seconds=min_interval_seconds,
+                require_distinct_evidence=require_distinct_evidence,
+            )
 
     def commit_memory_atoms(
         self,
@@ -485,23 +490,29 @@ class Amos:
         attention_context: Mapping[str, Any] | None = None,
         run_policy: bool = True,
     ) -> dict[str, Any]:
-        return self.retrieval.retrieve_packet(
-            cues=cues,
-            scope=scope,
-            requester=requester,
-            target_processor=target_processor,
-            retrieval_mode=retrieval_mode,
-            memory_mode=memory_mode,
-            max_items=max_items,
-            token_or_byte_budget=token_or_byte_budget,
-            include_conflicts=include_conflicts,
-            include_archived=include_archived,
-            include_low_health=include_low_health,
-            include_superseded=include_superseded,
-            type_filter=type_filter,
-            attention_context=attention_context,
-            run_policy=run_policy,
-        )
+        if run_policy:
+            self.policy.run_memory_policy(
+                trigger="retrieve_packet", scope=scope or {}
+            )
+        with self.store.read_snapshot():
+            return self.retrieval.retrieve_packet(
+                cues=cues,
+                scope=scope,
+                requester=requester,
+                target_processor=target_processor,
+                retrieval_mode=retrieval_mode,
+                memory_mode=memory_mode,
+                max_items=max_items,
+                token_or_byte_budget=token_or_byte_budget,
+                include_conflicts=include_conflicts,
+                include_archived=include_archived,
+                include_low_health=include_low_health,
+                include_superseded=include_superseded,
+                type_filter=type_filter,
+                attention_context=attention_context,
+                run_policy=run_policy,
+                _policy_already_run=True,
+            )
 
     def retrieve_atom(
         self,
@@ -519,18 +530,24 @@ class Amos:
     ) -> dict[str, Any]:
         """Resolve a known atom ID without invoking associative ranking."""
 
-        return self.retrieval.retrieve_atom(
-            atom_id,
-            scope=scope,
-            requester=requester,
-            target_processor=target_processor,
-            memory_mode=memory_mode,
-            include_conflicts=include_conflicts,
-            include_archived=include_archived,
-            include_low_health=include_low_health,
-            include_superseded=include_superseded,
-            run_policy=run_policy,
-        )
+        if run_policy:
+            self.policy.run_memory_policy(
+                trigger="retrieve_atom", scope=scope or {}
+            )
+        with self.store.read_snapshot():
+            return self.retrieval.retrieve_atom(
+                atom_id,
+                scope=scope,
+                requester=requester,
+                target_processor=target_processor,
+                memory_mode=memory_mode,
+                include_conflicts=include_conflicts,
+                include_archived=include_archived,
+                include_low_health=include_low_health,
+                include_superseded=include_superseded,
+                run_policy=run_policy,
+                _policy_already_run=True,
+            )
 
     def retrieve_evidence(
         self,
@@ -543,13 +560,19 @@ class Amos:
     ) -> dict[str, Any]:
         """Resolve a known evidence ID without associative ranking."""
 
-        return self.retrieval.retrieve_evidence(
-            evidence_id,
-            scope=scope,
-            requester=requester,
-            target_processor=target_processor,
-            run_policy=run_policy,
-        )
+        if run_policy:
+            self.policy.run_memory_policy(
+                trigger="retrieve_evidence", scope=scope or {}
+            )
+        with self.store.read_snapshot():
+            return self.retrieval.retrieve_evidence(
+                evidence_id,
+                scope=scope,
+                requester=requester,
+                target_processor=target_processor,
+                run_policy=run_policy,
+                _policy_already_run=True,
+            )
 
     def compile_memory_frame(
         self,
@@ -565,18 +588,24 @@ class Amos:
         token_or_byte_budget: int | Mapping[str, int] | None = None,
         run_policy: bool = True,
     ) -> dict[str, Any]:
-        return self.reasoning.compile_memory_frame(
-            need=need,
-            purpose=purpose,
-            depth=depth,
-            task_context=task_context,
-            scope=scope,
-            requester=requester,
-            target_processor=target_processor,
-            memory_mode=memory_mode,
-            token_or_byte_budget=token_or_byte_budget,
-            run_policy=run_policy,
-        )
+        if run_policy:
+            self.policy.run_memory_policy(
+                trigger="compile_memory_frame", scope=scope or {}
+            )
+        with self.store.read_snapshot():
+            return self.reasoning.compile_memory_frame(
+                need=need,
+                purpose=purpose,
+                depth=depth,
+                task_context=task_context,
+                scope=scope,
+                requester=requester,
+                target_processor=target_processor,
+                memory_mode=memory_mode,
+                token_or_byte_budget=token_or_byte_budget,
+                run_policy=run_policy,
+                _policy_already_run=True,
+            )
 
     def compile_cognitive_workspace(
         self,
@@ -597,23 +626,29 @@ class Amos:
         prior_workspace_revision: Mapping[str, Any] | None = None,
         run_policy: bool = False,
     ) -> dict[str, Any]:
-        return self.continuity.compile_cognitive_workspace(
-            current_event_ref=current_event_ref,
-            conversation_id=conversation_id,
-            scope=scope,
-            requester=requester,
-            target_processor=target_processor,
-            participant_refs=participant_refs,
-            operation_refs=operation_refs,
-            project_refs=project_refs,
-            context_refs=context_refs,
-            token_or_byte_budget=token_or_byte_budget,
-            temporal_limit=temporal_limit,
-            thread_limit=thread_limit,
-            recent_event_floor=recent_event_floor,
-            prior_workspace_revision=prior_workspace_revision,
-            run_policy=run_policy,
-        )
+        if run_policy:
+            self.policy.run_memory_policy(
+                trigger="compile_cognitive_workspace", scope=scope or {}
+            )
+        with self.store.read_snapshot():
+            return self.continuity.compile_cognitive_workspace(
+                current_event_ref=current_event_ref,
+                conversation_id=conversation_id,
+                scope=scope,
+                requester=requester,
+                target_processor=target_processor,
+                participant_refs=participant_refs,
+                operation_refs=operation_refs,
+                project_refs=project_refs,
+                context_refs=context_refs,
+                token_or_byte_budget=token_or_byte_budget,
+                temporal_limit=temporal_limit,
+                thread_limit=thread_limit,
+                recent_event_floor=recent_event_floor,
+                prior_workspace_revision=prior_workspace_revision,
+                run_policy=run_policy,
+                _policy_already_run=True,
+            )
 
     def compile_interaction_projection(
         self,
@@ -628,17 +663,18 @@ class Amos:
         linked_depth: int = 0,
         linked_limit_per_event: int = 32,
     ) -> dict[str, Any]:
-        return self.continuity.compile_interaction_projection(
-            conversation_id=conversation_id,
-            scope=scope,
-            requester=requester,
-            target_processor=target_processor,
-            after_sequence=after_sequence,
-            limit=limit,
-            linked_atom_types=linked_atom_types,
-            linked_depth=linked_depth,
-            linked_limit_per_event=linked_limit_per_event,
-        )
+        with self.store.read_snapshot():
+            return self.continuity.compile_interaction_projection(
+                conversation_id=conversation_id,
+                scope=scope,
+                requester=requester,
+                target_processor=target_processor,
+                after_sequence=after_sequence,
+                limit=limit,
+                linked_atom_types=linked_atom_types,
+                linked_depth=linked_depth,
+                linked_limit_per_event=linked_limit_per_event,
+            )
 
     def get_memory_head(
         self,
@@ -649,13 +685,14 @@ class Amos:
         requester: str = "system",
         target_processor: str = "reasoner",
     ) -> dict[str, Any]:
-        return self.continuity.get_memory_head(
-            scope=scope,
-            series_kind=series_kind,
-            series_id=series_id,
-            requester=requester,
-            target_processor=target_processor,
-        )
+        with self.store.read_snapshot():
+            return self.continuity.get_memory_head(
+                scope=scope,
+                series_kind=series_kind,
+                series_id=series_id,
+                requester=requester,
+                target_processor=target_processor,
+            )
 
     def get_memory_series_versions(
         self,
@@ -668,15 +705,16 @@ class Amos:
         target_processor: str = "reasoner",
         limit: int = 100,
     ) -> dict[str, Any]:
-        return self.continuity.get_memory_series_versions(
-            scope=scope,
-            series_kind=series_kind,
-            series_id=series_id,
-            versions=versions,
-            requester=requester,
-            target_processor=target_processor,
-            limit=limit,
-        )
+        with self.store.read_snapshot():
+            return self.continuity.get_memory_series_versions(
+                scope=scope,
+                series_kind=series_kind,
+                series_id=series_id,
+                versions=versions,
+                requester=requester,
+                target_processor=target_processor,
+                limit=limit,
+            )
 
     def observe_memory_transaction(
         self,
@@ -686,12 +724,13 @@ class Amos:
         requester: str = "system",
         target_processor: str = "reasoner",
     ) -> dict[str, Any]:
-        return self.continuity.observe_memory_transaction(
-            event_id=event_id,
-            scope=scope,
-            requester=requester,
-            target_processor=target_processor,
-        )
+        with self.store.read_snapshot():
+            return self.continuity.observe_memory_transaction(
+                event_id=event_id,
+                scope=scope,
+                requester=requester,
+                target_processor=target_processor,
+            )
 
     def rebuild_memory_heads(self) -> dict[str, Any]:
         return self.continuity.rebuild_memory_heads()
@@ -712,20 +751,26 @@ class Amos:
         token_or_byte_budget: int | Mapping[str, int] | None = None,
         run_policy: bool = True,
     ) -> dict[str, Any]:
-        return self.reasoning.load_memory_page(
-            frame_id=frame_id,
-            revision=revision,
-            page=page,
-            need=need,
-            purpose=purpose,
-            depth=depth,
-            scope=scope,
-            requester=requester,
-            target_processor=target_processor,
-            memory_mode=memory_mode,
-            token_or_byte_budget=token_or_byte_budget,
-            run_policy=run_policy,
-        )
+        if run_policy:
+            self.policy.run_memory_policy(
+                trigger="load_memory_page", scope=scope or {}
+            )
+        with self.store.read_snapshot():
+            return self.reasoning.load_memory_page(
+                frame_id=frame_id,
+                revision=revision,
+                page=page,
+                need=need,
+                purpose=purpose,
+                depth=depth,
+                scope=scope,
+                requester=requester,
+                target_processor=target_processor,
+                memory_mode=memory_mode,
+                token_or_byte_budget=token_or_byte_budget,
+                run_policy=run_policy,
+                _policy_already_run=True,
+            )
 
     def record_retrieval_outcome(
         self,
@@ -872,12 +917,13 @@ class Amos:
         requester: str = "system",
         target_processor: str = "self-model",
     ) -> dict[str, Any]:
-        return self.views.retrieve_self_awareness(
-            agent_id=agent_id,
-            scope=scope,
-            requester=requester,
-            target_processor=target_processor,
-        )
+        with self.store.read_snapshot():
+            return self.views.retrieve_self_awareness(
+                agent_id=agent_id,
+                scope=scope,
+                requester=requester,
+                target_processor=target_processor,
+            )
 
     def calibrate_self_model(
         self,
@@ -887,12 +933,20 @@ class Amos:
         actor: str = "system",
         record: bool = False,
     ) -> dict[str, Any]:
-        return self.views.calibrate_self_model(
-            agent_id=agent_id,
-            scope=scope,
-            actor=actor,
-            record=record,
-        )
+        if record:
+            return self.views.calibrate_self_model(
+                agent_id=agent_id,
+                scope=scope,
+                actor=actor,
+                record=True,
+            )
+        with self.store.read_snapshot():
+            return self.views.calibrate_self_model(
+                agent_id=agent_id,
+                scope=scope,
+                actor=actor,
+                record=False,
+            )
 
     def retrieve_agentic_recall(
         self,
@@ -903,13 +957,14 @@ class Amos:
         requester: str = "system",
         target_processor: str = "planner",
     ) -> dict[str, Any]:
-        return self.views.retrieve_agentic_recall(
-            agent_id=agent_id,
-            cues=cues,
-            scope=scope,
-            requester=requester,
-            target_processor=target_processor,
-        )
+        with self.store.read_snapshot():
+            return self.views.retrieve_agentic_recall(
+                agent_id=agent_id,
+                cues=cues,
+                scope=scope,
+                requester=requester,
+                target_processor=target_processor,
+            )
 
     def retrieve_shared_view(
         self,
@@ -919,14 +974,20 @@ class Amos:
         scope: Mapping[str, Any] | None = None,
         requester: str = "system",
         max_items: int = 20,
+        run_policy: bool = True,
     ) -> dict[str, Any]:
-        return self.views.retrieve_shared_view(
-            processor_ids=processor_ids,
-            cues=cues,
-            scope=scope,
-            requester=requester,
-            max_items=max_items,
-        )
+        if run_policy:
+            self.policy.run_memory_policy(
+                trigger="retrieve_shared_view", scope=scope or {}
+            )
+        with self.store.read_snapshot():
+            return self.views.retrieve_shared_view(
+                processor_ids=processor_ids,
+                cues=cues,
+                scope=scope,
+                requester=requester,
+                max_items=max_items,
+            )
 
     def refresh_shared_view(
         self,
@@ -936,14 +997,20 @@ class Amos:
         scope: Mapping[str, Any] | None = None,
         requester: str = "system",
         max_items: int = 20,
+        run_policy: bool = True,
     ) -> dict[str, Any]:
-        return self.views.refresh_shared_view(
-            processor_ids=processor_ids,
-            cues=cues,
-            scope=scope,
-            requester=requester,
-            max_items=max_items,
-        )
+        if run_policy:
+            self.policy.run_memory_policy(
+                trigger="refresh_shared_view", scope=scope or {}
+            )
+        with self.store.read_snapshot():
+            return self.views.refresh_shared_view(
+                processor_ids=processor_ids,
+                cues=cues,
+                scope=scope,
+                requester=requester,
+                max_items=max_items,
+            )
 
     def evaluate_procedure_execution(
         self,
@@ -956,15 +1023,16 @@ class Amos:
         rollback_plan: Mapping[str, Any] | None = None,
         review_status: str | None = None,
     ) -> dict[str, Any]:
-        return self.views.evaluate_procedure_execution(
-            procedure_ref=procedure_ref,
-            autonomous=autonomous,
-            approved_by=approved_by,
-            tool_permission_binding=tool_permission_binding,
-            preconditions_satisfied=preconditions_satisfied,
-            rollback_plan=rollback_plan,
-            review_status=review_status,
-        )
+        with self.store.read_snapshot():
+            return self.views.evaluate_procedure_execution(
+                procedure_ref=procedure_ref,
+                autonomous=autonomous,
+                approved_by=approved_by,
+                tool_permission_binding=tool_permission_binding,
+                preconditions_satisfied=preconditions_satisfied,
+                rollback_plan=rollback_plan,
+                review_status=review_status,
+            )
 
     def llm_reviewer_policy(self) -> dict[str, Any]:
         return self.stewardship.llm_reviewer_policy()

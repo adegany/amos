@@ -122,6 +122,7 @@ class RetrievalService:
         requester: str = "system",
         target_processor: str = "reasoner",
         run_policy: bool = True,
+        _policy_already_run: bool = False,
     ) -> dict[str, Any]:
         """Resolve one known evidence record with scope and access enforcement."""
 
@@ -129,7 +130,7 @@ class RetrievalService:
         if not evidence_id:
             raise ValidationError("evidence_id is required")
         self._mark_foreground_activity(requester)
-        if run_policy:
+        if run_policy and not _policy_already_run:
             self.run_memory_policy(trigger="retrieve_evidence", scope=scope or {})
         request = {
             "evidence_id": evidence_id,
@@ -177,13 +178,13 @@ class RetrievalService:
                 ),
             },
         }
-        with self.store.transaction() as conn:
-            self.store.cache_packet_feedback_receipt(
-                conn,
-                packet_id=packet_id,
-                response=packet,
-                graph_version=self.store.graph_version(),
-            )
+        self.store.persist_packet_after_read(
+            packet_id=packet_id,
+            request=request,
+            response=packet,
+            graph_version=self.store.graph_version(),
+            feedback_only=True,
+        )
         return packet
 
     def retrieve_atom(
@@ -199,6 +200,7 @@ class RetrievalService:
         include_low_health: bool = False,
         include_superseded: bool = False,
         run_policy: bool = True,
+        _policy_already_run: bool = False,
     ) -> dict[str, Any]:
         """Resolve one known atom reference without semantic ranking.
 
@@ -217,7 +219,7 @@ class RetrievalService:
         if memory_mode in {"deliberation", "historical_review"}:
             include_conflicts = True
         self._mark_foreground_activity(requester)
-        if run_policy:
+        if run_policy and not _policy_already_run:
             self.run_memory_policy(trigger="retrieve_atom", scope=scope or {})
         request = {
             "atom_id": atom_id,
@@ -342,14 +344,12 @@ class RetrievalService:
             },
             "cache_policy": {"cacheable": True, "keyed_by_graph_version": True},
         }
-        with self.store.transaction() as conn:
-            self.store.cache_packet(
-                conn,
-                packet_id=packet_id,
-                request=request,
-                response=packet,
-                graph_version=graph_version,
-            )
+        self.store.persist_packet_after_read(
+            packet_id=packet_id,
+            request=request,
+            response=packet,
+            graph_version=graph_version,
+        )
         return packet
 
     def retrieve_packet(
@@ -370,9 +370,10 @@ class RetrievalService:
         type_filter: Sequence[str] | None = None,
         attention_context: Mapping[str, Any] | None = None,
         run_policy: bool = True,
+        _policy_already_run: bool = False,
     ) -> dict[str, Any]:
         self._mark_foreground_activity(requester)
-        if run_policy:
+        if run_policy and not _policy_already_run:
             self.run_memory_policy(trigger="retrieve_packet", scope=scope or {})
         profile = DEFAULT_PACKET_PROFILES.get(
             retrieval_mode, DEFAULT_PACKET_PROFILES.get(target_processor, {})
@@ -398,6 +399,7 @@ class RetrievalService:
             max_items = max(1, max_items // 2)
         elif pressure_mode == "red":
             max_items = max(1, min(max_items, 3))
+        candidate_scan_limit = max(512, min(4096, int(max_items) * 64))
         attention_policy = self._attention_policy(attention_context)
         request = {
             "cues": list(cues or []),
@@ -415,6 +417,7 @@ class RetrievalService:
             "type_filter": list(type_filter or []),
             "attention_context": attention_policy["context"],
             "pressure_mode": pressure_mode,
+            "candidate_scan_limit": candidate_scan_limit,
             "run_policy": bool(run_policy),
         }
         graph_version = self.store.graph_version()
@@ -428,14 +431,47 @@ class RetrievalService:
         candidates: list[tuple[float, dict[str, Any]]] = []
         omissions: list[dict[str, Any]] = []
         allowed_types = set(type_filter or [])
+        filtered_types = sorted(allowed_types) if allowed_types else None
         cue_text = " ".join(request["cues"]).lower()
         cue_tokens = {token for token in re.findall(r"[a-z0-9_]+", cue_text) if token}
-        all_atoms = self.store.list_atoms_filtered(
-            types=sorted(allowed_types) if allowed_types else None,
+        total_candidate_count = self.store.atom_count_filtered(
+            types=filtered_types,
             lifecycle_states=lifecycle_states,
         )
+        base_atoms = self.store.list_atoms_filtered(
+            types=filtered_types,
+            lifecycle_states=lifecycle_states,
+            limit=candidate_scan_limit,
+            prioritize_hot=True,
+        )
+        candidate_scan_truncated = total_candidate_count > len(base_atoms)
+        semantic_query_text = " ".join(
+            [
+                cue_text,
+                *[
+                    str(term)
+                    for term in attention_policy.get("focus_terms", []) or []
+                    if str(term).strip()
+                ],
+            ]
+        ).strip()
+        cue_vector = self.smp.encode(semantic_query_text) if semantic_query_text else []
+        indexed_candidate_ids = self._indexed_retrieval_candidates(
+            cue_tokens=cue_tokens,
+            attention_policy=attention_policy,
+            eligible_atom_ids=None,
+        )
+        indexed_atoms = self.store.list_atoms_filtered(
+            types=filtered_types,
+            lifecycle_states=lifecycle_states,
+            atom_ids=sorted(set(indexed_candidate_ids or [])),
+        )
+        candidate_atoms_by_id = {
+            str(atom["id"]): atom for atom in [*base_atoms, *indexed_atoms]
+        }
+        candidate_universe = list(candidate_atoms_by_id.values())
         eligible_atoms: list[dict[str, Any]] = []
-        for atom in all_atoms:
+        for atom in candidate_universe:
             atom_ref = str(atom["id"])
             if not scope_visible(atom["scope"], request["scope"]):
                 omissions.append({"atom_ref": atom_ref, "reason": "scope_hidden"})
@@ -455,22 +491,6 @@ class RetrievalService:
             else:
                 eligible_atoms.append(atom)
         eligible_atom_ids = {str(atom["id"]) for atom in eligible_atoms}
-        semantic_query_text = " ".join(
-            [
-                cue_text,
-                *[
-                    str(term)
-                    for term in attention_policy.get("focus_terms", []) or []
-                    if str(term).strip()
-                ],
-            ]
-        ).strip()
-        cue_vector = self.smp.encode(semantic_query_text) if semantic_query_text else []
-        indexed_candidate_ids = self._indexed_retrieval_candidates(
-            cue_tokens=cue_tokens,
-            attention_policy=attention_policy,
-            eligible_atom_ids=eligible_atom_ids,
-        )
         latent_candidate_ids = self._latent_retrieval_candidates(
             eligible_atoms,
             cue_vector=cue_vector,
@@ -485,7 +505,7 @@ class RetrievalService:
             candidate_atom_ids = set(indexed_candidate_ids or [])
             candidate_atom_ids.update(latent_candidate_ids)
             atoms = self.store.list_atoms_filtered(
-                types=sorted(allowed_types) if allowed_types else None,
+                types=filtered_types,
                 lifecycle_states=lifecycle_states,
                 atom_ids=sorted(candidate_atom_ids.intersection(eligible_atom_ids)),
             )
@@ -623,10 +643,22 @@ class RetrievalService:
                     "semantic_index": "inline_rebuildable",
                     "graph_version": graph_version,
                 },
-                "reason_codes": sorted({omission["reason"] for omission in omissions}),
+                "reason_codes": sorted(
+                    {omission["reason"] for omission in omissions}
+                    | (
+                        {"candidate_scan_truncated"}
+                        if candidate_scan_truncated
+                        else set()
+                    )
+                ),
                 "vector_index_available": bool(semantic_query_text),
                 "candidate_generation": {
                     "eligible_count": len(eligible_atoms),
+                    "filtered_total_count": total_candidate_count,
+                    "scanned_count": len(base_atoms),
+                    "candidate_universe_count": len(candidate_universe),
+                    "scan_limit": candidate_scan_limit,
+                    "scan_truncated": candidate_scan_truncated,
                     "lexical_count": len(indexed_candidate_ids or []),
                     "latent_count": len(latent_candidate_ids),
                     "union_count": len(atoms),
@@ -650,14 +682,12 @@ class RetrievalService:
             },
             "cache_policy": {"cacheable": True, "keyed_by_graph_version": True},
         }
-        with self.store.transaction() as conn:
-            self.store.cache_packet(
-                conn,
-                packet_id=packet["packet_id"],
-                request=request,
-                response=packet,
-                graph_version=graph_version,
-            )
+        self.store.persist_packet_after_read(
+            packet_id=packet["packet_id"],
+            request=request,
+            response=packet,
+            graph_version=graph_version,
+        )
         return packet
 
     def _memory_lifecycle_states(
@@ -737,7 +767,7 @@ class RetrievalService:
                         *feedback["updated_edge_refs"],
                     ],
                 )
-                self.store.clear_packet_cache(conn)
+                self.store.retire_packet_cache(conn)
                 record["event"] = event
             record["feedback"] = feedback
             return record

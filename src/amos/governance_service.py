@@ -697,7 +697,7 @@ class GovernanceService:
             self.store.replace_atom(conn, updated)
             for edge in projected_edges:
                 self.store.upsert_edge(conn, edge)
-            self.store.clear_packet_cache(conn)
+            self.store.retire_packet_cache(conn)
             response = {
                 "status": "ratified",
                 "atom": updated,
@@ -953,7 +953,7 @@ class GovernanceService:
             self.store.replace_atom(conn, updated)
             for edge in projected_edges:
                 self.store.upsert_edge(conn, edge)
-            self.store.clear_packet_cache(conn)
+            self.store.retire_packet_cache(conn)
             response = {
                 "status": outcome,
                 "atom": updated,
@@ -1366,7 +1366,7 @@ class GovernanceService:
             self.store.replace_atom(conn, activated)
             for edge in projected_edges:
                 self.store.upsert_edge(conn, edge)
-            self.store.clear_packet_cache(conn)
+            self.store.retire_packet_cache(conn)
             response = {
                 "status": "replaced",
                 "prior": retired,

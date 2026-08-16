@@ -137,7 +137,22 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 body = self._read_json() if method == "POST" else {}
                 server = cast(AmosHTTPServer, self.server)
                 path = self.path.split("?", 1)[0]
-                if method == "POST" and path == "/v1/maintenance-distiller:run":
+                remaining = self._request_deadline_remaining()
+                if remaining <= 0:
+                    self._write_json(
+                        {
+                            "status": "error",
+                            "error": "request deadline exhausted before dispatch",
+                            "code": "request_deadline_exhausted",
+                            "retryable": True,
+                        },
+                        status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                    return
+                if method == "POST" and path in {
+                    "/v1/maintenance-distiller:run",
+                    "/v1/memory-policy:run",
+                }:
                     with server.service_lock:
                         closing = server.closing
                     if closing:
@@ -151,27 +166,35 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         )
                         return
                     # A semantic processor may make bounded model calls. Keep
-                    # that work off the global read/API lock, and serialize it
-                    # with the service-owned policy worker so duplicate
+                    # that work out of the request-service pool and serialize
+                    # it with the service-owned policy worker so duplicate
                     # distillations cannot contend for the same model substrate.
-                    with server.maintenance_lock:
-                        return self._write_json(
-                            server.maintenance_amos.run_maintenance_distiller(
-                                **body
-                            )
+                    if not server.maintenance_lock.acquire(timeout=remaining):
+                        self._write_json(
+                            {
+                                "status": "error",
+                                "error": (
+                                    "AMOS maintenance capacity was unavailable "
+                                    "before deadline"
+                                ),
+                                "code": "maintenance_capacity_exhausted",
+                                "retryable": True,
+                            },
+                            status=HTTPStatus.SERVICE_UNAVAILABLE,
                         )
-                remaining = self._request_deadline_remaining()
-                if remaining <= 0:
-                    self._write_json(
-                        {
-                            "status": "error",
-                            "error": "request deadline exhausted before dispatch",
-                            "code": "request_deadline_exhausted",
-                            "retryable": True,
-                        },
-                        status=HTTPStatus.SERVICE_UNAVAILABLE,
-                    )
-                    return
+                        return
+                    try:
+                        if path == "/v1/maintenance-distiller:run":
+                            return self._write_json(
+                                server.maintenance_amos.run_maintenance_distiller(
+                                    **body
+                                )
+                            )
+                        return self._write_json(
+                            server.policy_worker_amos.run_memory_policy(**body)
+                        )
+                    finally:
+                        server.maintenance_lock.release()
                 if method == "GET" and path == "/v1/ready":
                     if not server.ready_lock.acquire(timeout=remaining):
                         return self._write_saturated()
@@ -393,9 +416,17 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         "cognitive workspace request profile must be "
                         "'amos.cognitive-workspace-request.v1'"
                     )
-                return self._write_json(
-                    amos.compile_cognitive_workspace(**request)
-                )
+                policy_schedule = None
+                if bool(request.get("run_policy", False)):
+                    policy_schedule = server.memory_policy_worker.request_tick(
+                        trigger="compile_cognitive_workspace",
+                        scope=request.get("scope") or {},
+                    )
+                    request["run_policy"] = False
+                workspace = amos.compile_cognitive_workspace(**request)
+                if policy_schedule is not None:
+                    workspace["policy_schedule"] = policy_schedule
+                return self._write_json(workspace)
             if path == "/v1/interaction-projections:compile":
                 request = dict(body)
                 profile = request.pop("profile", None)
@@ -675,9 +706,31 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
             if path == "/v1/agentic-recall:retrieve":
                 return self._write_json(amos.retrieve_agentic_recall(**body))
             if path == "/v1/shared-views:retrieve":
-                return self._write_json(amos.retrieve_shared_view(**body))
+                request = dict(body)
+                policy_schedule = None
+                if bool(request.get("run_policy", True)):
+                    policy_schedule = server.memory_policy_worker.request_tick(
+                        trigger="retrieve_shared_view",
+                        scope=request.get("scope") or {},
+                    )
+                    request["run_policy"] = False
+                view = amos.retrieve_shared_view(**request)
+                if policy_schedule is not None:
+                    view["policy_schedule"] = policy_schedule
+                return self._write_json(view)
             if path == "/v1/shared-views:refresh":
-                return self._write_json(amos.refresh_shared_view(**body))
+                request = dict(body)
+                policy_schedule = None
+                if bool(request.get("run_policy", True)):
+                    policy_schedule = server.memory_policy_worker.request_tick(
+                        trigger="refresh_shared_view",
+                        scope=request.get("scope") or {},
+                    )
+                    request["run_policy"] = False
+                view = amos.refresh_shared_view(**request)
+                if policy_schedule is not None:
+                    view["policy_schedule"] = policy_schedule
+                return self._write_json(view)
             if path == "/v1/procedures:execution-policy":
                 return self._write_json(amos.evaluate_procedure_execution(**body))
             if path == "/v1/capacity:configure":

@@ -735,7 +735,7 @@ class ContinuityService:
                 }
                 self.store.put_memory_head(conn, committed)
                 committed_heads.append(committed)
-            self.store.clear_packet_cache(conn)
+            self.store.retire_packet_cache(conn)
             response = {
                 "status": "committed",
                 "profile": self.TRANSACTION_PROFILE,
@@ -1134,6 +1134,7 @@ class ContinuityService:
         recent_event_floor: int = 4,
         prior_workspace_revision: Mapping[str, Any] | None = None,
         run_policy: bool = False,
+        _policy_already_run: bool = False,
     ) -> dict[str, Any]:
         """Compile a bounded generated view anchored on one canonical event."""
 
@@ -1171,7 +1172,7 @@ class ContinuityService:
         if prior_workspace_revision is not None:
             self._mapping(prior_workspace_revision, "prior_workspace_revision")
         self._mark_foreground_activity(requester)
-        if run_policy:
+        if run_policy and not _policy_already_run:
             self.reasoning.run_memory_policy(
                 trigger="compile_cognitive_workspace", scope=request_scope
             )

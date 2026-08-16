@@ -363,14 +363,12 @@ class ViewService:
             },
             "cache_policy": {"cacheable": True, "keyed_by_graph_version": True},
         }
-        with self.store.transaction() as conn:
-            self.store.cache_packet(
-                conn,
-                packet_id=packet_id,
-                request=request,
-                response=packet,
-                graph_version=graph_version,
-            )
+        self.store.persist_packet_after_read(
+            packet_id=packet_id,
+            request=request,
+            response=packet,
+            graph_version=graph_version,
+        )
         return {
             "view": "self_awareness",
             "agent_id": agent_id,
@@ -598,6 +596,7 @@ class ViewService:
                 retrieval_mode="shared_coordination",
                 max_items=max_items,
                 include_conflicts=True,
+                run_policy=False,
             )
             packets[processor_id] = packet["packet_id"]
             graph_versions.append(packet["graph_version"])

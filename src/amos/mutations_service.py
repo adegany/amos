@@ -234,7 +234,7 @@ class MutationService:
             self.store.insert_atom(conn, normalized)
             for edge in projected_edges:
                 self.store.insert_edge(conn, edge)
-            self.store.clear_packet_cache(conn)
+            self.store.retire_packet_cache(conn)
             response = {
                 "status": "committed",
                 "atom": normalized,
@@ -383,7 +383,7 @@ class MutationService:
                     }
                 )
             if committed:
-                self.store.clear_packet_cache(conn)
+                self.store.retire_packet_cache(conn)
             if last_event is None:
                 raise RuntimeError("non-empty atom batch produced no journal event")
             response = {
@@ -564,7 +564,7 @@ class MutationService:
                 authorization_context=authorization_context,
             )
             self.store.replace_atom(conn, updated)
-            self.store.clear_packet_cache(conn)
+            self.store.retire_packet_cache(conn)
             response = {
                 "status": "updated",
                 "atom": updated,
@@ -699,6 +699,10 @@ class MutationService:
                 authorization_context=authorization_context,
             )
             self.store.replace_atom(conn, updated)
+            # Strong deletion promises that no derived packet retaining the
+            # deleted payload survives acknowledgement. Ordinary mutations
+            # can use graph-version invalidation plus bounded retirement, but
+            # deletion must physically purge the disposable cache.
             self.store.clear_packet_cache(conn)
             return {
                 "status": "deleted",
@@ -851,7 +855,7 @@ class MutationService:
                 target_refs=[merged["id"], *source_refs],
                 authorization_context={"approved_by": approved_by},
             )
-            self.store.clear_packet_cache(conn)
+            self.store.retire_packet_cache(conn)
             return {
                 "status": "merged",
                 "atom": merged,
@@ -1036,7 +1040,7 @@ class MutationService:
                         self._attach_search_index(changed), require_id=True
                     )
                     self.store.replace_atom(conn, changed)
-            self.store.clear_packet_cache(conn)
+            self.store.retire_packet_cache(conn)
             response = {
                 "status": "distilled",
                 "atom": distilled,
