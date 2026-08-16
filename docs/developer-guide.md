@@ -126,6 +126,16 @@ Append each visible or authorized private interaction with
 ```
 
 Read the current reference and version with `POST /v1/memory-heads:get`.
+When a processor needs explicitly named historical revisions, use `POST
+/v1/memory-series:versions:get` with the same scope, series kind, and series
+ID plus a bounded `versions` array. The historical-version index is rebuilt
+from committed `projected_heads`; it is an exact identity lookup, not semantic
+retrieval or an endorsement of the referenced atom's claims.
+Use `POST /v1/memory-transactions:observe` with an exact journal event ID when
+an auditor needs the transaction boundary rather than record content. The
+bounded response verifies the journal checksum and lists visible atom types,
+profiles, receipts, and head updates. `complete_visibility: false` means the
+caller must not infer absence from the filtered projection.
 Treat HTTP 409 as a stale append: refresh the head and rebuild a new
 transaction, unless replaying the exact idempotent request. Interaction events
 remain immutable and active; advancing the stream does not supersede history.

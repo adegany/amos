@@ -42,6 +42,10 @@ class ContinuityService:
     WORKSPACE_PROFILE = "amos.cognitive-workspace.v1"
     INTERACTION_PROJECTION_PROFILE = "amos.interaction-projection.v2"
     MEMORY_HEAD_PROFILE = "amos.memory-head.v1"
+    MEMORY_SERIES_VERSIONS_PROFILE = "amos.memory-series-versions.v1"
+    MEMORY_TRANSACTION_OBSERVATION_PROFILE = (
+        "amos.memory-transaction-observation.v1"
+    )
     SUPPORTED_HEAD_KINDS: ClassVar[frozenset[str]] = frozenset(
         {
             "assessment_qualification", "authority_record", "discourse_thread",
@@ -1997,6 +2001,276 @@ class ContinuityService:
             "head_version": int(head["head_version"]),
             "journal_event_id": str(head["journal_event_id"]),
             "updated_at": str(head["updated_at"]),
+            "revision": self.store.memory_revision(),
+        }
+
+    def observe_memory_transaction(
+        self,
+        *,
+        event_id: str,
+        scope: Mapping[str, Any] | None,
+        requester: str = "system",
+        target_processor: str = "reasoner",
+    ) -> dict[str, Any]:
+        """Return a bounded, access-filtered projection of one journal commit.
+
+        This is an audit read, not semantic retrieval.  It exposes the exact
+        transaction boundary (record kinds, head updates, and receipt IDs)
+        without returning the potentially very large canonical payloads.
+        """
+
+        event_id = self._required_text(event_id, "event_id")
+        request_scope = normalize_scope(scope)
+        requester = self._required_text(requester, "requester")
+        target_processor = self._required_text(
+            target_processor, "target_processor"
+        )
+        self._mark_foreground_activity(requester)
+        event = self.store.get_event(event_id)
+        absent = {
+            "status": "absent",
+            "profile": self.MEMORY_TRANSACTION_OBSERVATION_PROFILE,
+            "event_id": event_id,
+            "revision": self.store.memory_revision(),
+        }
+        if event is None or event.get("event_type") != "memory_transaction_committed":
+            return absent
+        payload = event.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        event_scope = normalize_scope(payload.get("scope"))
+        if not scope_visible(event_scope, request_scope):
+            return absent
+
+        projected_atoms = [
+            dict(item)
+            for item in payload.get("projected_atoms") or ()
+            if isinstance(item, Mapping)
+        ]
+        visible_atoms = [
+            item
+            for item in projected_atoms
+            if scope_visible(item.get("scope") or {}, request_scope)
+            and access_visible(
+                item.get("access_policy") or {},
+                requester,
+                target_processor,
+            )
+        ]
+        visible_atom_refs = {
+            str(item.get("id") or "") for item in visible_atoms if item.get("id")
+        }
+        projected_evidence = [
+            dict(item)
+            for item in payload.get("evidence") or ()
+            if isinstance(item, Mapping)
+        ]
+        visible_evidence = [
+            item
+            for item in projected_evidence
+            if scope_visible(item.get("scope") or {}, request_scope)
+            and access_visible(
+                item.get("access_policy") or {},
+                requester,
+                target_processor,
+            )
+        ]
+        visible_evidence_refs = {
+            str(item.get("evidence_id") or "")
+            for item in visible_evidence
+            if item.get("evidence_id")
+        }
+        projected_heads = [
+            dict(item)
+            for item in payload.get("projected_heads") or ()
+            if isinstance(item, Mapping)
+        ]
+        visible_heads = [
+            item
+            for item in projected_heads
+            if scope_visible(item.get("scope") or {}, request_scope)
+            and str(item.get("head_ref") or "") in visible_atom_refs
+        ]
+
+        integrity_body = {
+            key: event.get(key)
+            for key in (
+                "event_id", "event_type", "schema_version", "actor",
+                "target_refs", "payload", "payload_refs", "evidence_refs",
+                "idempotency_key", "payload_digest", "causal_parent_ids",
+                "expected_versions", "authorization_context", "occurred_at",
+                "accepted_at", "result_status", "projection_status",
+                "previous_event_hash", "graph_version",
+            )
+        }
+        checksum_valid = (
+            str(event.get("payload_digest") or "") == digest(payload)
+            and str(event.get("checksum") or "") == digest(integrity_body)
+        )
+        complete_visibility = (
+            len(visible_atoms) == len(projected_atoms)
+            and len(visible_evidence) == len(projected_evidence)
+            and len(visible_heads) == len(projected_heads)
+        )
+        return {
+            "status": "found",
+            "profile": self.MEMORY_TRANSACTION_OBSERVATION_PROFILE,
+            "verification_status": (
+                "mechanically_verified" if checksum_valid else "invalid_checksum"
+            ),
+            "complete_visibility": complete_visibility,
+            "event_id": event_id,
+            "event_type": str(event.get("event_type") or ""),
+            "actor": str(event.get("actor") or ""),
+            "idempotency_key": str(event.get("idempotency_key") or "") or None,
+            "occurred_at": str(event.get("occurred_at") or ""),
+            "accepted_at": str(event.get("accepted_at") or ""),
+            "result_status": str(event.get("result_status") or ""),
+            "projection_status": str(event.get("projection_status") or ""),
+            "graph_version": int(event.get("graph_version") or 0),
+            "payload_digest": str(event.get("payload_digest") or ""),
+            "journal_checksum": str(event.get("checksum") or ""),
+            "previous_event_hash": str(event.get("previous_event_hash") or ""),
+            "operation": str(payload.get("operation") or ""),
+            "projected_atoms": [
+                {
+                    "atom_ref": str(item.get("id") or ""),
+                    "type": str(item.get("type") or ""),
+                    "profile": str((item.get("payload") or {}).get("profile") or ""),
+                    "retention_class": str(item.get("retention_class") or ""),
+                    "lifecycle_state": str(item.get("lifecycle_state") or ""),
+                    "health_status": str(item.get("health_status") or ""),
+                    "payload_digest": digest(item.get("payload") or {}),
+                }
+                for item in visible_atoms
+            ],
+            "projected_heads": [
+                {
+                    "series_kind": str(item.get("series_kind") or ""),
+                    "series_id": str(item.get("series_id") or ""),
+                    "head_ref": str(item.get("head_ref") or ""),
+                    "head_version": int(item.get("head_version") or 0),
+                }
+                for item in visible_heads
+            ],
+            "projected_evidence": [
+                {
+                    "evidence_id": str(item.get("evidence_id") or ""),
+                    "source_type": str(item.get("source_type") or ""),
+                    "source_ref": str(item.get("source_ref") or ""),
+                    "captured_at": str(item.get("captured_at") or ""),
+                    "checksum": str(item.get("checksum") or ""),
+                }
+                for item in visible_evidence
+            ],
+            "receipt_refs": [
+                str(ref)
+                for ref in payload.get("receipt_refs") or ()
+                if str(ref) in visible_evidence_refs
+                or str(ref) in visible_atom_refs
+            ],
+            "counts": {
+                "projected_atoms": len(projected_atoms),
+                "visible_atoms": len(visible_atoms),
+                "projected_edges": len(payload.get("projected_edges") or ()),
+                "projected_heads": len(projected_heads),
+                "visible_heads": len(visible_heads),
+                "projected_evidence": len(projected_evidence),
+                "visible_evidence": len(visible_evidence),
+            },
+            "revision": self.store.memory_revision(),
+        }
+
+    def get_memory_series_versions(
+        self,
+        *,
+        scope: Mapping[str, Any] | None,
+        series_kind: str,
+        series_id: str,
+        versions: Sequence[int] | None = None,
+        requester: str = "system",
+        target_processor: str = "reasoner",
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Resolve exact historical heads without associative retrieval.
+
+        The append-only transaction journal remains authoritative.  The store's
+        history table is a rebuildable projection of each committed head update.
+        Historical atoms still pass the same scope and access checks as the
+        canonical head, and no semantic claim in their payload is endorsed.
+        """
+
+        request_scope = normalize_scope(scope)
+        requester = self._required_text(requester, "requester")
+        target_processor = self._required_text(
+            target_processor, "target_processor"
+        )
+        series_kind = self._required_text(series_kind, "series_kind")
+        series_id = self._required_text(series_id, "series_id")
+        if series_kind not in self.SUPPORTED_HEAD_KINDS:
+            raise ValidationError(f"unsupported head series_kind: {series_kind}")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValidationError("limit must be an integer between 1 and 1000")
+        requested_versions: list[int] = []
+        if versions is not None:
+            if isinstance(versions, (str, bytes)) or not isinstance(versions, Sequence):
+                raise ValidationError("versions must be an array of positive integers")
+            for value in versions:
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValidationError(
+                        "versions must contain only positive integers"
+                    )
+                if value not in requested_versions:
+                    requested_versions.append(value)
+            if len(requested_versions) > 100:
+                raise ValidationError("versions may contain at most 100 entries")
+        self._mark_foreground_activity(requester)
+        rows = self.store.list_memory_head_history(
+            scope=request_scope,
+            series_kind=series_kind,
+            series_id=series_id,
+            versions=requested_versions or None,
+            limit=max(limit, len(requested_versions)),
+        )
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            atom = self.store.get_atom(str(row["head_ref"]))
+            if (
+                atom is None
+                or atom.get("deleted")
+                or not scope_visible(atom.get("scope") or {}, request_scope)
+                or not access_visible(
+                    atom.get("access_policy") or {},
+                    requester,
+                    target_processor,
+                )
+            ):
+                continue
+            items.append({
+                "series_kind": series_kind,
+                "series_id": series_id,
+                "head_ref": str(row["head_ref"]),
+                "head_version": int(row["head_version"]),
+                "journal_event_id": str(row["journal_event_id"]),
+                "updated_at": str(row["updated_at"]),
+                "payload_digest": digest(atom.get("payload") or {}),
+                "lifecycle_state": str(atom.get("lifecycle_state") or ""),
+                "health_status": str(atom.get("health_status") or ""),
+            })
+        visible_versions = {int(item["head_version"]) for item in items}
+        missing_versions = [
+            version
+            for version in requested_versions
+            if version not in visible_versions
+        ]
+        return {
+            "status": "found" if items else "absent",
+            "profile": self.MEMORY_SERIES_VERSIONS_PROFILE,
+            "series_kind": series_kind,
+            "series_id": series_id,
+            "requested_versions": requested_versions,
+            "items": items,
+            "missing_versions": missing_versions,
+            "complete": bool(requested_versions) and not missing_versions,
             "revision": self.store.memory_revision(),
         }
 

@@ -371,6 +371,20 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 return self._write_json(
                     amos.commit_memory_transaction(**request)
                 )
+            if path == "/v1/memory-transactions:observe":
+                request = dict(body)
+                profile = request.pop("profile", None)
+                if profile not in {
+                    None,
+                    "amos.memory-transaction-observation-request.v1",
+                }:
+                    raise ValidationError(
+                        "memory transaction observation request profile must be "
+                        "'amos.memory-transaction-observation-request.v1'"
+                    )
+                return self._write_json(
+                    amos.observe_memory_transaction(**request)
+                )
             if path == "/v1/cognitive-workspaces:compile":
                 request = dict(body)
                 profile = request.pop("profile", None)
@@ -405,6 +419,20 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         "'amos.memory-head-request.v1'"
                     )
                 return self._write_json(amos.get_memory_head(**request))
+            if path == "/v1/memory-series:versions:get":
+                request = dict(body)
+                profile = request.pop("profile", None)
+                if profile not in {
+                    None,
+                    "amos.memory-series-version-request.v1",
+                }:
+                    raise ValidationError(
+                        "memory series version request profile must be "
+                        "'amos.memory-series-version-request.v1'"
+                    )
+                return self._write_json(
+                    amos.get_memory_series_versions(**request)
+                )
             if path == "/v1/memory-heads:rebuild":
                 return self._write_json(amos.rebuild_memory_heads())
             if path == "/v1/atoms:propose":

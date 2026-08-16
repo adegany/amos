@@ -124,7 +124,15 @@ sufficient. Callers need not parse error prose and may choose one bounded
 recompilation under their own processor ceiling.
 
 `POST /v1/memory-heads:get` returns an access-filtered head reference and
-version without exposing atom content. `POST
+version without exposing atom content. `POST /v1/memory-series:versions:get`
+resolves requested historical versions of the same typed series through a
+journal-rebuildable index; each returned atom still passes scope and access
+checks, and the response attests identity rather than payload truth. `POST
+/v1/memory-transactions:observe` returns a checksum-verified, access-filtered
+projection of one exact journal commit: compact atom classifications, receipt
+IDs, and the complete visible head-update boundary without the large canonical
+payloads. It supports host-side execution audits without treating journal
+identity as semantic truth. `POST
 /v1/interaction-projections:compile` returns an ordered, access-filtered event
 projection suitable for rebuilding a disposable transcript or delivery cache.
 The v2 request may additionally name a bounded set of atom types and an

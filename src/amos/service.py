@@ -657,6 +657,42 @@ class Amos:
             target_processor=target_processor,
         )
 
+    def get_memory_series_versions(
+        self,
+        *,
+        scope: Mapping[str, Any] | None,
+        series_kind: str,
+        series_id: str,
+        versions: Sequence[int] | None = None,
+        requester: str = "system",
+        target_processor: str = "reasoner",
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        return self.continuity.get_memory_series_versions(
+            scope=scope,
+            series_kind=series_kind,
+            series_id=series_id,
+            versions=versions,
+            requester=requester,
+            target_processor=target_processor,
+            limit=limit,
+        )
+
+    def observe_memory_transaction(
+        self,
+        *,
+        event_id: str,
+        scope: Mapping[str, Any] | None,
+        requester: str = "system",
+        target_processor: str = "reasoner",
+    ) -> dict[str, Any]:
+        return self.continuity.observe_memory_transaction(
+            event_id=event_id,
+            scope=scope,
+            requester=requester,
+            target_processor=target_processor,
+        )
+
     def rebuild_memory_heads(self) -> dict[str, Any]:
         return self.continuity.rebuild_memory_heads()
 

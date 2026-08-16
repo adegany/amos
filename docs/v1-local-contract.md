@@ -1231,7 +1231,9 @@ storage artifacts:
 service artifacts:
   capture_event endpoint
   atomic memory-transaction endpoint
+  access-filtered checksum-verified memory-transaction observation endpoint
   access-filtered memory-head lookup endpoint
+  access-filtered journal-projected memory-series version lookup endpoint
   cognitive-workspace compilation endpoint
   ordered interaction-projection endpoint
   journal-derived memory-head rebuild endpoint

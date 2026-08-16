@@ -352,6 +352,59 @@ def test_project_work_heads_are_typed_versioned_and_cas_guarded(amos):
     assert head["updated_at"] == stored_head["updated_at"]
     assert amos.store.get_atom("project_state_1")["lifecycle_state"] == "superseded"
 
+    history = amos.get_memory_series_versions(
+        scope=SCOPE,
+        series_kind="project_work",
+        series_id="project:continuity",
+        versions=[1, 2, 3],
+    )
+    assert history["status"] == "found"
+    assert history["complete"] is False
+    assert history["missing_versions"] == [3]
+    assert [item["head_version"] for item in history["items"]] == [1, 2]
+    assert [item["head_ref"] for item in history["items"]] == [
+        "project_state_1",
+        "project_state_2",
+    ]
+    assert all(item["journal_event_id"] for item in history["items"])
+    assert all(len(item["payload_digest"]) == 64 for item in history["items"])
+
+    observed = amos.observe_memory_transaction(
+        event_id=second["event"]["event_id"],
+        scope=SCOPE,
+        requester="project-auditor",
+        target_processor="test",
+    )
+    assert observed["status"] == "found"
+    assert observed["profile"] == "amos.memory-transaction-observation.v1"
+    assert observed["verification_status"] == "mechanically_verified"
+    assert observed["complete_visibility"] is True
+    assert observed["projected_heads"] == [{
+        "series_kind": "project_work",
+        "series_id": "project:continuity",
+        "head_ref": "project_state_2",
+        "head_version": 2,
+    }]
+    assert {
+        (item["atom_ref"], item["profile"])
+        for item in observed["projected_atoms"]
+    } >= {("project_state_2", "example.project-work-object.v1")}
+    assert observed["counts"]["projected_heads"] == 1
+
+    amos.store.conn.execute("DELETE FROM amos_memory_head_history")
+    amos.rebuild_memory_heads()
+    rebuilt = amos.get_memory_series_versions(
+        scope=SCOPE,
+        series_kind="project_work",
+        series_id="project:continuity",
+        versions=[1, 2],
+    )
+    assert rebuilt["complete"] is True
+    assert [item["head_ref"] for item in rebuilt["items"]] == [
+        "project_state_1",
+        "project_state_2",
+    ]
+
 
 def test_memory_transaction_reuses_existing_edge_without_rejournal_projection(amos):
     amos.commit_memory_atoms(
@@ -1448,8 +1501,38 @@ def test_http_memory_transaction_workspace_and_cas_conflict(tmp_path):
         assert head["status"] == "found"
         assert head["head_ref"] == "event_http_1"
         assert head["head_version"] == 1
-        assert head["journal_event_id"] == committed["journal_event_id"]
+        assert head["journal_event_id"] == committed["event"]["event_id"]
         assert head["updated_at"]
+        versions = post(
+            "/v1/memory-series:versions:get",
+            {
+                "profile": "amos.memory-series-version-request.v1",
+                "scope": SCOPE,
+                "series_kind": "interaction_stream",
+                "series_id": "main",
+                "versions": [1, 2],
+                "requester": "human:participant",
+                "target_processor": "participant-ui",
+            },
+        )
+        assert versions["profile"] == "amos.memory-series-versions.v1"
+        assert [item["head_ref"] for item in versions["items"]] == [
+            "event_http_1"
+        ]
+        assert versions["missing_versions"] == [2]
+        observed = post(
+            "/v1/memory-transactions:observe",
+            {
+                "profile": "amos.memory-transaction-observation-request.v1",
+                "event_id": committed["event"]["event_id"],
+                "scope": SCOPE,
+                "requester": "human:participant",
+                "target_processor": "participant-ui",
+            },
+        )
+        assert observed["profile"] == "amos.memory-transaction-observation.v1"
+        assert observed["verification_status"] == "mechanically_verified"
+        assert observed["projected_heads"][0]["head_ref"] == "event_http_1"
 
         with pytest.raises(urllib.error.HTTPError) as captured:
             post(

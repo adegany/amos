@@ -256,6 +256,26 @@ class SQLiteStore:
             CREATE INDEX IF NOT EXISTS idx_memory_heads_ref
                 ON amos_memory_heads(head_ref);
 
+            CREATE TABLE IF NOT EXISTS amos_memory_head_history (
+                scope_digest TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                series_kind TEXT NOT NULL,
+                series_id TEXT NOT NULL,
+                head_version INTEGER NOT NULL,
+                head_ref TEXT NOT NULL,
+                journal_event_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(
+                    scope_digest, series_kind, series_id, head_version
+                )
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_head_history_ref
+                ON amos_memory_head_history(head_ref);
+            CREATE INDEX IF NOT EXISTS idx_memory_head_history_series
+                ON amos_memory_head_history(
+                    scope_digest, series_kind, series_id, head_version
+                );
+
             CREATE TABLE IF NOT EXISTS amos_idempotency (
                 actor TEXT NOT NULL,
                 idempotency_key TEXT NOT NULL,
@@ -318,6 +338,7 @@ class SQLiteStore:
             if self._get_meta(conn, "last_event_hash") is None:
                 self._set_meta(conn, "last_event_hash", "genesis")
             self._restore_memory_heads_if_needed(conn)
+            self._restore_memory_head_history_if_needed(conn)
             self._backfill_atom_text_index(conn)
 
     def _migrate_edge_derivation(self, conn: sqlite3.Connection) -> None:
@@ -397,6 +418,28 @@ class SQLiteStore:
         if event is not None:
             self._rebuild_memory_heads(conn)
 
+    def _restore_memory_head_history_if_needed(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """Backfill the version index from the canonical transaction journal."""
+
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM amos_memory_head_history"
+        ).fetchone()
+        if int(row["count"] or 0) > 0:
+            return
+        event = conn.execute(
+            """
+            SELECT 1
+            FROM amos_event_journal
+            WHERE event_type = 'memory_transaction_committed'
+              AND json_array_length(json_extract(payload, '$.projected_heads')) > 0
+            LIMIT 1
+            """
+        ).fetchone()
+        if event is not None:
+            self._rebuild_memory_heads(conn)
+
     def get_memory_head(
         self,
         *,
@@ -437,6 +480,43 @@ class SQLiteStore:
         rows = self.conn.execute(query, tuple(params)).fetchall()
         return [self._row_dict(row) for row in rows]
 
+    def list_memory_head_history(
+        self,
+        *,
+        scope: Mapping[str, Any],
+        series_kind: str,
+        series_id: str,
+        versions: Sequence[int] | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return exact journal-projected versions for one memory series."""
+
+        bounded_limit = max(1, min(1000, int(limit)))
+        params: list[Any] = [
+            digest(dict(scope)),
+            str(series_kind),
+            str(series_id),
+        ]
+        query = """
+            SELECT *
+            FROM amos_memory_head_history
+            WHERE scope_digest = ? AND series_kind = ? AND series_id = ?
+        """
+        exact_versions = list(dict.fromkeys(
+            int(version) for version in (versions or ())
+        ))
+        if exact_versions:
+            placeholders = ", ".join("?" for _ in exact_versions)
+            query += f" AND head_version IN ({placeholders})"
+            params.extend(exact_versions)
+            query += " ORDER BY head_version ASC"
+        else:
+            query += " ORDER BY head_version DESC"
+        query += " LIMIT ?"
+        params.append(bounded_limit)
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [self._row_dict(row) for row in rows]
+
     def put_memory_head(
         self, conn: sqlite3.Connection, head: Mapping[str, Any]
     ) -> None:
@@ -466,9 +546,36 @@ class SQLiteStore:
                 str(head["updated_at"]),
             ),
         )
+        conn.execute(
+            """
+            INSERT INTO amos_memory_head_history(
+                scope_digest, scope, series_kind, series_id, head_version,
+                head_ref, journal_event_id, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(
+                scope_digest, series_kind, series_id, head_version
+            ) DO UPDATE SET
+                scope = excluded.scope,
+                head_ref = excluded.head_ref,
+                journal_event_id = excluded.journal_event_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                digest(scope),
+                canonical_json(scope),
+                str(head["series_kind"]),
+                str(head["series_id"]),
+                int(head["head_version"]),
+                str(head["head_ref"]),
+                str(head["journal_event_id"]),
+                str(head["updated_at"]),
+            ),
+        )
 
     def _rebuild_memory_heads(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
         conn.execute("DELETE FROM amos_memory_heads")
+        conn.execute("DELETE FROM amos_memory_head_history")
         rows = conn.execute(
             """
             SELECT event_id, accepted_at, payload
@@ -1859,6 +1966,15 @@ class SQLiteStore:
             "SELECT COUNT(*) AS count FROM amos_event_journal"
         ).fetchone()
         return int(row["count"])
+
+    def get_event(self, event_id: str) -> dict[str, Any] | None:
+        """Return one exact canonical journal event by its immutable ID."""
+
+        row = self.conn.execute(
+            "SELECT * FROM amos_event_journal WHERE event_id = ?",
+            (str(event_id),),
+        ).fetchone()
+        return None if row is None else self._row_dict(row)
 
     def list_events(self, *, limit: int | None = None) -> list[dict[str, Any]]:
         if limit is None:
