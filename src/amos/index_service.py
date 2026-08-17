@@ -4,6 +4,7 @@ from ._service_support import (
     Any,
     DEFAULT_MEMORY_POLICY,
     Mapping,
+    Sequence,
     SEARCH_INDEX_REF,
     SEARCH_INDEX_SCHEMA,
     _top_symmetric_components,
@@ -26,6 +27,17 @@ _REFERENCE_TOKEN = re.compile(
     r"^(?:atom|evt|evd|thread|cycle|repisode|curriculum|endogenous_work|"
     r"kproject|agent_project)_[a-z0-9_-]{8,}$"
 )
+
+_SKILL_BINDING_PROFILE = "cogito.skill-definition-binding.v2"
+_SKILL_FAMILY_PROFILE = "cogito.skill-family-definition.v1"
+_SKILL_SEMANTIC_PROFILE = "cogito.skill-semantic-node.v1"
+_SKILL_SELECTION_POSITIVE_FIELDS = (
+    "semantic_capabilities",
+    "input_shapes",
+    "work_products",
+    "retrieval_examples",
+)
+_SKILL_SELECTION_NEGATIVE_FIELDS = ("exclusions",)
 
 
 def _content_token(token: str) -> bool:
@@ -68,7 +80,61 @@ class IndexService:
         )
 
     def _search_text_for_atom(self, atom: Mapping[str, Any]) -> str:
-        return self._search_text_for_value(atom.get("payload", {})).lower()
+        payload = atom.get("payload", {})
+        if not isinstance(payload, Mapping):
+            return self._search_text_for_value(payload).lower()
+        profile = str(payload.get("profile") or "")
+        if profile == _SKILL_BINDING_PROFILE:
+            selection = payload.get("selection_contract")
+            selection = selection if isinstance(selection, Mapping) else {}
+            return self._search_text_for_value(
+                {
+                    "skill_id": payload.get("skill_id"),
+                    "skill_name": payload.get("skill_name"),
+                    "description": payload.get("description"),
+                    "family_refs": payload.get("family_refs"),
+                    "selection_contract": {
+                        field: selection.get(field)
+                        for field in _SKILL_SELECTION_POSITIVE_FIELDS
+                        if selection.get(field)
+                    },
+                }
+            ).lower()
+        if profile == _SKILL_FAMILY_PROFILE:
+            return self._search_text_for_value(
+                {
+                    "family_id": payload.get("family_id"),
+                    "name": payload.get("name"),
+                    "description": payload.get("description"),
+                }
+            ).lower()
+        if profile == _SKILL_SEMANTIC_PROFILE:
+            return self._search_text_for_value(
+                {
+                    "semantic_context_key": payload.get("semantic_context_key"),
+                    "name": payload.get("name"),
+                    "description": payload.get("description"),
+                    "retrieval_examples": payload.get("retrieval_examples"),
+                }
+            ).lower()
+        return self._search_text_for_value(payload).lower()
+
+
+    def _negative_search_text_for_atom(self, atom: Mapping[str, Any]) -> str:
+        payload = atom.get("payload", {})
+        if not isinstance(payload, Mapping):
+            return ""
+        if str(payload.get("profile") or "") != _SKILL_BINDING_PROFILE:
+            return ""
+        selection = payload.get("selection_contract")
+        selection = selection if isinstance(selection, Mapping) else {}
+        return self._search_text_for_value(
+            {
+                field: selection.get(field)
+                for field in _SKILL_SELECTION_NEGATIVE_FIELDS
+                if selection.get(field)
+            }
+        ).lower()
 
 
     def _search_text_for_value(self, value: Any) -> str:
@@ -92,14 +158,37 @@ class IndexService:
     def _search_index_for_atom(self, atom: Mapping[str, Any]) -> dict[str, Any]:
         self._sync_smp_vector_model()
         text = self._search_text_for_atom(atom)
-        raw_tokens = {token for token in re.findall(r"[a-z0-9_]+", text) if token}
-        tokens = set(raw_tokens)
-        for token in raw_tokens:
-            tokens.update(part for part in token.split("_") if part)
-        tokens = sorted(token for token in tokens if _content_token(token))
+        negative_text = self._negative_search_text_for_atom(atom)
+
+        def semantic_tokens(value: str) -> list[str]:
+            raw_tokens = {
+                token for token in re.findall(r"[a-z0-9_]+", value) if token
+            }
+            expanded = set(raw_tokens)
+            for token in raw_tokens:
+                expanded.update(part for part in token.split("_") if part)
+            return sorted(token for token in expanded if _content_token(token))
+
+        tokens = semantic_tokens(text)
+        negative_tokens = semantic_tokens(negative_text)
+        payload = atom.get("payload", {})
+        selection = (
+            payload.get("selection_contract")
+            if isinstance(payload, Mapping)
+            else None
+        )
+        selection = selection if isinstance(selection, Mapping) else {}
         return {
             "text": text,
             "tokens": tokens,
+            "negative_text": negative_text,
+            "negative_tokens": negative_tokens,
+            "negative_phrases": [
+                str(item).strip().lower()
+                for field in _SKILL_SELECTION_NEGATIVE_FIELDS
+                for item in selection.get(field, []) or []
+                if str(item).strip()
+            ],
             "vector": self.smp.encode(text),
             "processor_id": self.smp.processor_id,
             "processor_version": self.smp.processor_version,
@@ -137,6 +226,15 @@ class IndexService:
                         "text": text,
                         "tokens": [str(token) for token in tokens],
                         "vector": [float(value) for value in vector],
+                        "negative_text": str(stored.get("negative_text") or ""),
+                        "negative_tokens": [
+                            str(token)
+                            for token in stored.get("negative_tokens", []) or []
+                        ],
+                        "negative_phrases": [
+                            str(phrase)
+                            for phrase in stored.get("negative_phrases", []) or []
+                        ],
                         "vector_model": dict(stored.get("vector_model") or {}),
                     }
                     stale = not self.smp._stored_vector_matches(stored)
@@ -504,6 +602,7 @@ class IndexService:
         cue_tokens: set[str],
         attention_policy: Mapping[str, Any],
         eligible_atom_ids: set[str] | None = None,
+        payload_filter: Mapping[str, Sequence[str]] | None = None,
         limit: int = 512,
         neighbor_edge_limit: int | None = None,
     ) -> list[str] | None:
@@ -520,16 +619,15 @@ class IndexService:
             normalized,
             limit=limit,
             eligible_atom_ids=eligible_atom_ids,
+            payload_filter=payload_filter,
         )
         if not direct:
             return []
-        candidates = set(direct)
         neighbors = self.store.neighbor_atom_ids(
             direct, edge_limit=neighbor_edge_limit
         )
         if eligible_atom_ids is not None:
             neighbors = [ref for ref in neighbors if ref in eligible_atom_ids]
-        candidates.update(neighbors)
         # A bounded second hop lets a directly relevant memory activate a
         # short associative chain without turning retrieval into a graph scan.
         second_hop = self.store.neighbor_atom_ids(
@@ -537,8 +635,11 @@ class IndexService:
         )
         if eligible_atom_ids is not None:
             second_hop = [ref for ref in second_hop if ref in eligible_atom_ids]
-        candidates.update(second_hop)
-        return sorted(candidates)[: max(limit * 2, limit)]
+        # Preserve retrieval topology in the bounded pool: ranked direct hits
+        # first, then their first-hop bindings, then the weaker second hop.
+        return list(dict.fromkeys((*direct, *neighbors, *second_hop)))[
+            : max(limit * 2, limit)
+        ]
 
 
     def _invalidate_packet_cache(

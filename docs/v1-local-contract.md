@@ -648,6 +648,12 @@ GET /v1/health/memory
 POST /v1/packets:retrieve
   returns a packet from the current graph view
   defaults to memory_mode operational_recall, which admits active atoms only
+  accepts optional top-level payload_filter fields (AND across fields, OR
+  across each field's values) before candidate generation
+  accepts optional result_payload_filter fields after graph activation, so
+  helper nodes can activate an eligible result without consuming a packet slot
+  supports retrieval_mode skill_discovery for per-cue MaxSim ranking,
+  applicability-exclusion penalties, and typed skill-graph traversal
   queues a background policy tick when run_policy is true
 
 POST /v1/atoms:get

@@ -1221,7 +1221,7 @@ MemoryPacketRequest
   request_id
   client_identity
   target_processor
-  retrieval_mode: general | self_awareness | shared_coordination | agentic_recall
+  retrieval_mode: general | self_awareness | shared_coordination | agentic_recall | skill_discovery
   attention_context
   task_context
   scope
@@ -1230,6 +1230,8 @@ MemoryPacketRequest
   agency_attribution_filter
   bias_guardrails
   requested_memory_types
+  payload_filter
+  result_payload_filter
   max_items
   token_or_byte_budget
   consistency_requirement
@@ -3252,8 +3254,11 @@ POST /v1/packets:retrieve
 POST /v1/retrieval-outcomes
   request payload: packet_id, original retrieval request, outcome labels,
   used_item_refs, helpful_atom_refs, correction_refs, unhelpful_atom_refs,
-  optional use_status such as used, context_only, ignored, or unused
+  optional use_status such as used, context_only, ignored, or unused, and
+  optional bounded missing_capability_cues for a caller-observed coverage gap
   response payload: retrieval outcome record refs and created_at
+  missing-capability cues are audit telemetry only and never authorize feedback
+  against an atom that was not present in the exact packet
   consistency: eventual
 
 POST /v1/maintenance:request

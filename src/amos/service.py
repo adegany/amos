@@ -487,6 +487,8 @@ class Amos:
         include_low_health: bool = False,
         include_superseded: bool = False,
         type_filter: Sequence[str] | None = None,
+        payload_filter: Mapping[str, Sequence[Any]] | None = None,
+        result_payload_filter: Mapping[str, Sequence[Any]] | None = None,
         attention_context: Mapping[str, Any] | None = None,
         run_policy: bool = True,
     ) -> dict[str, Any]:
@@ -509,6 +511,8 @@ class Amos:
                 include_low_health=include_low_health,
                 include_superseded=include_superseded,
                 type_filter=type_filter,
+                payload_filter=payload_filter,
+                result_payload_filter=result_payload_filter,
                 attention_context=attention_context,
                 run_policy=run_policy,
                 _policy_already_run=True,

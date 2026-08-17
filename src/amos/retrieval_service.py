@@ -32,6 +32,20 @@ MEMORY_MODES = {
     "operational_recall",
 }
 
+SKILL_RETRIEVAL_WEIGHTS = {
+    **RETRIEVAL_WEIGHTS,
+    "direct_cue_match": 0.28,
+    "semantic_similarity": 0.30,
+    "edge_activation": 0.24,
+    "recency": 0.0,
+    "utility": 0.02,
+    "salience": 0.02,
+    "scope_specificity": 0.02,
+    "procedural_applicability": 0.08,
+    "attention_focus": 0.08,
+    "applicability_exclusion": -0.35,
+}
+
 
 class RetrievalService:
     def __init__(
@@ -352,6 +366,85 @@ class RetrievalService:
         )
         return packet
 
+    @staticmethod
+    def _normalize_payload_filter(
+        value: Mapping[str, Sequence[Any]] | None,
+    ) -> dict[str, tuple[str, ...]]:
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise ValidationError("payload filters must be objects")
+        if len(value) > 16:
+            raise ValidationError("payload filters are limited to 16 fields")
+        normalized: dict[str, tuple[str, ...]] = {}
+        for raw_field, raw_values in value.items():
+            field = str(raw_field or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", field):
+                raise ValidationError("payload filter fields must be top-level names")
+            if isinstance(raw_values, (str, bytes)) or not isinstance(
+                raw_values, Sequence
+            ):
+                raise ValidationError("payload filter values must be arrays")
+            values = tuple(
+                dict.fromkeys(str(item) for item in raw_values if str(item))
+            )
+            if len(values) > 2048:
+                raise ValidationError(
+                    "payload filter values are limited to 2048 entries per field"
+                )
+            normalized[field] = values
+        return normalized
+
+    @staticmethod
+    def _payload_matches_filter(
+        atom: Mapping[str, Any],
+        payload_filter: Mapping[str, Sequence[str]],
+    ) -> bool:
+        if not payload_filter:
+            return True
+        payload = atom.get("payload")
+        if not isinstance(payload, Mapping):
+            return False
+        return all(
+            str(payload.get(field) or "") in set(values)
+            for field, values in payload_filter.items()
+        )
+
+    @staticmethod
+    def _cue_token_sets(cues: Sequence[str]) -> tuple[set[str], ...]:
+        return tuple(
+            {
+                token
+                for token in re.findall(r"[a-z0-9_]+", str(cue).lower())
+                if token
+            }
+            for cue in cues
+            if str(cue).strip()
+        )
+
+    @staticmethod
+    def _lexical_cue_score(
+        *,
+        text: str,
+        text_tokens: set[str],
+        cues: Sequence[str],
+        cue_token_sets: Sequence[set[str]],
+    ) -> tuple[bool, float]:
+        direct = False
+        best = 0.0
+        for cue, tokens in zip(cues, cue_token_sets):
+            normalized = str(cue).lower().strip()
+            if normalized and normalized in text:
+                direct = True
+                best = 1.0
+                continue
+            if tokens:
+                best = max(
+                    best,
+                    len(tokens.intersection(text_tokens)) / max(1, len(tokens)),
+                )
+        return direct, min(1.0, best)
+
     def retrieve_packet(
         self,
         *,
@@ -368,6 +461,8 @@ class RetrievalService:
         include_low_health: bool = False,
         include_superseded: bool = False,
         type_filter: Sequence[str] | None = None,
+        payload_filter: Mapping[str, Sequence[Any]] | None = None,
+        result_payload_filter: Mapping[str, Sequence[Any]] | None = None,
         attention_context: Mapping[str, Any] | None = None,
         run_policy: bool = True,
         _policy_already_run: bool = False,
@@ -392,6 +487,10 @@ class RetrievalService:
         if memory_mode == "deliberation":
             attention_context = dict(attention_context or {})
             attention_context["counterevidence_required"] = True
+        payload_filter = self._normalize_payload_filter(payload_filter)
+        result_payload_filter = self._normalize_payload_filter(
+            result_payload_filter
+        )
         pressure_mode = self._capacity_pressure_mode()
         pressure_degraded = pressure_mode in {"orange", "red"}
         original_max_items = max_items
@@ -415,6 +514,12 @@ class RetrievalService:
             "include_low_health": include_low_health,
             "include_superseded": include_superseded,
             "type_filter": list(type_filter or []),
+            "payload_filter": {
+                key: list(values) for key, values in payload_filter.items()
+            },
+            "result_payload_filter": {
+                key: list(values) for key, values in result_payload_filter.items()
+            },
             "attention_context": attention_policy["context"],
             "pressure_mode": pressure_mode,
             "candidate_scan_limit": candidate_scan_limit,
@@ -432,39 +537,46 @@ class RetrievalService:
         omissions: list[dict[str, Any]] = []
         allowed_types = set(type_filter or [])
         filtered_types = sorted(allowed_types) if allowed_types else None
-        cue_text = " ".join(request["cues"]).lower()
-        cue_tokens = {token for token in re.findall(r"[a-z0-9_]+", cue_text) if token}
+        request_cues = tuple(
+            dict.fromkeys(
+                str(cue).strip()
+                for cue in request["cues"]
+                if str(cue).strip()
+            )
+        )
+        semantic_cues = request_cues or tuple(
+            str(term).strip()
+            for term in attention_policy.get("focus_terms", []) or []
+            if str(term).strip()
+        )
+        cue_text = " ".join(semantic_cues).lower()
+        cue_token_sets = self._cue_token_sets(semantic_cues)
+        cue_tokens = set().union(*cue_token_sets) if cue_token_sets else set()
+        cue_vectors = tuple(self.smp.encode(cue) for cue in semantic_cues)
         total_candidate_count = self.store.atom_count_filtered(
             types=filtered_types,
             lifecycle_states=lifecycle_states,
+            payload_filter=payload_filter,
         )
         base_atoms = self.store.list_atoms_filtered(
             types=filtered_types,
             lifecycle_states=lifecycle_states,
+            payload_filter=payload_filter,
             limit=candidate_scan_limit,
             prioritize_hot=True,
         )
-        candidate_scan_truncated = total_candidate_count > len(base_atoms)
-        semantic_query_text = " ".join(
-            [
-                cue_text,
-                *[
-                    str(term)
-                    for term in attention_policy.get("focus_terms", []) or []
-                    if str(term).strip()
-                ],
-            ]
-        ).strip()
-        cue_vector = self.smp.encode(semantic_query_text) if semantic_query_text else []
+        candidate_scan_truncated = total_candidate_count > candidate_scan_limit
         indexed_candidate_ids = self._indexed_retrieval_candidates(
             cue_tokens=cue_tokens,
             attention_policy=attention_policy,
             eligible_atom_ids=None,
+            payload_filter=payload_filter,
         )
         indexed_atoms = self.store.list_atoms_filtered(
             types=filtered_types,
             lifecycle_states=lifecycle_states,
             atom_ids=sorted(set(indexed_candidate_ids or [])),
+            payload_filter=payload_filter,
         )
         candidate_atoms_by_id = {
             str(atom["id"]): atom for atom in [*base_atoms, *indexed_atoms]
@@ -493,7 +605,7 @@ class RetrievalService:
         eligible_atom_ids = {str(atom["id"]) for atom in eligible_atoms}
         latent_candidate_ids = self._latent_retrieval_candidates(
             eligible_atoms,
-            cue_vector=cue_vector,
+            cue_vectors=cue_vectors,
             limit=max(64, int(max_items) * 8),
             minimum_similarity=(
                 0.55 if indexed_candidate_ids else SEMANTIC_MATCH_THRESHOLD
@@ -514,7 +626,7 @@ class RetrievalService:
         edge_degrees = self._hot_graph_edge_degree_counts(atoms)
         edge_activation_scores, association_traces = self._graph_activation_scores(
             atoms,
-            cues=request["cues"],
+            cues=semantic_cues,
             request_scope=request["scope"],
             requester=requester,
             target_processor=target_processor,
@@ -522,7 +634,10 @@ class RetrievalService:
             include_low_health=bool(include_low_health),
             cue_text=cue_text,
             cue_tokens=cue_tokens,
+            cue_token_sets=cue_token_sets,
+            cue_vectors=cue_vectors,
             attention_policy=attention_policy,
+            retrieval_mode=retrieval_mode,
             superseded_refs=superseded_refs if not include_superseded else None,
         )
         for atom in atoms:
@@ -555,12 +670,13 @@ class RetrievalService:
                 continue
             score, matched, components = self._rank_atom(
                 atom,
-                request["cues"],
+                semantic_cues,
                 request_scope=request["scope"],
                 retrieval_mode=retrieval_mode,
                 cue_text=cue_text,
                 cue_tokens=cue_tokens,
-                cue_vector=cue_vector,
+                cue_token_sets=cue_token_sets,
+                cue_vectors=cue_vectors,
                 edge_degrees=edge_degrees,
                 edge_activation_scores=edge_activation_scores,
                 attention_policy=attention_policy,
@@ -568,6 +684,10 @@ class RetrievalService:
             )
             if request["cues"] and not matched:
                 omissions.append({"atom_ref": atom_ref, "reason": "low_relevance"})
+                continue
+            if result_payload_filter and not self._payload_matches_filter(
+                atom, result_payload_filter
+            ):
                 continue
             atom = {
                 **atom,
@@ -651,7 +771,7 @@ class RetrievalService:
                         else set()
                     )
                 ),
-                "vector_index_available": bool(semantic_query_text),
+                "vector_index_available": bool(cue_vectors),
                 "candidate_generation": {
                     "eligible_count": len(eligible_atoms),
                     "filtered_total_count": total_candidate_count,
@@ -711,18 +831,24 @@ class RetrievalService:
         self,
         atoms: Sequence[Mapping[str, Any]],
         *,
-        cue_vector: Sequence[float],
+        cue_vectors: Sequence[Sequence[float]],
         limit: int,
         minimum_similarity: float,
     ) -> list[str]:
         """Select an independent semantic pool before lexical capping."""
 
-        if not cue_vector:
+        if not cue_vectors:
             return []
         scored: list[tuple[float, str]] = []
         for atom in atoms:
-            search_index = self._atom_search_index(atom, allow_stale=True)
-            similarity = cosine(cue_vector, search_index.get("vector") or [])
+            search_index = self._atom_search_index(atom)
+            similarity = max(
+                (
+                    cosine(cue_vector, search_index.get("vector") or [])
+                    for cue_vector in cue_vectors
+                ),
+                default=0.0,
+            )
             if similarity >= float(minimum_similarity):
                 scored.append((similarity, str(atom["id"])))
         scored.sort(key=lambda item: (-item[0], item[1]))
@@ -784,6 +910,17 @@ class RetrievalService:
         del request
         reported_positive, reported_corrections = self._retrieval_outcome_atom_refs(
             outcome
+        )
+        raw_missing_capabilities = outcome.get("missing_capability_cues")
+        missing_capability_cues = (
+            tuple(dict.fromkeys(
+                str(cue).strip()[:600]
+                for cue in raw_missing_capabilities
+                if str(cue).strip()
+            ))[:24]
+            if isinstance(raw_missing_capabilities, Sequence)
+            and not isinstance(raw_missing_capabilities, (str, bytes))
+            else ()
         )
         packet = self.store.get_cached_packet_by_id(packet_id)
         if packet is None:
@@ -957,6 +1094,7 @@ class RetrievalService:
             "ignored_non_packet_evidence_refs": sorted(
                 reported_evidence_refs - packet_evidence_refs
             ),
+            "missing_capability_cues": list(missing_capability_cues),
             "feedback_contract": "packet_items_only",
         }
 
@@ -1269,7 +1407,10 @@ class RetrievalService:
         include_low_health: bool,
         cue_text: str,
         cue_tokens: set[str],
+        cue_token_sets: Sequence[set[str]],
+        cue_vectors: Sequence[Sequence[float]],
         attention_policy: Mapping[str, Any] | None,
+        retrieval_mode: str = "general",
         superseded_refs: Mapping[str, Sequence[str]] | None = None,
         edge_scan_limit: int | None = None,
     ) -> tuple[dict[str, float], dict[str, list[dict[str, Any]]]]:
@@ -1290,12 +1431,22 @@ class RetrievalService:
             if superseded_refs and atom_ref in superseded_refs:
                 continue
             eligible_refs.add(atom_ref)
-            search_index = self._atom_search_index(atom, allow_stale=True)
+            search_index = self._atom_search_index(atom)
             text = str(search_index["text"])
             text_tokens = set(str(token) for token in search_index["tokens"])
-            direct = any(cue.lower() in text for cue in cues if cue)
-            overlap = len(cue_tokens.intersection(text_tokens))
-            cue_score = 1.0 if direct else min(1.0, overlap / max(1, len(cue_tokens)))
+            direct, cue_score = self._lexical_cue_score(
+                text=text,
+                text_tokens=text_tokens,
+                cues=cues,
+                cue_token_sets=cue_token_sets,
+            )
+            semantic_similarity = max(
+                (
+                    cosine(vector, search_index.get("vector") or [])
+                    for vector in cue_vectors
+                ),
+                default=0.0,
+            )
             attention = self._attention_score_components(
                 atom,
                 text=text,
@@ -1303,7 +1454,15 @@ class RetrievalService:
                 edge_degree=0,
                 attention_policy=attention_policy,
             )
-            seed = max(cue_score, float(attention.get("attention_focus", 0.0) or 0.0))
+            seed = max(
+                1.0 if direct else cue_score,
+                (
+                    semantic_similarity
+                    if semantic_similarity >= SEMANTIC_MATCH_THRESHOLD
+                    else 0.0
+                ),
+                float(attention.get("attention_focus", 0.0) or 0.0),
+            )
             if seed > 0:
                 seed_strengths[atom_ref] = seed
         if not seed_strengths:
@@ -1334,9 +1493,34 @@ class RetrievalService:
         for edge in edges:
             source = str(edge["source_ref"])
             target = str(edge["target_ref"])
-            relation_weight = self._edge_relation_activation_weight(
-                str(edge.get("relation") or "")
-            )
+            relation = str(edge.get("relation") or "")
+            relation_weight = self._edge_relation_activation_weight(relation)
+            if retrieval_mode == "skill_discovery":
+                source_payload = atoms_by_ref[source].get("payload")
+                target_payload = atoms_by_ref[target].get("payload")
+                source_role = (
+                    str(source_payload.get("semantic_role") or "")
+                    if isinstance(source_payload, Mapping)
+                    else ""
+                )
+                target_role = (
+                    str(target_payload.get("semantic_role") or "")
+                    if isinstance(target_payload, Mapping)
+                    else ""
+                )
+                if relation in {"rel:has_capability", "rel:supports"}:
+                    relation_weight = 0.95
+                elif relation == "rel:applies_to":
+                    relation_weight = 0.9
+                elif relation == "rel:part_of" and {
+                    source_role,
+                    target_role,
+                } == {"agent_skill", "skill_family"}:
+                    relation_weight = 0.75
+                else:
+                    relation_weight = 0.0
+            if relation_weight <= 0.0:
+                continue
             telemetry = (edge.get("derivation") or {}).get("retrieval_telemetry", {})
             telemetry = telemetry if isinstance(telemetry, Mapping) else {}
             used = int(telemetry.get("used_count", 0) or 0)
@@ -1392,30 +1576,48 @@ class RetrievalService:
         retrieval_mode: str = "general",
         cue_text: str | None = None,
         cue_tokens: set[str] | None = None,
-        cue_vector: Sequence[float] | None = None,
+        cue_token_sets: Sequence[set[str]] | None = None,
+        cue_vectors: Sequence[Sequence[float]] | None = None,
         edge_degrees: Mapping[str, int] | None = None,
         edge_activation_scores: Mapping[str, float] | None = None,
         attention_policy: Mapping[str, Any] | None = None,
         superseded_refs: Mapping[str, Sequence[str]] | None = None,
     ) -> tuple[float, bool, dict[str, float]]:
-        search_index = self._atom_search_index(atom, allow_stale=True)
+        search_index = self._atom_search_index(atom)
         text = str(search_index["text"])
-        cue_text = " ".join(cues).lower() if cue_text is None else cue_text
-        cue_tokens = (
-            {token for token in re.findall(r"[a-z0-9_]+", cue_text) if token}
-            if cue_tokens is None
-            else cue_tokens
+        normalized_cues = tuple(str(cue).strip() for cue in cues if str(cue).strip())
+        cue_text = " ".join(normalized_cues).lower() if cue_text is None else cue_text
+        cue_token_sets = (
+            self._cue_token_sets(normalized_cues)
+            if cue_token_sets is None
+            else tuple(cue_token_sets)
         )
+        cue_tokens = (
+            set().union(*cue_token_sets) if cue_token_sets else set()
+        ) if cue_tokens is None else cue_tokens
         text_tokens = set(str(token) for token in search_index["tokens"])
-        direct = any(cue.lower() in text for cue in cues if cue)
-        overlap = len(cue_tokens.intersection(text_tokens))
-        matched = direct or overlap > 0 or not cue_tokens
+        direct, direct_score = self._lexical_cue_score(
+            text=text,
+            text_tokens=text_tokens,
+            cues=normalized_cues,
+            cue_token_sets=cue_token_sets,
+        )
+        matched = direct or direct_score > 0 or not cue_tokens
         semantic_similarity = 0.0
         if cue_text:
-            cue_vector = self.smp.encode(cue_text) if cue_vector is None else cue_vector
-            semantic_similarity = cosine(cue_vector, search_index["vector"])
+            cue_vectors = (
+                tuple(self.smp.encode(cue) for cue in normalized_cues)
+                if cue_vectors is None
+                else tuple(cue_vectors)
+            )
+            semantic_similarity = max(
+                (
+                    cosine(cue_vector, search_index["vector"])
+                    for cue_vector in cue_vectors
+                ),
+                default=0.0,
+            )
             matched = matched or semantic_similarity >= SEMANTIC_MATCH_THRESHOLD
-        direct_score = 1.0 if direct else min(1.0, overlap / max(1, len(cue_tokens)))
         edge_degree = int((edge_degrees or {}).get(atom["id"], 0))
         edge_activation = min(
             1.0, max(0.0, float((edge_activation_scores or {}).get(atom["id"], 0.0)))
@@ -1459,6 +1661,30 @@ class RetrievalService:
         )
         redundancy_penalty = 1.0 if atom["health_status"] == "merged" else 0.0
         superseded_penalty = 1.0 if atom["id"] in (superseded_refs or {}) else 0.0
+        applicability_exclusion = 0.0
+        if retrieval_mode == "skill_discovery":
+            for phrase in search_index.get("negative_phrases", []) or []:
+                raw_phrase_tokens = {
+                    token
+                    for token in re.findall(r"[a-z0-9_]+", str(phrase).lower())
+                    if token
+                }
+                phrase_tokens = {
+                    part
+                    for token in raw_phrase_tokens
+                    for part in token.split("_")
+                    if part
+                }
+                if not phrase_tokens:
+                    continue
+                for request_tokens in cue_token_sets:
+                    coverage = len(
+                        phrase_tokens.intersection(request_tokens)
+                    ) / len(phrase_tokens)
+                    if coverage >= 0.6:
+                        applicability_exclusion = max(
+                            applicability_exclusion, coverage
+                        )
         components = {
             "direct_cue_match": direct_score,
             "semantic_similarity": semantic_similarity,
@@ -1474,12 +1700,17 @@ class RetrievalService:
             "staleness_penalty": staleness_penalty,
             "redundancy_penalty": redundancy_penalty,
             "superseded_penalty": superseded_penalty,
+            "applicability_exclusion": applicability_exclusion,
         }
         if retrieval_mode == "agentic_recall":
             components.update(self._agentic_score_components(atom))
         components.update(attention_components)
         score = 0.0
-        weights = dict(RETRIEVAL_WEIGHTS)
+        weights = dict(
+            SKILL_RETRIEVAL_WEIGHTS
+            if retrieval_mode == "skill_discovery"
+            else RETRIEVAL_WEIGHTS
+        )
         if retrieval_mode == "agentic_recall":
             weights.update(
                 {

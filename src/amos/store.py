@@ -399,6 +399,12 @@ class SQLiteStore:
                 ON amos_atoms(deleted, updated_at);
             CREATE INDEX IF NOT EXISTS idx_atoms_lifecycle_health_type
                 ON amos_atoms(lifecycle_state, health_status, type);
+            CREATE INDEX IF NOT EXISTS idx_atoms_skill_authority
+                ON amos_atoms(
+                    json_extract(payload, '$.profile'),
+                    json_extract(payload, '$.plugin_digest')
+                )
+                WHERE deleted = 0;
 
             CREATE TABLE IF NOT EXISTS amos_atom_text_index (
                 atom_id TEXT NOT NULL,
@@ -1328,6 +1334,7 @@ class SQLiteStore:
         excluded_health: list[str] | None = None,
         included_health: list[str] | None = None,
         atom_ids: list[str] | None = None,
+        payload_filter: Mapping[str, Sequence[str]] | None = None,
         limit: int | None = None,
         prioritize_hot: bool = False,
     ) -> list[dict[str, Any]]:
@@ -1358,6 +1365,11 @@ class SQLiteStore:
                 return []
             clauses.append(f"id IN ({','.join('?' for _ in atom_ids)})")
             params.extend(atom_ids)
+        self._append_payload_filter_sql(
+            clauses,
+            params,
+            payload_filter=payload_filter,
+        )
         query = "SELECT * FROM amos_atoms"
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
@@ -1436,6 +1448,7 @@ class SQLiteStore:
         *,
         limit: int | None = None,
         eligible_atom_ids: set[str] | None = None,
+        payload_filter: Mapping[str, Sequence[str]] | None = None,
     ) -> list[str]:
         normalized = sorted(
             {
@@ -1448,17 +1461,28 @@ class SQLiteStore:
             return []
         placeholders = ",".join("?" for _ in normalized)
         query = f"""
-            SELECT atom_id, token
-            FROM amos_atom_text_index
-            WHERE token IN ({placeholders})
+            SELECT i.atom_id, i.token
+            FROM amos_atom_text_index AS i
+            JOIN amos_atoms AS a ON a.id = i.atom_id
+            WHERE i.token IN ({placeholders})
+              AND a.deleted = 0
         """
         params: list[Any] = list(normalized)
         if eligible_atom_ids is not None:
             eligible = sorted({str(ref) for ref in eligible_atom_ids if str(ref)})
             if not eligible:
                 return []
-            query += f" AND atom_id IN ({','.join('?' for _ in eligible)})"
+            query += f" AND i.atom_id IN ({','.join('?' for _ in eligible)})"
             params.extend(eligible)
+        payload_clauses: list[str] = []
+        self._append_payload_filter_sql(
+            payload_clauses,
+            params,
+            payload_filter=payload_filter,
+            payload_column="a.payload",
+        )
+        if payload_clauses:
+            query += " AND " + " AND ".join(payload_clauses)
         rows = self.conn.execute(query, tuple(params)).fetchall()
         if not rows:
             return []
@@ -1506,6 +1530,7 @@ class SQLiteStore:
         *,
         types: Sequence[str] | None = None,
         lifecycle_states: Sequence[str] | None = None,
+        payload_filter: Mapping[str, Sequence[str]] | None = None,
         include_deleted: bool = False,
     ) -> int:
         clauses: list[str] = []
@@ -1526,11 +1551,42 @@ class SQLiteStore:
                 + ")"
             )
             params.extend(normalized_lifecycle)
+        self._append_payload_filter_sql(
+            clauses,
+            params,
+            payload_filter=payload_filter,
+        )
         query = "SELECT COUNT(*) AS count FROM amos_atoms"
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         row = self.conn.execute(query, tuple(params)).fetchone()
         return int(row["count"])
+
+    @staticmethod
+    def _append_payload_filter_sql(
+        clauses: list[str],
+        params: list[Any],
+        *,
+        payload_filter: Mapping[str, Sequence[str]] | None,
+        payload_column: str = "payload",
+    ) -> None:
+        for raw_field, raw_values in (payload_filter or {}).items():
+            field = str(raw_field)
+            values = tuple(dict.fromkeys(str(value) for value in raw_values))
+            if not values:
+                clauses.append("0 = 1")
+                continue
+            if field in {"profile", "plugin_digest"}:
+                expression = f"json_extract({payload_column}, '$.{field}')"
+            else:
+                expression = f"json_extract({payload_column}, ?)"
+                params.append(f'$."{field}"')
+            clauses.append(
+                f"CAST({expression} AS TEXT) IN ("
+                "SELECT CAST(value AS TEXT) FROM json_each(?)"
+                ")"
+            )
+            params.append(canonical_json(list(values)))
 
     def active_atom_ids(
         self, *, lifecycle_states: list[str] | None = None

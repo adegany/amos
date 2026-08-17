@@ -560,6 +560,222 @@ def test_edge_activation_spreads_from_cue_matched_atom(amos):
     assert by_ref[linked["id"]]["score_components"]["edge_activation"] > 0
 
 
+def test_skill_discovery_filters_current_authority_and_returns_bounded_bindings(
+    amos, monkeypatch,
+):
+    current_digest = "sha256:current-plugin"
+    stale_digest = "sha256:stale-plugin"
+    capability = amos.commit_atom(
+        {
+            "id": "skill_capability_exact_rational",
+            "type": "capability",
+            "payload": {
+                "profile": "cogito.skill-semantic-node.v1",
+                "subject_agent": "ent:agent:cogito",
+                "plugin_digest": current_digest,
+                "semantic_role": "skill_capability",
+                "semantic_kind": "semantic_capabilities",
+                "name": "exact_rational_arithmetic",
+                "description": "exact rational arithmetic",
+            },
+        }
+    )["atom"]
+    current = amos.commit_atom(
+        {
+            "id": "skill_binding_rational_current",
+            "type": "procedure",
+            "payload": {
+                "profile": "cogito.skill-definition-binding.v2",
+                "plugin_digest": current_digest,
+                "skill_id": "reasoning.formal.rational_arithmetic",
+                "skill_name": "Rational arithmetic",
+                "description": "Mechanically checked formal calculation.",
+                "selection_contract": {
+                    "semantic_capabilities": ["formal_calculation"],
+                    "input_shapes": ["explicit_operands"],
+                    "work_products": ["proof_receipt"],
+                    "exclusions": ["estimated_quantities"],
+                    "retrieval_examples": [],
+                },
+                "trigger_context": "Cogito Agent Plugin registry reconciliation",
+                "steps": ["verify current signed binding"],
+                "review_status": "host_verified_registry",
+                "semantic_role": "agent_skill",
+            },
+        }
+    )["atom"]
+    stale = amos.commit_atom(
+        {
+            "id": "skill_binding_rational_stale",
+            "type": "procedure",
+            "payload": {
+                "profile": "cogito.skill-definition-binding.v2",
+                "plugin_digest": stale_digest,
+                "skill_id": "obsolete.rational.skill",
+                "skill_name": "Exact rational arithmetic obsolete",
+                "description": "exact rational arithmetic",
+                "selection_contract": {
+                    "semantic_capabilities": ["exact_rational_arithmetic"],
+                    "input_shapes": [],
+                    "work_products": [],
+                    "exclusions": [],
+                    "retrieval_examples": [],
+                },
+                "trigger_context": "Obsolete registry record",
+                "steps": ["do not select"],
+                "review_status": "host_verified_registry",
+                "semantic_role": "agent_skill",
+            },
+        }
+    )["atom"]
+    with amos.store.transaction() as conn:
+        edge = amos.graph._edge(
+            current["id"], capability["id"], "rel:has_capability", {}
+        )
+        amos.store.insert_edge(conn, edge)
+
+    # Simulate a catalog larger than the bounded hot scan. Token-indexed
+    # candidates must still be found across the complete filtered authority
+    # projection instead of being constrained to the sampled base atoms.
+    original_list_atoms_filtered = amos.store.list_atoms_filtered
+
+    def omit_bounded_base_sample(**kwargs):
+        if kwargs.get("atom_ids") is None:
+            return []
+        return original_list_atoms_filtered(**kwargs)
+
+    monkeypatch.setattr(
+        amos.store, "list_atoms_filtered", omit_bounded_base_sample
+    )
+    original_atom_search_index = amos.indexes._atom_search_index
+    observed_vector_models = []
+
+    def coherent_atom_search_index(atom):
+        index = original_atom_search_index(atom)
+        assert index.get("vector_stale") is not True
+        observed_vector_models.append(index["vector_model"])
+        return index
+
+    monkeypatch.setattr(
+        amos.retrieval, "_atom_search_index", coherent_atom_search_index
+    )
+
+    cues = [
+        "First discuss background considerations that are unrelated to tools.",
+        "Compute the exact rational arithmetic result from supplied fractions.",
+    ]
+    packet = amos.retrieve_packet(
+        cues=cues,
+        retrieval_mode="skill_discovery",
+        type_filter=["procedure", "capability", "semantic", "limitation"],
+        payload_filter={
+            "profile": [
+                "cogito.skill-definition-binding.v2",
+                "cogito.skill-semantic-node.v1",
+            ],
+            "plugin_digest": [current_digest],
+        },
+        result_payload_filter={
+            "profile": ["cogito.skill-definition-binding.v2"]
+        },
+        attention_context={"focus_terms": cues},
+        max_items=4,
+        run_policy=False,
+    )
+
+    assert item_refs(packet) == {current["id"]}
+    assert stale["id"] not in item_refs(packet)
+    assert capability["id"] not in item_refs(packet)
+    item = packet["items"][0]
+    assert item["score_components"]["direct_cue_match"] < 1.0
+    assert item["score_components"]["edge_activation"] > 0
+    assert any(
+        step["relation"] == "rel:has_capability"
+        for step in item["association_trace"]
+    )
+    assert packet["request"]["payload_filter"]["plugin_digest"] == [
+        current_digest
+    ]
+    assert observed_vector_models
+    assert all(
+        model["idf_graph_version"] == packet["graph_version"]
+        for model in observed_vector_models
+    )
+
+
+def test_skill_discovery_separates_positive_and_exclusion_semantics(amos):
+    def commit_binding(atom_id, exclusions):
+        return amos.commit_atom(
+            {
+                "id": atom_id,
+                "type": "procedure",
+                "payload": {
+                    "profile": "cogito.skill-definition-binding.v2",
+                    "plugin_digest": "sha256:current-plugin",
+                    "skill_id": atom_id,
+                    "skill_name": "Exact rational arithmetic",
+                    "description": "Compute exact rational arithmetic.",
+                    "selection_contract": {
+                        "semantic_capabilities": ["exact_rational_arithmetic"],
+                        "input_shapes": ["explicit_rational_operands"],
+                        "work_products": ["exact_fraction"],
+                        "exclusions": exclusions,
+                        "retrieval_examples": [],
+                    },
+                    "trigger_context": "Cogito Agent Plugin registry reconciliation",
+                    "steps": ["verify current signed binding"],
+                    "review_status": "host_verified_registry",
+                    "semantic_role": "agent_skill",
+                },
+            }
+        )["atom"]
+
+    applicable = commit_binding(
+        "skill_binding_applicable", ["invented_formula"]
+    )
+    excluded = commit_binding(
+        "skill_binding_excluded", ["estimated_quantities"]
+    )
+    packet = amos.retrieve_packet(
+        cues=["Compute exact rational arithmetic from estimated quantities."],
+        retrieval_mode="skill_discovery",
+        type_filter=["procedure"],
+        payload_filter={
+            "profile": ["cogito.skill-definition-binding.v2"],
+            "plugin_digest": ["sha256:current-plugin"],
+        },
+        result_payload_filter={
+            "profile": ["cogito.skill-definition-binding.v2"]
+        },
+        max_items=4,
+        run_policy=False,
+    )
+
+    by_ref = {item["atom_ref"]: item for item in packet["items"]}
+    assert by_ref[excluded["id"]]["score_components"][
+        "applicability_exclusion"
+    ] == 1.0
+    assert by_ref[applicable["id"]]["score_components"][
+        "applicability_exclusion"
+    ] == 0.0
+    assert by_ref[applicable["id"]]["score"] > by_ref[excluded["id"]]["score"]
+
+
+def test_payload_filters_are_bounded_top_level_arrays(amos):
+    with pytest.raises(ValidationError, match="top-level"):
+        amos.retrieve_packet(
+            cues=["skill"],
+            payload_filter={"nested.profile": ["value"]},
+            run_policy=False,
+        )
+    with pytest.raises(ValidationError, match="must be arrays"):
+        amos.retrieve_packet(
+            cues=["skill"],
+            payload_filter={"profile": "value"},
+            run_policy=False,
+        )
+
+
 def test_retrieve_packet_uses_sqlite_token_candidate_index(amos, monkeypatch):
     amos.commit_atom(
         {
@@ -939,6 +1155,9 @@ def test_retrieval_feedback_only_updates_members_of_the_exact_packet(amos):
         outcome={
             "used_item_refs": [selected["id"], outside["id"], "evd_not_an_atom"],
             "evidence_refs": ["evd_reported_separately"],
+            "missing_capability_cues": [
+                "exact formal capability absent from the packet"
+            ],
             "label": "useful",
         },
     )
@@ -950,6 +1169,9 @@ def test_retrieval_feedback_only_updates_members_of_the_exact_packet(amos):
     ]
     assert result["feedback"]["reported_evidence_refs"] == [
         "evd_reported_separately"
+    ]
+    assert result["feedback"]["missing_capability_cues"] == [
+        "exact formal capability absent from the packet"
     ]
     assert amos.store.get_atom(outside["id"])["utility"] == outside["utility"]
 

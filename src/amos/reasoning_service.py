@@ -1196,7 +1196,9 @@ class ReasoningFrameService:
         }
         attention_policy = self.retrieval._attention_policy(task_context)
         self.indexes._sync_smp_vector_model(graph_version=self.store.graph_version())
-        cue_vector = self.smp.encode(query_text) if query_text else []
+        semantic_cues = tuple(str(cue).strip() for cue in cues if str(cue).strip())
+        cue_token_sets = self.retrieval._cue_token_sets(semantic_cues)
+        cue_vectors = tuple(self.smp.encode(cue) for cue in semantic_cues)
         indexed_ids = self.indexes._indexed_retrieval_candidates(
             cue_tokens=cue_tokens,
             attention_policy=attention_policy,
@@ -1207,7 +1209,7 @@ class ReasoningFrameService:
         latent_limit = max(1, len(eligible))
         latent_ids = self.retrieval._latent_retrieval_candidates(
             eligible,
-            cue_vector=cue_vector,
+            cue_vectors=cue_vectors,
             limit=latent_limit,
             minimum_similarity=0.22,
         )
@@ -1237,6 +1239,8 @@ class ReasoningFrameService:
             include_low_health=True,
             cue_text=query_text,
             cue_tokens=cue_tokens,
+            cue_token_sets=cue_token_sets,
+            cue_vectors=cue_vectors,
             attention_policy=attention_policy,
             superseded_refs=None,
             edge_scan_limit=int(work_budget["ranking_edges"]),
@@ -1250,7 +1254,8 @@ class ReasoningFrameService:
                 retrieval_mode="general",
                 cue_text=query_text,
                 cue_tokens=cue_tokens,
-                cue_vector=cue_vector,
+                cue_token_sets=cue_token_sets,
+                cue_vectors=cue_vectors,
                 edge_degrees=edge_degrees,
                 edge_activation_scores=edge_scores,
                 attention_policy=attention_policy,
