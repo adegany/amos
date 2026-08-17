@@ -25,6 +25,9 @@ class GraphService:
         self, refs: Sequence[str] | None = None
     ) -> dict[str, list[str]]:
         active_refs = self.store.active_atom_ids(lifecycle_states=["active"])
+        supersession_targets = self.store.active_atom_ids(
+            lifecycle_states=["active", "superseded"]
+        )
         scoped_refs = {str(ref) for ref in refs or [] if str(ref)}
         edges = (
             self.store.list_edges_for_refs(sorted(scoped_refs))
@@ -39,7 +42,7 @@ class GraphService:
                 continue
             source = str(edge.get("source_ref") or "")
             target = str(edge.get("target_ref") or "")
-            if source in active_refs and target in active_refs:
+            if source in active_refs and target in supersession_targets:
                 superseded.setdefault(target, []).append(source)
         return {ref: sorted(set(sources)) for ref, sources in superseded.items()}
 

@@ -284,11 +284,16 @@ SQLite database and uses isolated request connections behind the service boundar
 - Advisory maintenance for deduplication and contradiction marking, with
   high-risk mutation requests gated behind explicit approval.
 - Capacity pressure reporting and degraded packet disclosure.
-- Idle-triggered storage cleanup that prunes archived/stale atoms from the hot
-  token index, deletes expired archived/stale atoms through journaled
-  tombstones in bounded write batches, compacts old idempotency responses, and
-  performs non-blocking WAL checkpoints. Full SQLite `VACUUM` is opt-in and
-  remains gated by idle and minimum-interval policy.
+- Idle- or capacity-pressure-triggered storage cleanup that removes archived,
+  superseded, and stale atoms from hot indexes; physically deletes expired atom
+  and edge payload rows behind tombstones and minimal retired-edge identities;
+  compacts idempotency responses after one hour (five minutes under pressure);
+  and checkpoints the WAL with a pressure-specific `TRUNCATE` mode.
+- Snapshot-plus-tail journal recovery with compressed segments, a bounded
+  number of full recent segments, compact exact-reference receipts, and
+  digest-only chain manifests after old event bodies are physically discarded.
+  New databases use incremental auto-vacuum; an existing database adopts it
+  after its next explicitly enabled, idle-gated full `VACUUM`.
 - Revision-pinned WAL read snapshots for composite responses, plus FIFO
   database-scoped admission for short foreground, read-effect, and maintenance
   write transactions. Reads never upgrade their snapshot to a write; packet
@@ -541,7 +546,7 @@ PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 verify
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy --configure --schedule '{"every_graph_versions": 10, "every_seconds": 300}'
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy --configure --decay '{"require_atom_policy":true,"max_atoms":256,"max_active_atoms":128,"max_proposed_atoms":128,"pressure_archive_policyless":true,"pressure_archive_proposed":true}'
-PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy --configure --storage-cleanup '{"idle_after_seconds":300,"delete_archived_after_seconds":604800,"sqlite_compaction":{"vacuum_min_interval_seconds":86400}}'
+PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy --configure --storage-cleanup '{"trigger":"idle_or_pressure","idle_after_seconds":300,"pressure_min_interval_seconds":300,"journal_compaction":{"retain_full_segments":2},"sqlite_compaction":{"pressure_checkpoint_mode":"TRUNCATE","vacuum_min_interval_seconds":86400}}'
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 memory-policy --run --force --trigger operator_check
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 maintenance-processors
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 maintenance-distiller --domain generic --processor-id amos.maintenance.generic.v1
@@ -733,12 +738,14 @@ future architecture is not presented as current v1-local behavior.
 - No prompt-only memory architecture.
 - No autonomous external-state procedure execution.
 - No irreversible autonomous deletion policy without audit controls.
-- No canonical graph snapshots or compacted journal segments yet; replay uses
-  the full retained journal.
-- No v1-local ownership of evidence-object deletion, encryption keys, snapshots,
-  or offline-backup enforcement.
+- No external cold journal archive yet. V1-local retains snapshot state, recent
+  full event segments, compact exact-reference receipts, and digest-only chain
+  boundaries; payload-deep audit beyond that boundary is an external archive
+  responsibility.
+- No v1-local ownership of external evidence-object deletion, encryption keys,
+  cold archives, or offline-backup enforcement.
 - No per-tier capacity accounting or production-scale latency guarantee; the
-  current capacity mode covers one SQLite file and the benchmark is evidence,
-  not an acceptance threshold.
+  current capacity mode covers the SQLite main file plus its WAL, and the
+  benchmark is evidence, not an acceptance threshold.
 - No bundled production Postgres service yet; Postgres DDL is included as the
   target migration contract, while v1-local uses SQLite behind the HTTP API.

@@ -46,8 +46,7 @@ class CapacityService:
     ) -> str:
         budget = dict(budget if budget is not None else self._capacity_budget())
         if size_bytes is None:
-            path = self.store.path
-            size_bytes = path.stat().st_size if path.exists() and str(path) != ":memory:" else 0
+            size_bytes = int(self.store.storage_usage()["managed_size_bytes"])
         hard_limit = int(budget.get("hard_capacity_bytes", 0) or 0)
         if hard_limit <= 0:
             return "green"

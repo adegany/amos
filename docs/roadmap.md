@@ -48,9 +48,9 @@ checked-in service:
 
 ### Journal recovery and retention
 
-- Add canonical graph snapshots and snapshot-plus-tail recovery.
-- Add journal segment compaction, checkpoint verification, and provenance
-  rollups without weakening replay auditability.
+- Add an external cold-segment archive for payload-deep audit beyond the local
+  compact-receipt boundary.
+- Add signed or externally anchored snapshot and compact-segment manifests.
 - Define enforcement boundaries for external archives, backups, and
   crypto-shredding.
 

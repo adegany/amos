@@ -7,12 +7,18 @@ import uuid
 import json
 import math
 import threading
+import zlib
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from .journal_replay import (
+    empty_replay_state,
+    replay_events,
+    serializable_replay_state,
+)
 from .schemas import SCHEMA_VERSION, canonical_json, digest, utc_now
 
 
@@ -169,6 +175,11 @@ class SQLiteStore:
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
+        new_database = (
+            self.path == Path(":memory:")
+            or not self.path.exists()
+            or self.path.stat().st_size == 0
+        )
         self._runtime_key, self._runtime = _sqlite_runtime(self.path)
         self._connection_lock = threading.RLock()
         self._local = threading.local()
@@ -183,6 +194,11 @@ class SQLiteStore:
             self.conn.execute("PRAGMA foreign_keys = ON")
             self.conn.execute("PRAGMA busy_timeout = 5000")
             with self._runtime.schema_lock:
+                # Incremental auto-vacuum must be selected before the first
+                # table is created. Existing databases adopt it the next time
+                # an explicitly scheduled full VACUUM rebuilds the file.
+                if new_database:
+                    self.conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
                 if self.path != Path(":memory:"):
                     self.conn.execute("PRAGMA journal_mode = WAL")
                     self.conn.execute("PRAGMA synchronous = NORMAL")
@@ -434,6 +450,16 @@ class SQLiteStore:
             CREATE INDEX IF NOT EXISTS idx_edges_source ON amos_edges(source_ref);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON amos_edges(target_ref);
 
+            CREATE TABLE IF NOT EXISTS amos_retired_edges (
+                edge_id TEXT PRIMARY KEY,
+                source_ref TEXT NOT NULL,
+                target_ref TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                retired_at TEXT NOT NULL,
+                reason TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS amos_tombstones (
                 tombstone_id TEXT PRIMARY KEY,
                 target_ref TEXT NOT NULL,
@@ -469,6 +495,74 @@ class SQLiteStore:
             );
             CREATE INDEX IF NOT EXISTS idx_event_graph_version
                 ON amos_event_journal(graph_version);
+
+            CREATE TABLE IF NOT EXISTS amos_journal_segments (
+                segment_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL,
+                start_graph_version INTEGER NOT NULL,
+                end_graph_version INTEGER NOT NULL,
+                first_event_id TEXT NOT NULL,
+                last_event_id TEXT NOT NULL,
+                first_previous_event_hash TEXT NOT NULL,
+                last_event_hash TEXT NOT NULL,
+                event_count INTEGER NOT NULL,
+                codec TEXT NOT NULL,
+                events_blob BLOB NOT NULL,
+                events_digest TEXT NOT NULL,
+                uncompressed_bytes INTEGER NOT NULL,
+                compressed_bytes INTEGER NOT NULL,
+                payload_retained INTEGER NOT NULL DEFAULT 1,
+                payload_pruned_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_journal_segments_range
+                ON amos_journal_segments(start_graph_version, end_graph_version);
+
+            CREATE TABLE IF NOT EXISTS amos_journal_segment_events (
+                event_id TEXT PRIMARY KEY,
+                segment_id TEXT NOT NULL,
+                graph_version INTEGER NOT NULL UNIQUE
+            );
+            CREATE INDEX IF NOT EXISTS idx_journal_segment_events_segment
+                ON amos_journal_segment_events(segment_id, graph_version);
+
+            CREATE TABLE IF NOT EXISTS amos_journal_event_receipts (
+                event_id TEXT PRIMARY KEY,
+                segment_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                schema_version TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                idempotency_key TEXT,
+                payload_digest TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                accepted_at TEXT NOT NULL,
+                result_status TEXT NOT NULL,
+                projection_status TEXT NOT NULL,
+                previous_event_hash TEXT NOT NULL,
+                checksum TEXT NOT NULL,
+                graph_version INTEGER NOT NULL UNIQUE,
+                compact_payload TEXT NOT NULL,
+                receipt_digest TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_journal_event_receipts_segment
+                ON amos_journal_event_receipts(segment_id, graph_version);
+
+            CREATE TABLE IF NOT EXISTS amos_journal_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL,
+                through_graph_version INTEGER NOT NULL UNIQUE,
+                through_event_id TEXT NOT NULL,
+                through_event_hash TEXT NOT NULL,
+                codec TEXT NOT NULL,
+                state_blob BLOB NOT NULL,
+                state_digest TEXT NOT NULL,
+                uncompressed_bytes INTEGER NOT NULL,
+                compressed_bytes INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_journal_snapshots_version
+                ON amos_journal_snapshots(through_graph_version DESC);
 
             CREATE TABLE IF NOT EXISTS amos_memory_heads (
                 scope_digest TEXT NOT NULL,
@@ -561,6 +655,8 @@ class SQLiteStore:
         )
         with self.transaction() as conn:
             self._migrate_edge_derivation(conn)
+            self._migrate_retired_edge_storage(conn)
+            self._migrate_journal_segment_storage(conn)
             if self._get_meta(conn, "graph_version") is None:
                 self._set_meta(conn, "graph_version", "0")
             if self._get_meta(conn, "last_event_hash") is None:
@@ -568,6 +664,42 @@ class SQLiteStore:
             self._restore_memory_heads_if_needed(conn)
             self._restore_memory_head_history_if_needed(conn)
             self._backfill_atom_text_index(conn)
+
+    def _migrate_retired_edge_storage(self, conn: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(amos_retired_edges)"
+            ).fetchall()
+        }
+        for name in ("source_ref", "target_ref", "relation", "scope"):
+            if name in columns:
+                continue
+            default = "'{}'" if name == "scope" else "''"
+            conn.execute(
+                f"ALTER TABLE amos_retired_edges ADD COLUMN {name} "
+                f"TEXT NOT NULL DEFAULT {default}"
+            )
+
+    def _migrate_journal_segment_storage(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(amos_journal_segments)"
+            ).fetchall()
+        }
+        if "payload_retained" not in columns:
+            conn.execute(
+                "ALTER TABLE amos_journal_segments "
+                "ADD COLUMN payload_retained INTEGER NOT NULL DEFAULT 1"
+            )
+        if "payload_pruned_at" not in columns:
+            conn.execute(
+                "ALTER TABLE amos_journal_segments "
+                "ADD COLUMN payload_pruned_at TEXT"
+            )
 
     def _migrate_edge_derivation(self, conn: sqlite3.Connection) -> None:
         """Add explicit edge provenance and classify legacy rows for migration."""
@@ -643,7 +775,10 @@ class SQLiteStore:
             LIMIT 1
             """
         ).fetchone()
-        if event is not None:
+        snapshot = conn.execute(
+            "SELECT 1 FROM amos_journal_snapshots LIMIT 1"
+        ).fetchone()
+        if event is not None or snapshot is not None:
             self._rebuild_memory_heads(conn)
 
     def _restore_memory_head_history_if_needed(
@@ -665,7 +800,10 @@ class SQLiteStore:
             LIMIT 1
             """
         ).fetchone()
-        if event is not None:
+        snapshot = conn.execute(
+            "SELECT 1 FROM amos_journal_snapshots LIMIT 1"
+        ).fetchone()
+        if event is not None or snapshot is not None:
             self._rebuild_memory_heads(conn)
 
     def get_memory_head(
@@ -804,13 +942,41 @@ class SQLiteStore:
     def _rebuild_memory_heads(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
         conn.execute("DELETE FROM amos_memory_heads")
         conn.execute("DELETE FROM amos_memory_head_history")
+        snapshot = self.latest_journal_snapshot()
+        through_graph_version = int(
+            (snapshot or {}).get("through_graph_version", 0) or 0
+        )
+        if snapshot is not None:
+            state = dict(snapshot.get("state") or {})
+            history = [
+                dict(head)
+                for head in dict(state.get("head_history") or {}).values()
+                if isinstance(head, Mapping)
+            ]
+            if not history:
+                history = [
+                    dict(head)
+                    for head in dict(state.get("heads") or {}).values()
+                    if isinstance(head, Mapping)
+                ]
+            history.sort(
+                key=lambda head: (
+                    str(head.get("series_kind") or ""),
+                    str(head.get("series_id") or ""),
+                    int(head.get("head_version", 0) or 0),
+                )
+            )
+            for head in history:
+                self.put_memory_head(conn, head)
         rows = conn.execute(
             """
             SELECT event_id, accepted_at, payload
             FROM amos_event_journal
             WHERE event_type = 'memory_transaction_committed'
+              AND graph_version > ?
             ORDER BY graph_version ASC
-            """
+            """,
+            (through_graph_version,),
         ).fetchall()
         for row in rows:
             payload = self._json(str(row["payload"]))
@@ -1209,7 +1375,11 @@ class SQLiteStore:
         if not atom_id:
             return
         conn.execute("DELETE FROM amos_atom_text_index WHERE atom_id = ?", (atom_id,))
-        if atom.get("deleted"):
+        if atom.get("deleted") or atom.get("lifecycle_state") in {
+            "archived",
+            "superseded",
+            "deleted",
+        }:
             return
         tokens = sorted(self._atom_text_index_tokens(atom))
         if not tokens:
@@ -1615,6 +1785,12 @@ class SQLiteStore:
         return {str(row["key"]): int(row["count"]) for row in rows}
 
     def insert_edge(self, conn: sqlite3.Connection, edge: Mapping[str, Any]) -> bool:
+        retired = conn.execute(
+            "SELECT 1 FROM amos_retired_edges WHERE edge_id = ?",
+            (str(edge["edge_id"]),),
+        ).fetchone()
+        if retired is not None:
+            return False
         cursor = conn.execute(
             """
             INSERT INTO amos_edges(
@@ -1649,10 +1825,40 @@ class SQLiteStore:
         row = self.conn.execute(
             "SELECT * FROM amos_edges WHERE edge_id = ?", (edge_id,)
         ).fetchone()
-        return self._row_dict(row) if row else None
+        if row is not None:
+            return self._row_dict(row)
+        retired = self.conn.execute(
+            "SELECT * FROM amos_retired_edges WHERE edge_id = ?", (edge_id,)
+        ).fetchone()
+        if retired is None:
+            return None
+        return {
+            "edge_id": str(retired["edge_id"]),
+            "source_ref": str(retired["source_ref"]),
+            "target_ref": str(retired["target_ref"]),
+            "relation": str(retired["relation"]),
+            "scope": self._json(str(retired["scope"])),
+            "schema_version": SCHEMA_VERSION,
+            "evidence_refs": [],
+            "confidence": {},
+            "derivation": {},
+            "lifecycle_state": "deleted",
+            "health_status": "deleted",
+            "created_at": str(retired["retired_at"]),
+            "updated_at": str(retired["retired_at"]),
+            "version": 0,
+            "deleted": 1,
+            "storage_compacted": True,
+        }
 
     def upsert_edge(self, conn: sqlite3.Connection, edge: Mapping[str, Any]) -> None:
         """Project an edge state, including lifecycle reactivation on promotion."""
+        retired = conn.execute(
+            "SELECT 1 FROM amos_retired_edges WHERE edge_id = ?",
+            (str(edge["edge_id"]),),
+        ).fetchone()
+        if retired is not None:
+            return
         conn.execute(
             """
             INSERT INTO amos_edges(
@@ -1824,6 +2030,70 @@ class SQLiteStore:
                 ),
             )
         return edges
+
+    def retire_and_purge_edges_for_ref(
+        self,
+        conn: sqlite3.Connection,
+        target_ref: str,
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Replace full deleted edge rows with minimal identity markers."""
+
+        rows = conn.execute(
+            """
+            SELECT edge_id, source_ref, target_ref, relation, scope
+            FROM amos_edges
+            WHERE source_ref = ? OR target_ref = ?
+            """,
+            (str(target_ref), str(target_ref)),
+        ).fetchall()
+        retired_at = utc_now()
+        conn.executemany(
+            """
+            INSERT INTO amos_retired_edges(
+                edge_id, source_ref, target_ref, relation, scope,
+                retired_at, reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(edge_id) DO NOTHING
+            """,
+            [
+                (
+                    str(row["edge_id"]),
+                    str(row["source_ref"]),
+                    str(row["target_ref"]),
+                    str(row["relation"]),
+                    str(row["scope"]),
+                    retired_at,
+                    str(reason),
+                )
+                for row in rows
+            ],
+        )
+        deleted = conn.execute(
+            "DELETE FROM amos_edges WHERE source_ref = ? OR target_ref = ?",
+            (str(target_ref), str(target_ref)),
+        )
+        return {
+            "status": "completed",
+            "rows": int(deleted.rowcount or 0),
+            "retired_edge_ids": [str(row["edge_id"]) for row in rows],
+        }
+
+    def purge_atom_projection(
+        self, conn: sqlite3.Connection, atom_id: str
+    ) -> dict[str, Any]:
+        """Physically remove an atom row after its tombstone is durable."""
+
+        index_rows = self.delete_atom_text_index(conn, atom_id)
+        deleted = conn.execute(
+            "DELETE FROM amos_atoms WHERE id = ?", (str(atom_id),)
+        )
+        return {
+            "status": "completed",
+            "atom_rows": int(deleted.rowcount or 0),
+            "index_rows": index_rows,
+        }
 
     def restore_edges_for_ref(
         self, conn: sqlite3.Connection, target_ref: str
@@ -2328,53 +2598,911 @@ class SQLiteStore:
             else None,
         }
 
+    def storage_usage(self) -> dict[str, int]:
+        """Return filesystem bytes owned by this SQLite database.
+
+        Capacity pressure includes the WAL because it is durable database
+        storage even though it lives beside, rather than inside, the main
+        SQLite file. The shared-memory coordination file is reported
+        separately and excluded from the managed total.
+        """
+
+        if self.path == Path(":memory:"):
+            return {
+                "main_size_bytes": 0,
+                "wal_size_bytes": 0,
+                "shm_size_bytes": 0,
+                "managed_size_bytes": 0,
+            }
+
+        def file_size(path: Path) -> int:
+            try:
+                return int(path.stat().st_size)
+            except FileNotFoundError:
+                return 0
+
+        main_size = file_size(self.path)
+        wal_size = file_size(Path(f"{self.path}-wal"))
+        shm_size = file_size(Path(f"{self.path}-shm"))
+        return {
+            "main_size_bytes": main_size,
+            "wal_size_bytes": wal_size,
+            "shm_size_bytes": shm_size,
+            "managed_size_bytes": main_size + wal_size,
+        }
+
+    def sqlite_space_status(self) -> dict[str, int | str | bool]:
+        with self._connection_lock:
+            page_size = int(self.conn.execute("PRAGMA page_size").fetchone()[0])
+            page_count = int(self.conn.execute("PRAGMA page_count").fetchone()[0])
+            freelist_count = int(
+                self.conn.execute("PRAGMA freelist_count").fetchone()[0]
+            )
+            auto_vacuum = int(
+                self.conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+            )
+        auto_vacuum_name = {
+            0: "none",
+            1: "full",
+            2: "incremental",
+        }.get(auto_vacuum, f"unknown:{auto_vacuum}")
+        return {
+            "page_size_bytes": page_size,
+            "page_count": page_count,
+            "freelist_count": freelist_count,
+            "freelist_bytes": freelist_count * page_size,
+            "auto_vacuum_mode": auto_vacuum_name,
+            "incremental_reclaim_available": auto_vacuum == 2,
+            "requires_full_vacuum_for_incremental": auto_vacuum == 0,
+        }
+
+    def incremental_vacuum(self, *, max_pages: int = 4096) -> dict[str, Any]:
+        max_pages = max(0, int(max_pages))
+        with self._connection_lock:
+            with self._runtime.writer.acquire("maintenance"):
+                auto_vacuum = int(
+                    self.conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+                )
+                if auto_vacuum != 2:
+                    return {
+                        "status": "skipped",
+                        "reason": "incremental_auto_vacuum_not_enabled",
+                        "auto_vacuum_mode": auto_vacuum,
+                    }
+                before_page_count = int(
+                    self.conn.execute("PRAGMA page_count").fetchone()[0]
+                )
+                before_freelist = int(
+                    self.conn.execute("PRAGMA freelist_count").fetchone()[0]
+                )
+                if max_pages > 0 and before_freelist > 0:
+                    self.conn.execute(
+                        f"PRAGMA incremental_vacuum({min(max_pages, before_freelist)})"
+                    )
+                after_page_count = int(
+                    self.conn.execute("PRAGMA page_count").fetchone()[0]
+                )
+                after_freelist = int(
+                    self.conn.execute("PRAGMA freelist_count").fetchone()[0]
+                )
+        return {
+            "status": "completed",
+            "requested_pages": max_pages,
+            "page_count_before": before_page_count,
+            "page_count_after": after_page_count,
+            "freelist_count_before": before_freelist,
+            "freelist_count_after": after_freelist,
+            "reclaimed_pages": max(0, before_page_count - after_page_count),
+        }
+
     def vacuum(self) -> dict[str, Any]:
         with self._connection_lock:
             with self._runtime.writer.acquire("maintenance"):
                 before_page_count = self.conn.execute("PRAGMA page_count").fetchone()[0]
                 before_freelist = self.conn.execute("PRAGMA freelist_count").fetchone()[0]
+                # A full rebuild is the only way to enable incremental
+                # auto-vacuum on an existing database without one.
+                self.conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
                 self.conn.execute("VACUUM")
                 after_page_count = self.conn.execute("PRAGMA page_count").fetchone()[0]
                 after_freelist = self.conn.execute("PRAGMA freelist_count").fetchone()[0]
+                auto_vacuum = self.conn.execute("PRAGMA auto_vacuum").fetchone()[0]
         return {
             "status": "completed",
             "page_count_before": int(before_page_count),
             "page_count_after": int(after_page_count),
             "freelist_count_before": int(before_freelist),
             "freelist_count_after": int(after_freelist),
+            "auto_vacuum_mode": int(auto_vacuum),
+        }
+
+    @staticmethod
+    def _encode_journal_blob(value: Any) -> tuple[bytes, int, str]:
+        raw = canonical_json(value).encode("utf-8")
+        return zlib.compress(raw, level=6), len(raw), digest(value)
+
+    @staticmethod
+    def _decode_journal_blob(
+        blob: bytes,
+        *,
+        codec: str,
+        expected_digest: str,
+    ) -> Any:
+        if codec != "zlib-json-v1":
+            raise ValueError(f"unsupported journal codec: {codec}")
+        value = json.loads(zlib.decompress(bytes(blob)).decode("utf-8"))
+        if digest(value) != str(expected_digest):
+            raise ValueError("journal archive digest mismatch")
+        return value
+
+    @staticmethod
+    def _validate_exact_journal_events(
+        events: Sequence[Mapping[str, Any]],
+        *,
+        expected_previous: str,
+    ) -> str:
+        previous = str(expected_previous)
+        for event in events:
+            if str(event.get("previous_event_hash") or "") != previous:
+                raise ValueError("journal event chain mismatch during compaction")
+            body = dict(event)
+            checksum = str(body.pop("checksum", ""))
+            if digest(body) != checksum:
+                raise ValueError("journal event checksum mismatch during compaction")
+            previous = checksum
+        return previous
+
+    @staticmethod
+    def _compact_journal_event_payload(
+        event: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if str(event.get("event_type") or "") != "memory_transaction_committed":
+            return {"storage_compacted": True}
+        payload = event.get("payload")
+        payload = dict(payload) if isinstance(payload, Mapping) else {}
+        compact_atoms = []
+        for raw in payload.get("projected_atoms") or ():
+            if not isinstance(raw, Mapping):
+                continue
+            atom_payload = raw.get("payload")
+            atom_payload = atom_payload if isinstance(atom_payload, Mapping) else {}
+            compact_atoms.append(
+                {
+                    "id": str(raw.get("id") or ""),
+                    "type": str(raw.get("type") or ""),
+                    "profile": str(atom_payload.get("profile") or ""),
+                    "payload_digest": digest(atom_payload),
+                    "scope": dict(raw.get("scope") or {}),
+                    "access_policy": dict(raw.get("access_policy") or {}),
+                    "retention_class": str(raw.get("retention_class") or ""),
+                    "lifecycle_state": str(raw.get("lifecycle_state") or ""),
+                    "health_status": str(raw.get("health_status") or ""),
+                }
+            )
+        compact_evidence = []
+        for raw in payload.get("evidence") or ():
+            if not isinstance(raw, Mapping):
+                continue
+            compact_evidence.append(
+                {
+                    "evidence_id": str(raw.get("evidence_id") or ""),
+                    "source_type": str(raw.get("source_type") or ""),
+                    "source_ref": str(raw.get("source_ref") or ""),
+                    "captured_at": str(raw.get("captured_at") or ""),
+                    "checksum": str(raw.get("checksum") or ""),
+                    "scope": dict(raw.get("scope") or {}),
+                    "access_policy": dict(raw.get("access_policy") or {}),
+                }
+            )
+        return {
+            "storage_compacted": True,
+            "operation": str(payload.get("operation") or ""),
+            "scope": dict(payload.get("scope") or {}),
+            "projected_atoms": compact_atoms,
+            "projected_heads": [
+                dict(raw)
+                for raw in payload.get("projected_heads") or ()
+                if isinstance(raw, Mapping)
+            ],
+            "projected_evidence": compact_evidence,
+            "receipt_refs": [
+                str(ref) for ref in payload.get("receipt_refs") or () if str(ref)
+            ],
+            "projected_edge_count": len(payload.get("projected_edges") or ()),
+        }
+
+    def _journal_event_receipt(
+        self,
+        event: Mapping[str, Any],
+        *,
+        segment_id: str,
+        created_at: str,
+    ) -> dict[str, Any]:
+        compact_payload = self._compact_journal_event_payload(event)
+        receipt = {
+            "event_id": str(event["event_id"]),
+            "segment_id": str(segment_id),
+            "event_type": str(event["event_type"]),
+            "schema_version": str(event["schema_version"]),
+            "actor": str(event["actor"]),
+            "idempotency_key": event.get("idempotency_key"),
+            "payload_digest": str(event["payload_digest"]),
+            "occurred_at": str(event["occurred_at"]),
+            "accepted_at": str(event["accepted_at"]),
+            "result_status": str(event["result_status"]),
+            "projection_status": str(event["projection_status"]),
+            "previous_event_hash": str(event["previous_event_hash"]),
+            "checksum": str(event["checksum"]),
+            "graph_version": int(event["graph_version"]),
+            "compact_payload": compact_payload,
+            "created_at": str(created_at),
+        }
+        receipt["receipt_digest"] = digest(receipt)
+        return receipt
+
+    def _insert_journal_event_receipts(
+        self,
+        conn: sqlite3.Connection,
+        receipts: Sequence[Mapping[str, Any]],
+    ) -> None:
+        conn.executemany(
+            """
+            INSERT INTO amos_journal_event_receipts(
+                event_id, segment_id, event_type, schema_version, actor,
+                idempotency_key, payload_digest, occurred_at, accepted_at,
+                result_status, projection_status, previous_event_hash,
+                checksum, graph_version, compact_payload, receipt_digest,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO NOTHING
+            """,
+            [
+                (
+                    receipt["event_id"],
+                    receipt["segment_id"],
+                    receipt["event_type"],
+                    receipt["schema_version"],
+                    receipt["actor"],
+                    receipt.get("idempotency_key"),
+                    receipt["payload_digest"],
+                    receipt["occurred_at"],
+                    receipt["accepted_at"],
+                    receipt["result_status"],
+                    receipt["projection_status"],
+                    receipt["previous_event_hash"],
+                    receipt["checksum"],
+                    int(receipt["graph_version"]),
+                    canonical_json(receipt["compact_payload"]),
+                    receipt["receipt_digest"],
+                    receipt["created_at"],
+                )
+                for receipt in receipts
+            ],
+        )
+
+    def latest_journal_snapshot(self) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM amos_journal_snapshots
+            ORDER BY through_graph_version DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        data["state"] = self._decode_journal_blob(
+            data.pop("state_blob"),
+            codec=str(data["codec"]),
+            expected_digest=str(data["state_digest"]),
+        )
+        return data
+
+    def list_journal_segments(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT segment_id, schema_version, start_graph_version,
+                   end_graph_version, first_event_id, last_event_id,
+                   first_previous_event_hash, last_event_hash, event_count,
+                   codec, events_digest, uncompressed_bytes, compressed_bytes,
+                   payload_retained, payload_pruned_at, created_at
+            FROM amos_journal_segments
+            ORDER BY start_graph_version ASC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def journal_storage_status(self) -> dict[str, Any]:
+        live = self.conn.execute(
+            "SELECT COUNT(*) AS count FROM amos_event_journal"
+        ).fetchone()
+        segments = self.conn.execute(
+            """
+            SELECT COUNT(*) AS count,
+                   COALESCE(SUM(event_count), 0) AS events,
+                   COALESCE(SUM(CASE WHEN payload_retained = 1
+                                     THEN event_count ELSE 0 END), 0)
+                       AS retained_events,
+                   COALESCE(SUM(CASE WHEN payload_retained = 0
+                                     THEN event_count ELSE 0 END), 0)
+                       AS digest_only_events,
+                   COALESCE(SUM(CASE WHEN payload_retained = 1
+                                     THEN 1 ELSE 0 END), 0)
+                       AS retained_segments,
+                   COALESCE(SUM(CASE WHEN payload_retained = 0
+                                     THEN 1 ELSE 0 END), 0)
+                       AS digest_only_segments,
+                   COALESCE(SUM(uncompressed_bytes), 0) AS uncompressed_bytes,
+                   COALESCE(SUM(compressed_bytes), 0) AS compressed_bytes,
+                   COALESCE(MAX(end_graph_version), 0) AS through_graph_version
+            FROM amos_journal_segments
+            """
+        ).fetchone()
+        snapshots = self.conn.execute(
+            """
+            SELECT COUNT(*) AS count,
+                   COALESCE(SUM(compressed_bytes), 0) AS compressed_bytes,
+                   COALESCE(MAX(through_graph_version), 0) AS through_graph_version
+            FROM amos_journal_snapshots
+            """
+        ).fetchone()
+        receipts = self.conn.execute(
+            """
+            SELECT COUNT(*) AS count,
+                   COALESCE(SUM(length(compact_payload)), 0) AS payload_bytes
+            FROM amos_journal_event_receipts
+            """
+        ).fetchone()
+        return {
+            "live_event_count": int(live["count"] or 0),
+            "compacted_event_count": int(segments["events"] or 0),
+            "segment_count": int(segments["count"] or 0),
+            "retained_segment_count": int(segments["retained_segments"] or 0),
+            "digest_only_segment_count": int(
+                segments["digest_only_segments"] or 0
+            ),
+            "retained_segment_event_count": int(
+                segments["retained_events"] or 0
+            ),
+            "digest_only_event_count": int(
+                segments["digest_only_events"] or 0
+            ),
+            "segment_uncompressed_bytes": int(
+                segments["uncompressed_bytes"] or 0
+            ),
+            "segment_compressed_bytes": int(segments["compressed_bytes"] or 0),
+            "snapshot_count": int(snapshots["count"] or 0),
+            "snapshot_compressed_bytes": int(
+                snapshots["compressed_bytes"] or 0
+            ),
+            "compacted_receipt_count": int(receipts["count"] or 0),
+            "compacted_receipt_payload_bytes": int(
+                receipts["payload_bytes"] or 0
+            ),
+            "through_graph_version": max(
+                int(segments["through_graph_version"] or 0),
+                int(snapshots["through_graph_version"] or 0),
+            ),
         }
 
     def event_count(self) -> int:
-        row = self.conn.execute(
-            "SELECT COUNT(*) AS count FROM amos_event_journal"
-        ).fetchone()
-        return int(row["count"])
+        status = self.journal_storage_status()
+        return int(status["live_event_count"]) + int(
+            status["compacted_event_count"]
+        )
+
+    def _journal_receipt_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        compact_payload = self._json(str(row["compact_payload"]))
+        receipt = {
+            "event_id": str(row["event_id"]),
+            "segment_id": str(row["segment_id"]),
+            "event_type": str(row["event_type"]),
+            "schema_version": str(row["schema_version"]),
+            "actor": str(row["actor"]),
+            "idempotency_key": row["idempotency_key"],
+            "payload_digest": str(row["payload_digest"]),
+            "occurred_at": str(row["occurred_at"]),
+            "accepted_at": str(row["accepted_at"]),
+            "result_status": str(row["result_status"]),
+            "projection_status": str(row["projection_status"]),
+            "previous_event_hash": str(row["previous_event_hash"]),
+            "checksum": str(row["checksum"]),
+            "graph_version": int(row["graph_version"]),
+            "compact_payload": compact_payload,
+            "created_at": str(row["created_at"]),
+        }
+        if digest(receipt) != str(row["receipt_digest"]):
+            raise ValueError("journal compact receipt digest mismatch")
+        return {
+            **receipt,
+            "payload": compact_payload,
+            "target_refs": [],
+            "payload_refs": [],
+            "evidence_refs": [],
+            "causal_parent_ids": [],
+            "expected_versions": {},
+            "authorization_context": {},
+            "storage_compacted": True,
+            "compact_receipt_verified": True,
+            "compact_receipt_digest": str(row["receipt_digest"]),
+        }
+
+    def list_journal_event_receipts(
+        self, segment_id: str
+    ) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM amos_journal_event_receipts
+            WHERE segment_id = ?
+            ORDER BY graph_version ASC
+            """,
+            (str(segment_id),),
+        ).fetchall()
+        return [self._journal_receipt_from_row(row) for row in rows]
 
     def get_event(self, event_id: str) -> dict[str, Any] | None:
-        """Return one exact canonical journal event by its immutable ID."""
+        """Return a retained event or its verified compact reference receipt."""
 
         row = self.conn.execute(
             "SELECT * FROM amos_event_journal WHERE event_id = ?",
             (str(event_id),),
         ).fetchone()
-        return None if row is None else self._row_dict(row)
+        if row is not None:
+            return self._row_dict(row)
+        segment = self.conn.execute(
+            """
+            SELECT s.*
+            FROM amos_journal_segment_events e
+            JOIN amos_journal_segments s ON s.segment_id = e.segment_id
+            WHERE e.event_id = ?
+              AND s.payload_retained = 1
+            """,
+            (str(event_id),),
+        ).fetchone()
+        if segment is None:
+            receipt_row = self.conn.execute(
+                """
+                SELECT * FROM amos_journal_event_receipts
+                WHERE event_id = ?
+                """,
+                (str(event_id),),
+            ).fetchone()
+            if receipt_row is None:
+                return None
+            return self._journal_receipt_from_row(receipt_row)
+        events = self._decode_journal_blob(
+            segment["events_blob"],
+            codec=str(segment["codec"]),
+            expected_digest=str(segment["events_digest"]),
+        )
+        return next(
+            (dict(event) for event in events if event.get("event_id") == event_id),
+            None,
+        )
+
+    def journal_segment_events(
+        self, segment_id: str
+    ) -> list[dict[str, Any]] | None:
+        row = self.conn.execute(
+            "SELECT * FROM amos_journal_segments WHERE segment_id = ?",
+            (str(segment_id),),
+        ).fetchone()
+        if row is None or not int(row["payload_retained"] or 0):
+            return None
+        decoded = self._decode_journal_blob(
+            row["events_blob"],
+            codec=str(row["codec"]),
+            expected_digest=str(row["events_digest"]),
+        )
+        return [dict(event) for event in decoded]
+
+    def list_live_events(
+        self,
+        *,
+        limit: int | None = None,
+        after_graph_version: int | None = None,
+        newest: bool = False,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if after_graph_version is not None:
+            clauses.append("graph_version > ?")
+            params.append(int(after_graph_version))
+        query = "SELECT * FROM amos_event_journal"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY graph_version " + ("DESC" if newest else "ASC")
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        events = [self._row_dict(row) for row in rows]
+        if newest:
+            events.reverse()
+        return events
 
     def list_events(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        """List exact event bodies still present in retained segments and tail.
+
+        ``event_count`` includes older digest-only segments; those deliberately
+        shredded payloads are represented by compact receipts through
+        ``get_event`` rather than synthesized as full journal entries here.
+        """
+
         if limit is None:
-            rows = self.conn.execute(
-                "SELECT * FROM amos_event_journal ORDER BY graph_version ASC"
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
+            events: list[dict[str, Any]] = []
+            segments = self.conn.execute(
                 """
-                SELECT * FROM amos_event_journal
-                ORDER BY graph_version DESC
-                LIMIT ?
-                """,
-                (max(0, int(limit)),),
+                SELECT * FROM amos_journal_segments
+                ORDER BY start_graph_version ASC
+                """
             ).fetchall()
-            rows = list(reversed(rows))
-        return [self._row_dict(row) for row in rows]
+            for segment in segments:
+                if not int(segment["payload_retained"] or 0):
+                    continue
+                decoded = self._decode_journal_blob(
+                    segment["events_blob"],
+                    codec=str(segment["codec"]),
+                    expected_digest=str(segment["events_digest"]),
+                )
+                events.extend(dict(event) for event in decoded)
+            events.extend(self.list_live_events())
+            return events
+
+        requested = max(0, int(limit))
+        if requested == 0:
+            return []
+        events = self.list_live_events(limit=requested, newest=True)
+        needed = requested - len(events)
+        if needed <= 0:
+            return events
+        segments = self.conn.execute(
+            """
+            SELECT * FROM amos_journal_segments
+            ORDER BY end_graph_version DESC
+            """
+        ).fetchall()
+        archived: list[dict[str, Any]] = []
+        for segment in segments:
+            if not int(segment["payload_retained"] or 0):
+                continue
+            decoded = self._decode_journal_blob(
+                segment["events_blob"],
+                codec=str(segment["codec"]),
+                expected_digest=str(segment["events_digest"]),
+            )
+            selected = [dict(event) for event in decoded[-needed:]]
+            archived = selected + archived
+            needed -= len(selected)
+            if needed <= 0:
+                break
+        return archived + events
+
+    def compact_journal_segment(
+        self,
+        *,
+        max_events: int = 512,
+        min_events: int = 128,
+        retain_tail_events: int = 128,
+        retain_snapshots: int = 1,
+        retain_full_segments: int = 2,
+    ) -> dict[str, Any]:
+        max_events = max(1, int(max_events))
+        min_events = max(1, min(max_events, int(min_events)))
+        retain_tail_events = max(0, int(retain_tail_events))
+        retain_snapshots = max(1, int(retain_snapshots))
+        retain_full_segments = max(0, int(retain_full_segments))
+        with self.read_snapshot():
+            prior_snapshot = self.latest_journal_snapshot()
+            retained_segment_events = {
+                str(segment["segment_id"]): self.journal_segment_events(
+                    str(segment["segment_id"])
+                )
+                or []
+                for segment in self.list_journal_segments()
+                if int(segment.get("payload_retained", 1) or 0)
+            }
+            for retained_events in retained_segment_events.values():
+                if retained_events:
+                    self._validate_exact_journal_events(
+                        retained_events,
+                        expected_previous=str(
+                            retained_events[0]["previous_event_hash"]
+                        ),
+                    )
+            prior_version = int(
+                (prior_snapshot or {}).get("through_graph_version", 0) or 0
+            )
+            live_count_row = self.conn.execute(
+                "SELECT COUNT(*) AS count FROM amos_event_journal"
+            ).fetchone()
+            eligible = max(
+                0, int(live_count_row["count"] or 0) - retain_tail_events
+            )
+            if eligible < min_events:
+                return {
+                    "status": "skipped",
+                    "reason": "journal_segment_below_minimum",
+                    "compacted_event_count": 0,
+                    "eligible_event_count": eligible,
+                    "min_events": min_events,
+                    "live_event_count": int(live_count_row["count"] or 0),
+                    "retain_tail_events": retain_tail_events,
+                }
+            selected = self.list_live_events(limit=min(max_events, eligible))
+            if not selected:
+                return {
+                    "status": "skipped",
+                    "reason": "journal_tail_within_retention",
+                    "compacted_event_count": 0,
+                    "live_event_count": int(live_count_row["count"] or 0),
+                    "retain_tail_events": retain_tail_events,
+                }
+            expected_start = prior_version + 1
+            actual_start = int(selected[0]["graph_version"])
+            if actual_start != expected_start:
+                return {
+                    "status": "error",
+                    "reason": "journal_snapshot_tail_gap",
+                    "expected_start_graph_version": expected_start,
+                    "actual_start_graph_version": actual_start,
+                }
+            base_state = (
+                prior_snapshot["state"]
+                if prior_snapshot is not None
+                else empty_replay_state()
+            )
+
+        expected_previous = (
+            str(prior_snapshot["through_event_hash"])
+            if prior_snapshot is not None
+            else "genesis"
+        )
+        terminal_hash = self._validate_exact_journal_events(
+            selected,
+            expected_previous=expected_previous,
+        )
+        if terminal_hash != str(selected[-1]["checksum"]):
+            raise ValueError("journal segment terminal checksum mismatch")
+
+        replayed = replay_events(
+            selected,
+            initial_state=base_state,
+            migrated_edge_derivation=migrated_edge_derivation,
+        )
+        snapshot_state = serializable_replay_state(replayed)
+        events_blob, events_bytes, events_digest = self._encode_journal_blob(
+            selected
+        )
+        state_blob, state_bytes, state_digest = self._encode_journal_blob(
+            snapshot_state
+        )
+        start_version = int(selected[0]["graph_version"])
+        end_version = int(selected[-1]["graph_version"])
+        segment_id = (
+            f"jseg_{start_version}_{end_version}_{events_digest[:12]}"
+        )
+        snapshot_id = f"jsnap_{end_version}_{state_digest[:12]}"
+        created_at = utc_now()
+        retained_segment_events[segment_id] = selected
+        prepared_receipts_by_segment = {
+            retained_segment_id: [
+                self._journal_event_receipt(
+                    event,
+                    segment_id=retained_segment_id,
+                    created_at=created_at,
+                )
+                for event in segment_events
+            ]
+            for retained_segment_id, segment_events in retained_segment_events.items()
+        }
+        expected_rows = [
+            (str(event["event_id"]), str(event["checksum"])) for event in selected
+        ]
+
+        with self.transaction(lane="maintenance") as conn:
+            current_snapshot = conn.execute(
+                """
+                SELECT through_graph_version
+                FROM amos_journal_snapshots
+                ORDER BY through_graph_version DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            current_prior_version = int(
+                current_snapshot["through_graph_version"]
+                if current_snapshot is not None
+                else 0
+            )
+            if current_prior_version != prior_version:
+                return {
+                    "status": "stale",
+                    "reason": "journal_snapshot_advanced_before_publish",
+                    "planned_through_graph_version": prior_version,
+                    "current_through_graph_version": current_prior_version,
+                }
+            current_rows = conn.execute(
+                """
+                SELECT event_id, checksum
+                FROM amos_event_journal
+                WHERE graph_version BETWEEN ? AND ?
+                ORDER BY graph_version ASC
+                """,
+                (start_version, end_version),
+            ).fetchall()
+            if [
+                (str(row["event_id"]), str(row["checksum"]))
+                for row in current_rows
+            ] != expected_rows:
+                return {
+                    "status": "stale",
+                    "reason": "journal_segment_changed_before_publish",
+                    "start_graph_version": start_version,
+                    "end_graph_version": end_version,
+                }
+            conn.execute(
+                """
+                INSERT INTO amos_journal_segments(
+                    segment_id, schema_version, start_graph_version,
+                    end_graph_version, first_event_id, last_event_id,
+                    first_previous_event_hash, last_event_hash, event_count,
+                    codec, events_blob, events_digest, uncompressed_bytes,
+                    compressed_bytes, payload_retained, payload_pruned_at,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    segment_id,
+                    SCHEMA_VERSION,
+                    start_version,
+                    end_version,
+                    selected[0]["event_id"],
+                    selected[-1]["event_id"],
+                    selected[0]["previous_event_hash"],
+                    selected[-1]["checksum"],
+                    len(selected),
+                    "zlib-json-v1",
+                    sqlite3.Binary(events_blob),
+                    events_digest,
+                    events_bytes,
+                    len(events_blob),
+                    1,
+                    None,
+                    created_at,
+                ),
+            )
+            conn.executemany(
+                """
+                INSERT INTO amos_journal_segment_events(
+                    event_id, segment_id, graph_version
+                ) VALUES (?, ?, ?)
+                """,
+                [
+                    (event["event_id"], segment_id, int(event["graph_version"]))
+                    for event in selected
+                ],
+            )
+            conn.execute(
+                """
+                INSERT INTO amos_journal_snapshots(
+                    snapshot_id, schema_version, through_graph_version,
+                    through_event_id, through_event_hash, codec, state_blob,
+                    state_digest, uncompressed_bytes, compressed_bytes, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    SCHEMA_VERSION,
+                    end_version,
+                    selected[-1]["event_id"],
+                    selected[-1]["checksum"],
+                    "zlib-json-v1",
+                    sqlite3.Binary(state_blob),
+                    state_digest,
+                    state_bytes,
+                    len(state_blob),
+                    created_at,
+                ),
+            )
+            deleted = conn.execute(
+                """
+                DELETE FROM amos_event_journal
+                WHERE graph_version BETWEEN ? AND ?
+                """,
+                (start_version, end_version),
+            )
+            if int(deleted.rowcount or 0) != len(selected):
+                raise RuntimeError("journal compaction deleted an unexpected event count")
+            conn.execute(
+                """
+                DELETE FROM amos_journal_snapshots
+                WHERE snapshot_id NOT IN (
+                    SELECT snapshot_id
+                    FROM amos_journal_snapshots
+                    ORDER BY through_graph_version DESC
+                    LIMIT ?
+                )
+                """,
+                (retain_snapshots,),
+            )
+            retained = conn.execute(
+                """
+                SELECT segment_id, compressed_bytes
+                FROM amos_journal_segments
+                WHERE payload_retained = 1
+                ORDER BY end_graph_version DESC
+                """
+            ).fetchall()
+            pruned_segments = retained[retain_full_segments:]
+            pruned_segment_ids = [
+                str(row["segment_id"]) for row in pruned_segments
+            ]
+            pruned_payload_bytes = sum(
+                int(row["compressed_bytes"] or 0) for row in pruned_segments
+            )
+            if pruned_segment_ids:
+                if any(
+                    segment_id not in prepared_receipts_by_segment
+                    for segment_id in pruned_segment_ids
+                ):
+                    raise RuntimeError(
+                        "journal segment changed before receipt compaction"
+                    )
+                self._insert_journal_event_receipts(
+                    conn,
+                    [
+                        receipt
+                        for pruned_segment_id in pruned_segment_ids
+                        for receipt in prepared_receipts_by_segment[
+                            pruned_segment_id
+                        ]
+                    ],
+                )
+                placeholders = ",".join("?" for _ in pruned_segment_ids)
+                conn.execute(
+                    f"""
+                    UPDATE amos_journal_segments
+                    SET events_blob = X'', compressed_bytes = 0,
+                        payload_retained = 0, payload_pruned_at = ?
+                    WHERE segment_id IN ({placeholders})
+                    """,
+                    (created_at, *pruned_segment_ids),
+                )
+                conn.execute(
+                    f"""
+                    DELETE FROM amos_journal_segment_events
+                    WHERE segment_id IN ({placeholders})
+                    """,
+                    tuple(pruned_segment_ids),
+                )
+            self._set_meta(conn, "last_journal_compaction_at", created_at)
+
+        return {
+            "status": "completed",
+            "segment_id": segment_id,
+            "snapshot_id": snapshot_id,
+            "start_graph_version": start_version,
+            "end_graph_version": end_version,
+            "compacted_event_count": len(selected),
+            "segment_uncompressed_bytes": events_bytes,
+            "segment_compressed_bytes": len(events_blob),
+            "snapshot_uncompressed_bytes": state_bytes,
+            "snapshot_compressed_bytes": len(state_blob),
+            "pruned_segment_count": len(pruned_segment_ids),
+            "pruned_segment_payload_bytes": pruned_payload_bytes,
+            "saved_bytes_before_sqlite_reclaim": max(
+                0,
+                events_bytes
+                + pruned_payload_bytes
+                - len(events_blob)
+                - len(state_blob),
+            ),
+            "min_events": min_events,
+            "retain_tail_events": retain_tail_events,
+            "retain_snapshots": retain_snapshots,
+            "retain_full_segments": retain_full_segments,
+        }
 
     def _row_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         data = dict(row)

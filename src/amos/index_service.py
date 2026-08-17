@@ -199,6 +199,15 @@ class IndexService:
 
     def _attach_search_index(self, atom: Mapping[str, Any]) -> dict[str, Any]:
         indexed = dict(atom)
+        if indexed.get("deleted") or indexed.get("lifecycle_state") in {
+            "archived",
+            "superseded",
+            "deleted",
+        }:
+            # Derived search vectors are hot data, not canonical history.
+            # Lifecycle retirement removes their payload immediately.
+            indexed["index_refs"] = {}
+            return indexed
         index_refs = dict(indexed.get("index_refs") or {})
         index_refs[SEARCH_INDEX_REF] = self._search_index_for_atom(indexed)
         indexed["index_refs"] = index_refs
@@ -333,11 +342,11 @@ class IndexService:
         cleanup = policy.get("storage_cleanup", {})
         pruned_index = {"status": "skipped", "reason": "storage_cleanup_disabled"}
         if cleanup.get("enabled", True):
-            lifecycle_states = (
-                ["archived"]
-                if cleanup.get("remove_archived_from_hot_index", True)
-                else []
-            )
+            lifecycle_states: list[str] = []
+            if cleanup.get("remove_archived_from_hot_index", True):
+                lifecycle_states.append("archived")
+            if cleanup.get("remove_superseded_from_hot_index", True):
+                lifecycle_states.append("superseded")
             health_statuses = (
                 ["stale"]
                 if cleanup.get("remove_stale_from_hot_index", True)

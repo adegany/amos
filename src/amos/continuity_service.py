@@ -2060,9 +2060,13 @@ class ContinuityService:
         visible_atom_refs = {
             str(item.get("id") or "") for item in visible_atoms if item.get("id")
         }
+        compacted_receipt = bool(event.get("storage_compacted"))
         projected_evidence = [
             dict(item)
-            for item in payload.get("evidence") or ()
+            for item in payload.get(
+                "projected_evidence" if compacted_receipt else "evidence"
+            )
+            or ()
             if isinstance(item, Mapping)
         ]
         visible_evidence = [
@@ -2104,8 +2108,12 @@ class ContinuityService:
             )
         }
         checksum_valid = (
-            str(event.get("payload_digest") or "") == digest(payload)
-            and str(event.get("checksum") or "") == digest(integrity_body)
+            bool(event.get("compact_receipt_verified"))
+            if compacted_receipt
+            else (
+                str(event.get("payload_digest") or "") == digest(payload)
+                and str(event.get("checksum") or "") == digest(integrity_body)
+            )
         )
         complete_visibility = (
             len(visible_atoms) == len(projected_atoms)
@@ -2118,6 +2126,12 @@ class ContinuityService:
             "verification_status": (
                 "mechanically_verified" if checksum_valid else "invalid_checksum"
             ),
+            "verification_basis": (
+                "compacted_receipt_linked_to_verified_event_checksum"
+                if compacted_receipt
+                else "retained_event_payload_checksum"
+            ),
+            "storage_compacted": compacted_receipt,
             "complete_visibility": complete_visibility,
             "event_id": event_id,
             "event_type": str(event.get("event_type") or ""),
@@ -2136,11 +2150,18 @@ class ContinuityService:
                 {
                     "atom_ref": str(item.get("id") or ""),
                     "type": str(item.get("type") or ""),
-                    "profile": str((item.get("payload") or {}).get("profile") or ""),
+                    "profile": str(
+                        item.get("profile")
+                        if compacted_receipt
+                        else (item.get("payload") or {}).get("profile")
+                        or ""
+                    ),
                     "retention_class": str(item.get("retention_class") or ""),
                     "lifecycle_state": str(item.get("lifecycle_state") or ""),
                     "health_status": str(item.get("health_status") or ""),
-                    "payload_digest": digest(item.get("payload") or {}),
+                    "payload_digest": str(item.get("payload_digest") or "")
+                    if compacted_receipt
+                    else digest(item.get("payload") or {}),
                 }
                 for item in visible_atoms
             ],
@@ -2172,7 +2193,9 @@ class ContinuityService:
             "counts": {
                 "projected_atoms": len(projected_atoms),
                 "visible_atoms": len(visible_atoms),
-                "projected_edges": len(payload.get("projected_edges") or ()),
+                "projected_edges": int(payload.get("projected_edge_count", 0) or 0)
+                if compacted_receipt
+                else len(payload.get("projected_edges") or ()),
                 "projected_heads": len(projected_heads),
                 "visible_heads": len(visible_heads),
                 "projected_evidence": len(projected_evidence),

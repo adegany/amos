@@ -102,12 +102,12 @@ class PolicyService:
             cleanup = dict(policy["storage_cleanup"])
             for key, value in dict(storage_cleanup).items():
                 if (
-                    key == "sqlite_compaction"
+                    key in {"sqlite_compaction", "journal_compaction"}
                     and isinstance(value, Mapping)
-                    and isinstance(cleanup.get("sqlite_compaction"), Mapping)
+                    and isinstance(cleanup.get(key), Mapping)
                 ):
-                    cleanup["sqlite_compaction"] = {
-                        **dict(cleanup["sqlite_compaction"]),
+                    cleanup[key] = {
+                        **dict(cleanup[key]),
                         **dict(value),
                     }
                 else:
@@ -430,12 +430,13 @@ class PolicyService:
                     cleanup = dict(normalized[key])
                     for cleanup_key, cleanup_value in dict(value).items():
                         if (
-                            cleanup_key == "sqlite_compaction"
+                            cleanup_key
+                            in {"sqlite_compaction", "journal_compaction"}
                             and isinstance(cleanup_value, Mapping)
-                            and isinstance(cleanup.get("sqlite_compaction"), Mapping)
+                            and isinstance(cleanup.get(cleanup_key), Mapping)
                         ):
-                            cleanup["sqlite_compaction"] = {
-                                **dict(cleanup["sqlite_compaction"]),
+                            cleanup[cleanup_key] = {
+                                **dict(cleanup[cleanup_key]),
                                 **dict(cleanup_value),
                             }
                         else:
@@ -600,12 +601,25 @@ class PolicyService:
                 decay[key] = max(0, int(value))
         cleanup = normalized["storage_cleanup"]
         cleanup["enabled"] = bool(cleanup.get("enabled", True))
-        cleanup["trigger"] = str(cleanup.get("trigger") or "idle")
-        if cleanup["trigger"] != "idle":
-            cleanup["trigger"] = "idle"
+        cleanup["trigger"] = str(
+            cleanup.get("trigger") or "idle_or_pressure"
+        )
+        if cleanup["trigger"] not in {"idle", "idle_or_pressure"}:
+            cleanup["trigger"] = "idle_or_pressure"
+        cleanup["run_on_pressure"] = bool(
+            cleanup.get("run_on_pressure", True)
+        )
+        cleanup["pressure_modes"] = sorted(
+            {
+                str(mode)
+                for mode in cleanup.get("pressure_modes", ["orange", "red"])
+                if str(mode) in {"orange", "red"}
+            }
+        ) or ["orange", "red"]
         for key, default in (
             ("idle_after_seconds", 300),
             ("min_interval_seconds", 900),
+            ("pressure_min_interval_seconds", 300),
             ("max_deletions_per_tick", 256),
             ("max_idempotency_compactions_per_tick", 512),
             ("write_batch_size", 32),
@@ -616,12 +630,22 @@ class PolicyService:
         for key, default in (
             ("delete_archived_after_seconds", 604800),
             ("delete_stale_after_seconds", 1209600),
-            ("compact_idempotency_after_seconds", 604800),
+            ("delete_superseded_after_seconds", 604800),
+            ("purge_deleted_after_seconds", 3600),
+            ("pressure_delete_archived_after_seconds", 86400),
+            ("pressure_delete_stale_after_seconds", 604800),
+            ("pressure_delete_superseded_after_seconds", 86400),
+            ("pressure_purge_deleted_after_seconds", 0),
+            ("compact_idempotency_after_seconds", 3600),
+            ("pressure_compact_idempotency_after_seconds", 300),
         ):
             value = cleanup.get(key, default)
             cleanup[key] = None if value in (None, "") else max(0, int(value))
         cleanup["remove_archived_from_hot_index"] = bool(
             cleanup.get("remove_archived_from_hot_index", True)
+        )
+        cleanup["remove_superseded_from_hot_index"] = bool(
+            cleanup.get("remove_superseded_from_hot_index", True)
         )
         cleanup["remove_stale_from_hot_index"] = bool(
             cleanup.get("remove_stale_from_hot_index", True)
@@ -630,13 +654,77 @@ class PolicyService:
             {str(item) for item in cleanup.get("protected_types", [])}
             | GOVERNANCE_MAINTENANCE_PROTECTED_TYPES
         )
+        journal_compaction = dict(cleanup.get("journal_compaction") or {})
+        max_events_per_segment = max(
+            1,
+            int(journal_compaction.get("max_events_per_segment", 512) or 512),
+        )
+        cleanup["journal_compaction"] = {
+            "enabled": bool(journal_compaction.get("enabled", True)),
+            "max_events_per_segment": max_events_per_segment,
+            "min_events_per_segment": max(
+                1,
+                min(
+                    max_events_per_segment,
+                    int(
+                        journal_compaction.get("min_events_per_segment", 128)
+                        or 128
+                    ),
+                ),
+            ),
+            "pressure_min_events_per_segment": max(
+                1,
+                min(
+                    max_events_per_segment,
+                    int(
+                        journal_compaction.get(
+                            "pressure_min_events_per_segment", 64
+                        )
+                        or 64
+                    ),
+                ),
+            ),
+            "retain_tail_events": max(
+                0,
+                int(journal_compaction.get("retain_tail_events", 128) or 0),
+            ),
+            "retain_snapshots": max(
+                1,
+                int(journal_compaction.get("retain_snapshots", 1) or 1),
+            ),
+            "retain_full_segments": max(
+                0,
+                int(journal_compaction.get("retain_full_segments", 2) or 0),
+            ),
+        }
         sqlite_compaction = dict(cleanup.get("sqlite_compaction") or {})
         checkpoint_mode = str(sqlite_compaction.get("checkpoint_mode") or "PASSIVE").upper()
         if checkpoint_mode not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
             checkpoint_mode = "PASSIVE"
+        pressure_checkpoint_mode = str(
+            sqlite_compaction.get("pressure_checkpoint_mode") or "TRUNCATE"
+        ).upper()
+        if pressure_checkpoint_mode not in {
+            "PASSIVE",
+            "FULL",
+            "RESTART",
+            "TRUNCATE",
+        }:
+            pressure_checkpoint_mode = "TRUNCATE"
         cleanup["sqlite_compaction"] = {
             "checkpoint_wal": bool(sqlite_compaction.get("checkpoint_wal", True)),
             "checkpoint_mode": checkpoint_mode,
+            "pressure_checkpoint_mode": pressure_checkpoint_mode,
+            "incremental_vacuum": bool(
+                sqlite_compaction.get("incremental_vacuum", True)
+            ),
+            "incremental_vacuum_pages": max(
+                0,
+                int(
+                    sqlite_compaction.get("incremental_vacuum_pages", 4096)
+                    or 0
+                ),
+            ),
             "vacuum_enabled": bool(sqlite_compaction.get("vacuum_enabled", False)),
             "vacuum_idle_after_seconds": max(
                 0, int(sqlite_compaction.get("vacuum_idle_after_seconds", 1800) or 0)
@@ -849,15 +937,31 @@ class PolicyService:
         event_ref = event.get("event_id") if isinstance(event, Mapping) else None
         index_prune = dict(result.get("index_prune") or {})
         idempotency = dict(result.get("idempotency") or {})
+        journal_compaction = dict(result.get("journal_compaction") or {})
+        incremental_vacuum = dict(result.get("incremental_vacuum") or {})
         checkpoint = dict(result.get("checkpoint") or {})
         vacuum = dict(result.get("vacuum") or {})
         return {
             "status": result.get("status"),
             "deleted_atom_count": int(result.get("deleted_atom_count", 0) or 0),
+            "physically_purged_atom_count": int(
+                result.get("physically_purged_atom_count", 0) or 0
+            ),
             "deleted_atom_refs": self._bounded_refs(result.get("deleted_atom_refs", [])),
             "index_pruned_rows": int(index_prune.get("rows", 0) or 0),
             "idempotency_compacted_rows": int(idempotency.get("rows", 0) or 0),
             "idempotency_saved_bytes": int(idempotency.get("saved_bytes", 0) or 0),
+            "journal_compaction_status": journal_compaction.get("status"),
+            "journal_compacted_events": int(
+                journal_compaction.get("compacted_event_count", 0) or 0
+            ),
+            "journal_pruned_payload_bytes": int(
+                journal_compaction.get("pruned_segment_payload_bytes", 0) or 0
+            ),
+            "incremental_vacuum_status": incremental_vacuum.get("status"),
+            "incremental_vacuum_reclaimed_pages": int(
+                incremental_vacuum.get("reclaimed_pages", 0) or 0
+            ),
             "checkpoint_status": checkpoint.get("status"),
             "checkpoint_mode": checkpoint.get("mode"),
             "vacuum_status": vacuum.get("status"),
@@ -954,10 +1058,17 @@ class PolicyService:
             if proposed_count > max_proposed_atoms:
                 reasons.append("memory_atom_pressure:proposed")
         storage_cleanup = self._storage_cleanup_due(
-            policy.get("storage_cleanup", {}), state, force=force
+            policy.get("storage_cleanup", {}),
+            state,
+            force=force,
+            pressure_mode=pressure_mode,
         )
         if storage_cleanup["due"] and "force" not in reasons:
-            reasons.append("storage_cleanup_idle")
+            reasons.append(
+                "storage_cleanup_pressure"
+                if storage_cleanup.get("pressure_triggered")
+                else "storage_cleanup_idle"
+            )
         return {
             "due": bool(reasons),
             "reasons": reasons,
@@ -1439,19 +1550,32 @@ class PolicyService:
         state: Mapping[str, Any],
         *,
         force: bool = False,
+        pressure_mode: str | None = None,
     ) -> dict[str, Any]:
         if not cleanup.get("enabled", True) and not force:
             return {"due": False, "reason": "storage_cleanup_disabled"}
+        pressure_mode = str(pressure_mode or self._capacity_pressure_mode())
+        pressure_triggered = bool(
+            cleanup.get("run_on_pressure", True)
+            and pressure_mode in set(cleanup.get("pressure_modes", ["orange", "red"]))
+        )
         last_foreground = (
             self.store.get_meta("last_foreground_activity_at")
             or state.get("last_foreground_activity_at")
         )
         idle_elapsed = self._seconds_since(last_foreground)
         idle_after = int(cleanup.get("idle_after_seconds", 300) or 0)
-        if idle_elapsed is not None and idle_elapsed < idle_after and not force:
+        if (
+            not pressure_triggered
+            and idle_elapsed is not None
+            and idle_elapsed < idle_after
+            and not force
+        ):
             return {
                 "due": False,
                 "reason": "foreground_activity_recent",
+                "pressure_mode": pressure_mode,
+                "pressure_triggered": False,
                 "idle_elapsed_seconds": idle_elapsed,
                 "idle_after_seconds": idle_after,
                 "last_foreground_activity_at": last_foreground,
@@ -1461,18 +1585,36 @@ class PolicyService:
             or state.get("last_storage_cleanup_at")
         )
         cleanup_elapsed = self._seconds_since(last_cleanup)
-        min_interval = int(cleanup.get("min_interval_seconds", 900) or 0)
+        min_interval = int(
+            cleanup.get(
+                "pressure_min_interval_seconds"
+                if pressure_triggered
+                else "min_interval_seconds",
+                300 if pressure_triggered else 900,
+            )
+            or 0
+        )
         if cleanup_elapsed is not None and cleanup_elapsed < min_interval and not force:
             return {
                 "due": False,
                 "reason": "cleanup_interval_not_elapsed",
+                "pressure_mode": pressure_mode,
+                "pressure_triggered": pressure_triggered,
                 "elapsed_since_cleanup_seconds": cleanup_elapsed,
                 "min_interval_seconds": min_interval,
                 "last_storage_cleanup_at": last_cleanup,
             }
         return {
             "due": True,
-            "reason": "force" if force else "idle_interval_elapsed",
+            "reason": (
+                "force"
+                if force
+                else "capacity_pressure"
+                if pressure_triggered
+                else "idle_interval_elapsed"
+            ),
+            "pressure_mode": pressure_mode,
+            "pressure_triggered": pressure_triggered,
             "idle_elapsed_seconds": idle_elapsed,
             "idle_after_seconds": idle_after,
             "last_foreground_activity_at": last_foreground,
@@ -1493,6 +1635,7 @@ class PolicyService:
         force: bool = False,
     ) -> dict[str, Any]:
         now = utc_now()
+        pressure_triggered = bool(due.get("pressure_triggered"))
         protected_types = {str(item) for item in cleanup.get("protected_types", [])}
         max_deletions = max(0, int(cleanup.get("max_deletions_per_tick", 256) or 0))
         write_batch_size = max(1, int(cleanup.get("write_batch_size", 32) or 32))
@@ -1502,31 +1645,56 @@ class PolicyService:
         actions: list[dict[str, Any]] = []
         deleted_refs: list[str] = []
         events: list[dict[str, Any]] = []
-        index_lifecycle_states = (
-            ["archived"] if cleanup.get("remove_archived_from_hot_index", True) else []
-        )
+        index_lifecycle_states: list[str] = []
+        if cleanup.get("remove_archived_from_hot_index", True):
+            index_lifecycle_states.append("archived")
+        if cleanup.get("remove_superseded_from_hot_index", True):
+            index_lifecycle_states.append("superseded")
         index_health_statuses = (
             ["stale"] if cleanup.get("remove_stale_from_hot_index", True) else []
         )
-        compact_after = cleanup.get("compact_idempotency_after_seconds")
+        compact_after = cleanup.get(
+            "pressure_compact_idempotency_after_seconds"
+            if pressure_triggered
+            else "compact_idempotency_after_seconds"
+        )
 
         # Plan from a coherent read, then revalidate each candidate immediately
         # before mutation. The plan never holds SQLite's single-writer slot.
         candidates: list[dict[str, Any]] = []
         if max_deletions:
             with self.store.read_snapshot():
-                atoms = self.store.list_atoms_filtered(
-                    include_deleted=False,
-                    lifecycle_states=["active", "archived", "proposed"],
+                current_head_refs = {
+                    str(head.get("head_ref") or "")
+                    for head in self.store.list_memory_heads()
+                    if str(head.get("head_ref") or "")
+                }
+                atoms = sorted(
+                    self.store.list_atoms_filtered(include_deleted=True),
+                    key=lambda atom: (
+                        str(
+                            atom.get("last_accessed")
+                            or atom.get("updated_at")
+                            or atom.get("observed_at")
+                            or ""
+                        ),
+                        str(atom.get("id") or ""),
+                    ),
                 )
                 for atom in atoms:
                     if len(candidates) >= max_deletions:
                         break
                     if not maintenance_scope_visible(atom["scope"], scope):
                         continue
-                    if atom["type"] in protected_types:
+                    if str(atom["id"]) in current_head_refs:
                         continue
-                    if self._storage_deletion_reason(atom, cleanup) is not None:
+                    if atom["type"] in protected_types and not atom.get("deleted"):
+                        continue
+                    if self._storage_deletion_reason(
+                        atom,
+                        cleanup,
+                        pressure_triggered=pressure_triggered,
+                    ) is not None:
                         candidates.append(atom)
 
         # Derived-index pruning is bounded by atom and yields between batches.
@@ -1625,19 +1793,63 @@ class PolicyService:
             batch_tombstones: list[dict[str, Any]] = []
             batch_refs: list[str] = []
             with self.store.transaction() as conn:
+                current_head_refs_for_batch = {
+                    str(head.get("head_ref") or "")
+                    for head in self.store.list_memory_heads_from_connection(conn)
+                    if str(head.get("head_ref") or "")
+                }
                 for planned_atom in batch:
                     atom = self.store.get_atom(str(planned_atom["id"]))
                     if (
                         atom is None
-                        or atom.get("deleted")
                         or int(atom.get("version", 0))
                         != int(planned_atom.get("version", 0))
+                        or str(atom.get("id") or "")
+                        in current_head_refs_for_batch
                         or not maintenance_scope_visible(atom["scope"], scope)
-                        or atom["type"] in protected_types
+                        or (
+                            atom["type"] in protected_types
+                            and not atom.get("deleted")
+                        )
                     ):
                         continue
-                    reason = self._storage_deletion_reason(atom, cleanup)
+                    reason = self._storage_deletion_reason(
+                        atom,
+                        cleanup,
+                        pressure_triggered=pressure_triggered,
+                    )
                     if reason is None:
+                        continue
+                    if atom.get("deleted"):
+                        if self.store.get_tombstone(str(atom["id"])) is None:
+                            batch_tombstones.append(
+                                self.store.insert_tombstone(
+                                    conn,
+                                    target_ref=str(atom["id"]),
+                                    content_digest=self._memory_identity_digest(atom),
+                                    recreation_policy="block_recreate",
+                                    reason=reason,
+                                )
+                            )
+                        deleted_edges = self.store.mark_edges_deleted_for_ref(
+                            conn, str(atom["id"])
+                        )
+                        batch_edges.extend(
+                            {
+                                "edge_id": edge["edge_id"],
+                                "deleted": 1,
+                            }
+                            for edge in deleted_edges
+                        )
+                        action = {
+                            "atom_ref": atom["id"],
+                            "action": "purge_deleted_projection",
+                            "reason": reason,
+                            "lifecycle_state_before": atom["lifecycle_state"],
+                            "health_status_before": atom["health_status"],
+                        }
+                        batch_refs.append(atom["id"])
+                        batch_actions.append(action)
                         continue
                     updated = dict(atom)
                     updated["lifecycle_state"] = "deleted"
@@ -1678,8 +1890,17 @@ class PolicyService:
                         "lifecycle_state_before": atom["lifecycle_state"],
                         "health_status_before": atom["health_status"],
                     }
-                    batch_atoms.append(updated)
-                    batch_edges.extend(deleted_edges)
+                    # The tombstone and action hold the durable deletion
+                    # receipt. Journal only minimal removal projections, not
+                    # the payload being physically discarded.
+                    batch_atoms.append({"id": atom["id"], "deleted": 1})
+                    batch_edges.extend(
+                        {
+                            "edge_id": edge["edge_id"],
+                            "deleted": 1,
+                        }
+                        for edge in deleted_edges
+                    )
                     batch_tombstones.append(tombstone)
                     batch_refs.append(atom["id"])
                     batch_actions.append(action)
@@ -1711,6 +1932,17 @@ class PolicyService:
                         },
                         target_refs=batch_refs,
                     )
+                    reasons_by_ref = {
+                        str(action["atom_ref"]): str(action["reason"])
+                        for action in batch_actions
+                    }
+                    for atom_ref in batch_refs:
+                        self.store.retire_and_purge_edges_for_ref(
+                            conn,
+                            atom_ref,
+                            reason=reasons_by_ref[atom_ref],
+                        )
+                        self.store.purge_atom_projection(conn, atom_ref)
                     # Storage cleanup physically deletes canonical payloads,
                     # so retain the strong deletion contract and purge packet
                     # copies before committing each bounded delete batch.
@@ -1753,12 +1985,68 @@ class PolicyService:
                 events.append(event)
             self.store._set_meta(conn, "last_storage_cleanup_at", now)
         event = events[-1] if events else None
+
+        journal_policy = dict(cleanup.get("journal_compaction") or {})
+        journal_compaction: dict[str, Any] = {
+            "status": "skipped",
+            "reason": "journal_compaction_disabled",
+        }
+        if journal_policy.get("enabled", True):
+            try:
+                journal_compaction = self.store.compact_journal_segment(
+                    max_events=int(
+                        journal_policy.get("max_events_per_segment", 512) or 512
+                    ),
+                    min_events=int(
+                        journal_policy.get(
+                            "pressure_min_events_per_segment"
+                            if pressure_triggered
+                            else "min_events_per_segment",
+                            64 if pressure_triggered else 128,
+                        )
+                        or 1
+                    ),
+                    retain_tail_events=int(
+                        journal_policy.get("retain_tail_events", 128) or 0
+                    ),
+                    retain_snapshots=int(
+                        journal_policy.get("retain_snapshots", 1) or 1
+                    ),
+                    retain_full_segments=int(
+                        journal_policy.get("retain_full_segments", 2) or 0
+                    ),
+                )
+            except Exception as exc:
+                journal_compaction = {"status": "error", "error": str(exc)}
+
         sqlite_compaction = dict(cleanup.get("sqlite_compaction") or {})
+        incremental_vacuum = {
+            "status": "skipped",
+            "reason": "incremental_vacuum_disabled",
+        }
+        if sqlite_compaction.get("incremental_vacuum", True):
+            try:
+                incremental_vacuum = self.store.incremental_vacuum(
+                    max_pages=int(
+                        sqlite_compaction.get("incremental_vacuum_pages", 4096)
+                        or 0
+                    )
+                )
+            except Exception as exc:
+                incremental_vacuum = {"status": "error", "error": str(exc)}
         checkpoint = {"status": "skipped", "reason": "checkpoint_disabled"}
         if sqlite_compaction.get("checkpoint_wal", True):
             try:
+                checkpoint_mode = str(
+                    sqlite_compaction.get(
+                        "pressure_checkpoint_mode"
+                        if pressure_triggered
+                        else "checkpoint_mode",
+                        "TRUNCATE" if pressure_triggered else "PASSIVE",
+                    )
+                )
                 checkpoint = self.store.checkpoint_wal(
-                    mode=str(sqlite_compaction.get("checkpoint_mode") or "PASSIVE")
+                    mode=checkpoint_mode
                 )
             except Exception as exc:
                 checkpoint = {"status": "error", "error": str(exc)}
@@ -1774,7 +2062,14 @@ class PolicyService:
         ):
             try:
                 checkpoint_after_vacuum = self.store.checkpoint_wal(
-                    mode=str(sqlite_compaction.get("checkpoint_mode") or "PASSIVE")
+                    mode=str(
+                        sqlite_compaction.get(
+                            "pressure_checkpoint_mode"
+                            if pressure_triggered
+                            else "checkpoint_mode",
+                            "TRUNCATE" if pressure_triggered else "PASSIVE",
+                        )
+                    )
                 )
             except Exception as exc:
                 checkpoint_after_vacuum = {"status": "error", "error": str(exc)}
@@ -1783,10 +2078,13 @@ class PolicyService:
             "due": dict(due),
             "index_prune": index_prune,
             "deleted_atom_count": len(actions),
+            "physically_purged_atom_count": len(actions),
             "deleted_atom_refs": deleted_refs,
             "write_batch_size": write_batch_size,
             "write_batch_count": len(events),
             "idempotency": idempotency,
+            "journal_compaction": journal_compaction,
+            "incremental_vacuum": incremental_vacuum,
             "checkpoint": checkpoint,
             "vacuum": vacuum,
             "checkpoint_after_vacuum": checkpoint_after_vacuum,
@@ -1796,14 +2094,40 @@ class PolicyService:
 
 
     def _storage_deletion_reason(
-        self, atom: Mapping[str, Any], cleanup: Mapping[str, Any]
+        self,
+        atom: Mapping[str, Any],
+        cleanup: Mapping[str, Any],
+        *,
+        pressure_triggered: bool = False,
     ) -> str | None:
+        observed_ages = [
+            age
+            for timestamp in (
+                atom.get("last_accessed"),
+                atom.get("updated_at"),
+                atom.get("observed_at"),
+            )
+            if timestamp and (age := self._seconds_since(timestamp)) is not None
+        ]
+        updated_age = min(observed_ages) if observed_ages else None
         if atom.get("deleted"):
+            purge_after = cleanup.get(
+                "pressure_purge_deleted_after_seconds"
+                if pressure_triggered
+                else "purge_deleted_after_seconds"
+            )
+            if (
+                purge_after is not None
+                and updated_age is not None
+                and updated_age >= int(purge_after)
+            ):
+                return "storage_cleanup_deleted_projection_retention_elapsed"
             return None
-        updated_age = self._seconds_since(
-            atom.get("last_accessed") or atom.get("updated_at") or atom.get("observed_at")
+        archived_after = cleanup.get(
+            "pressure_delete_archived_after_seconds"
+            if pressure_triggered
+            else "delete_archived_after_seconds"
         )
-        archived_after = cleanup.get("delete_archived_after_seconds")
         if (
             archived_after is not None
             and atom.get("lifecycle_state") == "archived"
@@ -1811,7 +2135,23 @@ class PolicyService:
             and updated_age >= int(archived_after)
         ):
             return "storage_cleanup_archived_retention_elapsed"
-        stale_after = cleanup.get("delete_stale_after_seconds")
+        superseded_after = cleanup.get(
+            "pressure_delete_superseded_after_seconds"
+            if pressure_triggered
+            else "delete_superseded_after_seconds"
+        )
+        if (
+            superseded_after is not None
+            and atom.get("lifecycle_state") == "superseded"
+            and updated_age is not None
+            and updated_age >= int(superseded_after)
+        ):
+            return "storage_cleanup_superseded_retention_elapsed"
+        stale_after = cleanup.get(
+            "pressure_delete_stale_after_seconds"
+            if pressure_triggered
+            else "delete_stale_after_seconds"
+        )
         if (
             stale_after is not None
             and atom.get("health_status") == "stale"
@@ -2142,11 +2482,11 @@ class PolicyService:
         atoms_by_ref = {
             atom["id"]: atom
             for atom in self.store.list_atoms_filtered(
-                lifecycle_states=["active", "proposed"]
+                lifecycle_states=["active", "proposed", "superseded"]
             )
         }
         for atom in self.store.list_atoms_filtered(
-            lifecycle_states=["active", "proposed"],
+            lifecycle_states=["active", "proposed", "superseded"],
             atom_ids=sorted(superseded_refs),
         ):
             atoms_by_ref[atom["id"]] = atom
@@ -2240,7 +2580,13 @@ class PolicyService:
         hot_count_before = sum(
             1 for atom in atoms if atom.get("lifecycle_state") in {"active", "proposed"}
         )
-        hot_count_after_rules = hot_count_before - len(planned_archives)
+        planned_hot_archives = {
+            str(atom["id"])
+            for atom in atoms
+            if str(atom["id"]) in planned_archives
+            and atom.get("lifecycle_state") in {"active", "proposed"}
+        }
+        hot_count_after_rules = hot_count_before - len(planned_hot_archives)
         active_count_after_rules = sum(
             1
             for atom in atoms
@@ -2709,9 +3055,17 @@ class PolicyService:
             return None
         after = policy.get("archive_superseded_after_seconds", 0)
         if after not in (None, ""):
-            age = self._seconds_since(
-                atom.get("last_accessed") or atom.get("updated_at") or atom.get("observed_at")
-            )
+            ages = [
+                age
+                for timestamp in (
+                    atom.get("last_accessed"),
+                    atom.get("updated_at"),
+                    atom.get("observed_at"),
+                )
+                if timestamp
+                and (age := self._seconds_since(timestamp)) is not None
+            ]
+            age = min(ages) if ages else None
             if age is not None and age < int(after):
                 return None
         return {

@@ -61,6 +61,32 @@ def test_capacity_pressure_degrades_packets_and_reports_mode(amos):
     assert any(o["reason"] == "pressure_degraded" for o in packet["omissions"])
 
 
+def test_capacity_pressure_accounts_for_main_database_and_wal(amos, monkeypatch):
+    monkeypatch.setattr(
+        amos.store,
+        "storage_usage",
+        lambda: {
+            "main_size_bytes": 80,
+            "wal_size_bytes": 30,
+            "shm_size_bytes": 7,
+            "managed_size_bytes": 110,
+        },
+    )
+    amos.configure_capacity_budget(
+        hard_capacity_bytes=100,
+        warning_ratio=0.7,
+        critical_ratio=0.9,
+    )
+
+    capacity = amos.health_capacity()
+
+    assert capacity["size_bytes"] == 110
+    assert capacity["main_size_bytes"] == 80
+    assert capacity["wal_size_bytes"] == 30
+    assert capacity["shm_size_bytes"] == 7
+    assert capacity["pressure_mode"] == "red"
+
+
 def test_worker_artifacts_update_indexes_and_observability(amos):
     amos.commit_atom(
         {
@@ -1449,7 +1475,7 @@ def test_memory_policy_storage_cleanup_deletes_expired_archived_and_stale_atoms(
             "health_status": "stale",
         }
     )["atom"]
-    assert archived["id"] in amos.store.candidate_atom_ids_for_tokens(["archived"])
+    assert archived["id"] not in amos.store.candidate_atom_ids_for_tokens(["archived"])
     assert stale["id"] in amos.store.candidate_atom_ids_for_tokens(["stale"])
 
     amos.configure_memory_policy(
@@ -1475,8 +1501,8 @@ def test_memory_policy_storage_cleanup_deletes_expired_archived_and_stale_atoms(
     cleanup = result["results"]["storage_cleanup"]
     assert cleanup["deleted_atom_count"] == 2
     assert set(cleanup["deleted_atom_refs"]) == {archived["id"], stale["id"]}
-    assert amos.store.get_atom(archived["id"])["deleted"] == 1
-    assert amos.store.get_atom(stale["id"])["deleted"] == 1
+    assert amos.store.get_atom(archived["id"]) is None
+    assert amos.store.get_atom(stale["id"]) is None
     assert amos.store.get_atom(protected["id"])["deleted"] == 0
     assert archived["id"] not in amos.store.candidate_atom_ids_for_tokens(["archived"])
     assert stale["id"] not in amos.store.candidate_atom_ids_for_tokens(["stale"])
@@ -1484,6 +1510,107 @@ def test_memory_policy_storage_cleanup_deletes_expired_archived_and_stale_atoms(
         event["event_type"] == "storage_cleanup_run"
         for event in amos.store.list_events()
     )
+    assert amos.verify_replay()["status"] == "ok"
+
+
+def test_storage_cleanup_physically_retires_atom_and_edge_payload_rows(amos):
+    old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    amos.commit_atom(
+        {
+            "id": "cleanup_retained_target",
+            "type": "semantic",
+            "payload": {"summary": "retained target"},
+        }
+    )
+    amos.commit_atom(
+        {
+            "id": "cleanup_physical_source",
+            "type": "semantic",
+            "payload": {"summary": "large discarded payload", "blob": "x" * 4096},
+            "created_at": old,
+            "observed_at": old,
+            "updated_at": old,
+            "health_status": "stale",
+            "supersedes": ["cleanup_retained_target"],
+        }
+    )
+    edge_id = amos.store.list_edges_for_refs(["cleanup_physical_source"])[0][
+        "edge_id"
+    ]
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": False},
+        storage_cleanup={
+            "idle_after_seconds": 0,
+            "min_interval_seconds": 0,
+            "delete_stale_after_seconds": 0,
+            "journal_compaction": {"enabled": False},
+            "sqlite_compaction": {
+                "checkpoint_wal": False,
+                "incremental_vacuum": False,
+                "vacuum_enabled": False,
+            },
+        },
+    )
+
+    result = amos.run_memory_policy(force=True, trigger="physical_cleanup_test")
+
+    cleanup = result["results"]["storage_cleanup"]
+    assert cleanup["physically_purged_atom_count"] == 1
+    assert amos.store.get_atom("cleanup_physical_source") is None
+    assert amos.store.get_atom("cleanup_retained_target") is not None
+    assert amos.store.conn.execute(
+        "SELECT COUNT(*) FROM amos_edges WHERE edge_id = ?", (edge_id,)
+    ).fetchone()[0] == 0
+    retired = amos.store.get_edge(edge_id)
+    assert retired["deleted"] == 1
+    assert retired["storage_compacted"] is True
+    assert amos.store.get_tombstone("cleanup_physical_source") is not None
+    assert amos.verify_replay()["status"] == "ok"
+
+
+def test_storage_cleanup_purges_previously_logical_deleted_rows(amos):
+    amos.commit_atom(
+        {
+            "id": "cleanup_prior_logical_delete",
+            "type": "semantic",
+            "payload": {"summary": "payload awaiting physical purge"},
+        }
+    )
+    amos.delete_atom(
+        "cleanup_prior_logical_delete",
+        reason="logical delete before retention cleanup",
+    )
+    assert amos.store.get_atom("cleanup_prior_logical_delete")["deleted"] == 1
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": False},
+        storage_cleanup={
+            "idle_after_seconds": 0,
+            "min_interval_seconds": 0,
+            "purge_deleted_after_seconds": 0,
+            "journal_compaction": {"enabled": False},
+            "sqlite_compaction": {
+                "checkpoint_wal": False,
+                "incremental_vacuum": False,
+                "vacuum_enabled": False,
+            },
+        },
+    )
+
+    result = amos.run_memory_policy(force=True, trigger="logical_delete_purge")
+
+    assert result["results"]["storage_cleanup"][
+        "physically_purged_atom_count"
+    ] == 1
+    assert amos.store.get_atom("cleanup_prior_logical_delete") is None
+    assert amos.store.get_tombstone("cleanup_prior_logical_delete") is not None
     assert amos.verify_replay()["status"] == "ok"
 
 
@@ -1505,7 +1632,7 @@ def test_memory_policy_rebuild_keeps_archived_stale_atoms_out_of_hot_index(amos)
             "health_status": "stale",
         }
     )["atom"]
-    assert archived["id"] in amos.store.candidate_atom_ids_for_tokens(["archived"])
+    assert archived["id"] not in amos.store.candidate_atom_ids_for_tokens(["archived"])
     assert stale["id"] in amos.store.candidate_atom_ids_for_tokens(["stale"])
 
     amos.configure_memory_policy(
@@ -1539,7 +1666,7 @@ def test_memory_policy_rebuild_keeps_archived_stale_atoms_out_of_hot_index(amos)
     hot_prune = result["results"]["index"]["indexes"][0]["details_json"][
         "hot_index_prune"
     ]
-    assert hot_prune["rows"] >= 2
+    assert hot_prune["rows"] >= 1
     assert archived["id"] not in amos.store.candidate_atom_ids_for_tokens(["archived"])
     assert stale["id"] not in amos.store.candidate_atom_ids_for_tokens(["stale"])
 
@@ -1613,6 +1740,69 @@ def test_memory_policy_storage_cleanup_compacts_idempotency_and_sqlite(amos, mon
         ("cleanup-idempotency-key",),
     ).fetchone()
     assert json.loads(row["response_json"])["storage_compacted"] is True
+
+
+def test_storage_cleanup_runs_under_pressure_despite_recent_activity(amos, monkeypatch):
+    amos.commit_atom(
+        {
+            "id": "pressure_cleanup_idempotency",
+            "type": "semantic",
+            "payload": {"summary": "pressure cleanup", "blob": "x" * 2048},
+        },
+        idempotency_key="pressure-cleanup-key",
+    )
+    ten_minutes_old = (
+        datetime.now(timezone.utc) - timedelta(minutes=10)
+    ).isoformat().replace("+00:00", "Z")
+    with amos.store.transaction() as conn:
+        conn.execute(
+            "UPDATE amos_idempotency SET created_at = ?",
+            (ten_minutes_old,),
+        )
+
+    checkpoint_modes: list[str] = []
+
+    def fake_checkpoint(*, mode="PASSIVE"):
+        checkpoint_modes.append(mode)
+        return {"status": "completed", "mode": mode, "busy": 0}
+
+    monkeypatch.setattr(amos.store, "checkpoint_wal", fake_checkpoint)
+    amos.configure_capacity_budget(hard_capacity_bytes=1)
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": False},
+        storage_cleanup={
+            "enabled": True,
+            "run_on_pressure": True,
+            "idle_after_seconds": 86400,
+            "min_interval_seconds": 86400,
+            "pressure_min_interval_seconds": 300,
+            "max_deletions_per_tick": 0,
+            "compact_idempotency_after_seconds": 3600,
+            "pressure_compact_idempotency_after_seconds": 300,
+            "journal_compaction": {"enabled": False},
+            "sqlite_compaction": {
+                "checkpoint_wal": True,
+                "checkpoint_mode": "PASSIVE",
+                "pressure_checkpoint_mode": "TRUNCATE",
+                "incremental_vacuum": False,
+                "vacuum_enabled": False,
+            },
+        },
+    )
+
+    result = amos.run_memory_policy(trigger="pressure_cleanup_test")
+
+    cleanup = result["results"]["storage_cleanup"]
+    assert result["due"]["storage_cleanup"]["pressure_triggered"] is True
+    assert cleanup["idempotency"]["rows"] == 1
+    assert cleanup["checkpoint"]["mode"] == "TRUNCATE"
+    assert checkpoint_modes == ["TRUNCATE"]
+    assert amos.run_memory_policy(trigger="pressure_cleanup_repeat")["status"] == (
+        "skipped"
+    )
 
 
 def test_health_memory_can_skip_foreground_policy_tick(amos):

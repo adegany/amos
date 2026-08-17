@@ -904,12 +904,12 @@ def test_integrity_verification_uses_one_snapshot_during_concurrent_write(
         }
     )
     writer = Amos(amos.store.path)
-    original_list_events = amos.store.list_events
+    original_list_live_events = amos.store.list_live_events
     wrote_concurrently = False
 
-    def list_events_with_concurrent_write(*, limit=None):
+    def list_events_with_concurrent_write(**kwargs):
         nonlocal wrote_concurrently
-        events = original_list_events(limit=limit)
+        events = original_list_live_events(**kwargs)
         if not wrote_concurrently:
             wrote_concurrently = True
             writer.commit_atom(
@@ -921,7 +921,9 @@ def test_integrity_verification_uses_one_snapshot_during_concurrent_write(
             )
         return events
 
-    monkeypatch.setattr(amos.store, "list_events", list_events_with_concurrent_write)
+    monkeypatch.setattr(
+        amos.store, "list_live_events", list_events_with_concurrent_write
+    )
     try:
         verified = amos.verify_integrity()
     finally:

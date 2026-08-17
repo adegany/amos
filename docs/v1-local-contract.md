@@ -423,33 +423,49 @@ deleted memories without replaying deletion events.
 
 ### 1.9 Journal rollup format
 
-**Status: Planned.** V1-local replays the retained journal from genesis. It does
-not create canonical graph snapshots or compacted journal segments. A future
-compaction implementation should use this rollup shape:
+**Status: Implemented.** V1-local verifies an exact live journal prefix before
+publishing a compressed canonical replay-state snapshot and compressed event
+segment in one maintenance transaction. Replay then uses the latest snapshot
+plus the live tail. A bounded number of recent segments retain full event
+bodies; older bodies are zeroed after compact receipts are durable.
 
 ```text
 CompactedJournalSegment
   segment_id
   schema_version
-  tenant_id
-  workspace_id
-  covers_event_ids
-  covers_event_range
   start_graph_version
   end_graph_version
-  resulting_atom_refs
-  resulting_edge_refs
-  tombstone_refs
-  evidence_rollup_refs
-  aggregate_counters
-  policy_decisions
-  checksum_chain_start
-  checksum_chain_end
+  first_event_id
+  last_event_id
+  first_previous_event_hash
+  last_event_hash
+  event_count
+  codec
+  events_digest
+  payload_retained
+  payload_pruned_at
   created_at
-  created_by
+
+CanonicalJournalSnapshot
+  through_graph_version
+  through_event_id
+  through_event_hash
+  codec
+  state_digest
+  compressed replay state
+
+CompactEventReceipt
+  immutable event identity and graph version
+  original payload digest and event checksum links
+  bounded memory-transaction refs when applicable
+  compact receipt digest
 ```
 
-Rollups are audit accelerators, not replacements for deletion policy. If raw events are deleted or shredded, the rollup must not retain forbidden payload content.
+Digest-only segments prove range and checksum-chain boundaries but do not claim
+that a shredded payload can still be recomputed. Diagnostics report that
+verification scope explicitly. Compact receipts are audit accelerators and
+exact-reference records, not replacements for deletion policy or an external
+cold archive; they do not retain discarded canonical payload bodies.
 
 ### 1.10 V1 evaluation suite
 
@@ -607,14 +623,24 @@ decay:
 
 storage_cleanup:
   enabled: true
-  trigger: idle
+  trigger: idle_or_pressure
+  run_on_pressure: true
+  pressure_modes: [orange, red]
+  pressure_min_interval_seconds: 300
   idle_after_seconds: 300
   min_interval_seconds: 900
   max_deletions_per_tick: 256
   remove_archived_from_hot_index: true
+  remove_superseded_from_hot_index: true
   remove_stale_from_hot_index: true
   delete_archived_after_seconds: 604800
   delete_stale_after_seconds: 1209600
+  delete_superseded_after_seconds: 604800
+  purge_deleted_after_seconds: 3600
+  pressure_delete_archived_after_seconds: 86400
+  pressure_delete_stale_after_seconds: 604800
+  pressure_delete_superseded_after_seconds: 86400
+  pressure_purge_deleted_after_seconds: 0
   protected_types:
     - adjudication
     - policy
@@ -622,13 +648,25 @@ storage_cleanup:
     - commitment
     - covenant
     - primal_guidance
-  compact_idempotency_after_seconds: 604800
+  compact_idempotency_after_seconds: 3600
+  pressure_compact_idempotency_after_seconds: 300
   max_idempotency_compactions_per_tick: 512
   write_batch_size: 32
   max_index_prune_atoms_per_tick: 512
+  journal_compaction:
+    enabled: true
+    max_events_per_segment: 512
+    min_events_per_segment: 128
+    pressure_min_events_per_segment: 64
+    retain_tail_events: 128
+    retain_snapshots: 1
+    retain_full_segments: 2
   sqlite_compaction:
     checkpoint_wal: true
     checkpoint_mode: PASSIVE
+    pressure_checkpoint_mode: TRUNCATE
+    incremental_vacuum: true
+    incremental_vacuum_pages: 4096
     vacuum_enabled: false
     vacuum_idle_after_seconds: 1800
     vacuum_min_interval_seconds: 86400
@@ -908,22 +946,23 @@ do not infer similarity or support merely because two unscoped registry
 commit only low-risk, policy-allowed proposals such as add_atom distillations
 execute deterministic decay rules from atom decay_policy and configured global
   bounds after distillation and processor commits
-archive active atoms that are superseded by active replacement atoms in that
-  same policy pass when archive_superseded is enabled
-  and explicit structural graph relations with active endpoints
+archive active or lifecycle-superseded atoms named by active replacements in
+  that same policy pass when archive_superseded is enabled
 defer medium/high-risk proposals, health changes, merges, archives, access
   policy changes, and ambiguous claims to explicit review
 never create or amend covenants, primal guidance, identity commitments,
   standing, operational authority, or ratification records
 never create active derived output from proposed, contested, or unratified
   source atoms
-prune archived/stale atoms from hot retrieval indexes during idle cleanup
-delete expired archived/stale atoms through normal tombstone and journal
-  projection paths while preserving protected types
+prune archived/superseded/stale atoms from hot retrieval indexes immediately
+physically purge expired archived/superseded/stale/deleted atom and edge
+  payload rows through tombstone and retired-identity projection paths
 compact old idempotency responses so duplicate-response cache rows do not
   dominate the hot SQLite file
-checkpoint the SQLite WAL and run VACUUM only after the configured idle window
-  and compaction interval
+publish journal snapshots, compact full event segments, and shred old bodies
+  after bounded exact-reference receipts are durable
+checkpoint the SQLite WAL during idle or pressure cleanup; keep full VACUUM
+  gated by its configured idle window and interval
 refresh rebuildable derived-index metadata
 refresh dependency-free lexical and LSA derived vector indexes
 invalidate packet cache
@@ -1007,17 +1046,32 @@ current-head protection in each batch, and skips a stale plan rather than
 overwriting a concurrent update. Current-head repair is committed atomically
 with its journal event.
 
-Storage cleanup is deterministic and idle-triggered, not size-triggered by
-default. It removes archived/stale atoms from the hot token index immediately
-when the cleanup tick is due, then deletes archived/stale atoms only after their
-configured retention windows. Candidate planning occurs on a read snapshot;
-each bounded write batch revalidates atom version and eligibility before
-deletion, then yields writer admission before the next batch. Deletion uses the same deleted lifecycle,
-tombstones, edge deletion, packet-cache invalidation, and replay projection model
-as explicit `atom_deleted` operations. The event journal remains logically
-append-only; v1-local physical compaction trims derived/cache storage with
-idempotency-response slimming and a default `PASSIVE` WAL checkpoint. Full
-SQLite `VACUUM` is disabled by default and requires an explicit idle-gated policy.
+Storage cleanup is deterministic and is due after either its idle window or
+configured orange/red capacity pressure. Pressure bypasses the idle gate but
+uses its own minimum interval. Archived, superseded, and stale atoms leave the
+hot token index immediately. Once their retention window elapses, bounded
+write batches journal a minimal removal projection and tombstone, physically
+delete the atom row, replace incident edge rows with minimal retired identities,
+and purge packet copies. Previously logical-only deleted rows are also purged
+after a short grace period. Each batch revalidates atom version, scope, and
+current-head protection before publication and yields writer admission before
+the next batch.
+
+Idempotency response bodies compact after one hour by default and after five
+minutes under pressure. Journal compaction verifies event checksums, publishes
+a compressed canonical snapshot, retains a bounded full-event tail, and then
+physically discards older segment bodies. Digest-only segment manifests retain
+chain boundaries, while compact receipts retain immutable event IDs and bounded
+memory-transaction observations. Replay uses the latest snapshot plus live
+tail. Verification clearly reports whether older events were checked through
+digest-only boundaries rather than claiming their discarded payloads remain.
+
+Capacity counts the SQLite main file plus its WAL. Normal cleanup uses a
+`PASSIVE` checkpoint; pressure defaults to `TRUNCATE`. New databases select
+incremental auto-vacuum before schema creation and cleanup reclaims a bounded
+number of free pages. Existing databases continue to reuse freed pages but need
+one explicitly enabled, idle-gated full `VACUUM` to adopt incremental
+auto-vacuum and visibly shrink pre-existing file slack.
 
 Derived-index maintenance similarly refreshes lexical rows in bounded write
 batches and performs LSA computation on a pinned read snapshot. Publication
@@ -1332,13 +1386,13 @@ Acceptance status:
 | Journal | Implemented | Canonical graph mutations append checksummed `EventJournalEntry` records with authorization and expected-version context. |
 | Projection | Implemented | Strong mutations append their event and project graph changes in one SQLite transaction. |
 | Interaction continuity | Implemented | Per-conversation interaction-stream CAS binds immutable event order; v2 discourse-state entries retain caller-defined class/authority provenance; heads advance independently; both indexes rebuild from the retained journal; v2 interaction projections can include bounded access-filtered typed linked lineage without semantic interpretation. |
-| Replay | Partial | The graph is reconstructable from the full retained journal. Snapshot-plus-tail recovery and journal segment compaction are planned. |
+| Replay | Implemented | The graph and memory-head indexes rebuild from the latest verified compressed snapshot plus the live tail. Recent segments retain exact events; older bodies become compact receipts and digest-only chain boundaries with an explicit verification scope. |
 | Retrieval and attention | Implemented | Packets expose graph version, provenance, omissions, degradation, score components, attention trace, bounded candidate selection, and scoped edge activation. |
 | Self-awareness and agentic recall | Implemented | Structural self views, responsibility attribution, counterevidence, and generated self-narrative expiry are tested. |
 | Shared memory | Implemented | Common graph-version views and identity-specific overlays/omissions are tested. |
 | Authorization | Implemented | Scope, visibility, mutation roles, trust, capabilities, and evidence visibility are independently exercised. |
-| Deletion | Partial | V1-local suppresses atoms and edges, clears hot derived state, and creates tombstones. External evidence archives, snapshots, encryption keys, and backups remain integration responsibilities. |
-| Capacity | Partial | One SQLite-file byte budget drives one pressure mode and packet degradation. Per-tier budgets and external-object-store capacity are planned. |
+| Deletion | Partial | Expired atom and edge payload rows are physically removed after durable tombstone/retired-identity publication; hot derived state and packet copies are purged. External evidence archives, encryption keys, and backups remain integration responsibilities. |
+| Capacity | Partial | The SQLite main file plus WAL drive one pressure mode, cleanup/checkpoint escalation, and packet degradation. Per-tier budgets and external-object-store capacity are planned. |
 | SMP and processor packs | Implemented | Deterministic processors produce advisory proposals; only policy-approved low-risk atoms auto-commit. |
 | Memory policy | Implemented | Background and operator-triggered deterministic maintenance paths are tested without an LLM. |
 | Performance | Evidence only | A reproducible local benchmark exists, but CI has no scale or latency acceptance threshold; this is not a production-scale guarantee. |

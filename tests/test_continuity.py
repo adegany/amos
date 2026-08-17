@@ -280,6 +280,64 @@ def test_generic_goal_work_heads_are_typed_versioned_and_superseding(amos):
     assert amos.store.get_atom("goal_state_1")["lifecycle_state"] == "superseded"
 
 
+def test_superseded_head_predecessor_leaves_hot_index_and_is_archived(amos):
+    goal_ref = "goal:superseded-index-lifecycle"
+    amos.commit_memory_transaction(
+        scope=SCOPE,
+        actor="goal-lifecycle-test",
+        atoms=[goal_state("goal_lifecycle_1", goal_ref=goal_ref, revision=1)],
+        head_updates=[goal_head(
+            "goal_lifecycle_1",
+            goal_ref=goal_ref,
+            expected_head_ref=None,
+            expected_head_version=0,
+        )],
+    )
+    assert "goal_lifecycle_1" in amos.store.candidate_atom_ids_for_tokens(
+        ["exercise"]
+    )
+    amos.commit_memory_transaction(
+        scope=SCOPE,
+        actor="goal-lifecycle-test",
+        atoms=[goal_state("goal_lifecycle_2", goal_ref=goal_ref, revision=2)],
+        head_updates=[goal_head(
+            "goal_lifecycle_2",
+            goal_ref=goal_ref,
+            expected_head_ref="goal_lifecycle_1",
+            expected_head_version=1,
+        )],
+    )
+
+    assert amos.store.get_atom("goal_lifecycle_1")["lifecycle_state"] == (
+        "superseded"
+    )
+    assert "goal_lifecycle_1" not in amos.store.candidate_atom_ids_for_tokens(
+        ["exercise"]
+    )
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={
+            "enabled": True,
+            "archive_superseded": True,
+            "archive_superseded_after_seconds": 0,
+        },
+        storage_cleanup={"enabled": False},
+    )
+
+    result = amos.run_memory_policy(force=True, trigger="head_lifecycle_test")
+
+    assert result["results"]["decay"]["actions"][0]["atom_ref"] == (
+        "goal_lifecycle_1"
+    )
+    assert amos.store.get_atom("goal_lifecycle_1")["lifecycle_state"] == (
+        "archived"
+    )
+    assert amos.store.get_atom("goal_lifecycle_2")["lifecycle_state"] == "active"
+    assert amos.verify_replay()["status"] == "ok"
+
+
 def test_project_work_heads_are_typed_versioned_and_cas_guarded(amos):
     first = amos.commit_memory_transaction(
         scope=SCOPE,

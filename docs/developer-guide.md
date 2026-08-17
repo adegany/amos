@@ -479,6 +479,15 @@ proposal retention/deduplication, separate active/proposed quota enforcement,
 cache invalidation, and capacity governance. It does not require an LLM or an
 external vector database.
 
+Storage cleanup runs after either a quiet interval or configured orange/red
+capacity pressure. Pressure bypasses the idle gate but remains rate-limited.
+Expired records are physically removed from `amos_atoms` and `amos_edges` after
+their tombstone/retired identity is durable; old journal bodies become a
+snapshot plus bounded recent segments and compact receipts. Capacity includes
+both the SQLite main file and WAL. New databases use incremental auto-vacuum;
+an older database needs one full `VACUUM` before incremental file-byte reclaim
+is available.
+
 Distillation and maintenance-processor commits precede decay within one policy
 pass. A newly committed active successor therefore causes its active
 predecessor to be archived before that pass completes, avoiding a transient

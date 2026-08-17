@@ -44,14 +44,14 @@ Status terms:
 | Schema | Implemented | Envelope/payload separation, required fields, property types, enum constraints, and score bounds are tested. |
 | Journal | Implemented | Events include authorization context, expected versions, checksums, and projection status. |
 | Projection | Implemented | Canonical mutations append events and project graph changes transactionally. |
-| Replay | Partial | `DiagnosticsService.verify_replay()` rebuilds from the full retained journal. Snapshot-plus-tail recovery and segment compaction are not implemented. |
+| Replay | Implemented | `DiagnosticsService.verify_replay()` rebuilds from the latest compressed snapshot plus the live tail. Chain verification checks retained event bodies and truthfully labels older digest-only segment boundaries. |
 | Retrieval and attention | Implemented | Graph-version cache keys, token candidate indexing, semantic fallback, scoped edge activation, score components, omissions, provenance, degradation, and attention traces are tested. |
 | Self-awareness and agentic recall | Implemented | Runtime capability suppression, commitments, calibration, responsibility attribution, counterevidence, and self-narrative expiry are tested. |
 | Shared memory | Implemented | Common graph-version views plus identity-specific overlays and evidence omissions are tested. |
 | Authorization | Implemented | Scope, visibility, mutation roles, trust levels, capabilities, and evidence visibility are independently exercised. |
 | Constitutional authorship | Implemented | External sources can remain evidence, but only an identity-matched `self_ratification` capability can adopt a proposal; generic mutation and privileged maintenance cannot substitute for that transition. |
-| Deletion | Partial | Atom/edge suppression, hot index/cache cleanup, tombstones, replay exclusion, and residual-retention disclosure are tested. External evidence archives, snapshots, key management, and backups are not owned by v1-local. |
-| Capacity | Partial | One SQLite-file byte budget produces one pressure mode and packet degradation. Per-tier and external-store budgets are planned. |
+| Deletion | Partial | Expired atom/edge payload rows are physically purged behind tombstones and retired identities; hot indexes/cache and compacted journal bodies are removed. External evidence archives, key management, and backups are not owned by v1-local. |
+| Capacity | Partial | The SQLite main file and WAL jointly produce one pressure mode, maintenance escalation, and packet degradation. Per-tier and external-store budgets are planned. |
 | SMP and processor packs | Implemented | Deterministic proposal envelopes, review gates, low-risk auto-commit policy, and external processor loading are tested. |
 | Memory policy | Implemented | Background and forced deterministic maintenance, decay, cleanup, distillation, index refresh, cache invalidation, and journal summaries are tested. |
 | Concurrency | Implemented for one process | Composite reads are revision-pinned, writers use FIFO database-scoped admission across connections, HTTP reads queue policy work in the background, policy execution is single-flight, cleanup/index/decay writes are batched, and stale steward, decay, and derived-index plans fail closed. Multi-process coordination remains a production-adapter concern. |

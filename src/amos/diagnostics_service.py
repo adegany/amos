@@ -1,6 +1,7 @@
 """DiagnosticsService implementation for the AMOS service facade."""
 
 from ._service_support import Any, digest
+from .journal_replay import empty_replay_state, replay_events
 from .store import migrated_edge_derivation
 
 
@@ -77,16 +78,20 @@ class DiagnosticsService:
 
     def health_capacity(self) -> dict[str, Any]:
         path = self.store.path
-        size_bytes = path.stat().st_size if path.exists() and str(path) != ":memory:" else 0
+        usage = self.store.storage_usage()
         with self.store.read_snapshot():
             budget = self._capacity_budget()
             pressure_mode = self._capacity_pressure_mode(
-                size_bytes=size_bytes, budget=budget
+                size_bytes=int(usage["managed_size_bytes"]), budget=budget
             )
             return {
                 "store": getattr(self.store, "backend_name", "unknown"),
                 "path": str(path),
-                "size_bytes": size_bytes,
+                # Preserve size_bytes as the total capacity-accounted value.
+                "size_bytes": int(usage["managed_size_bytes"]),
+                **usage,
+                "sqlite_space": self.store.sqlite_space_status(),
+                "journal_storage": self.store.journal_storage_status(),
                 "capacity_budget": budget,
                 "pressure_mode": pressure_mode,
                 "graph_version": self.store.graph_version(),
@@ -107,10 +112,25 @@ class DiagnosticsService:
             return self._verify_journal_chain()
 
     def _verify_journal_chain(self) -> dict[str, Any]:
-        events = self.store.list_events()
         previous = "genesis"
-        failures = []
-        for event in events:
+        expected_graph_version = 1
+        failures: list[dict[str, Any]] = []
+        retained_event_count = 0
+        digest_only_event_count = 0
+        compact_receipt_count = 0
+
+        def verify_event(event: dict[str, Any]) -> None:
+            nonlocal previous, expected_graph_version
+            graph_version = int(event["graph_version"])
+            if graph_version != expected_graph_version:
+                failures.append(
+                    {
+                        "event_id": event["event_id"],
+                        "reason": "graph_version_gap",
+                        "expected": expected_graph_version,
+                        "actual": graph_version,
+                    }
+                )
             if event["previous_event_hash"] != previous:
                 failures.append(
                     {
@@ -130,11 +150,218 @@ class DiagnosticsService:
                     }
                 )
             previous = event["checksum"]
+            expected_graph_version = graph_version + 1
+
+        segments = self.store.list_journal_segments()
+        for segment in segments:
+            start = int(segment["start_graph_version"])
+            end = int(segment["end_graph_version"])
+            count = int(segment["event_count"])
+            if start != expected_graph_version:
+                failures.append(
+                    {
+                        "segment_id": segment["segment_id"],
+                        "reason": "segment_graph_version_gap",
+                        "expected": expected_graph_version,
+                        "actual": start,
+                    }
+                )
+            if str(segment["first_previous_event_hash"]) != previous:
+                failures.append(
+                    {
+                        "segment_id": segment["segment_id"],
+                        "reason": "segment_previous_hash_mismatch",
+                        "expected": previous,
+                        "actual": segment["first_previous_event_hash"],
+                    }
+                )
+            if int(segment.get("payload_retained", 1) or 0):
+                try:
+                    events = self.store.journal_segment_events(
+                        str(segment["segment_id"])
+                    ) or []
+                except Exception as exc:
+                    failures.append(
+                        {
+                            "segment_id": segment["segment_id"],
+                            "reason": "segment_payload_invalid",
+                            "error": str(exc),
+                        }
+                    )
+                    events = []
+                if len(events) != count:
+                    failures.append(
+                        {
+                            "segment_id": segment["segment_id"],
+                            "reason": "segment_event_count_mismatch",
+                            "expected": count,
+                            "actual": len(events),
+                        }
+                    )
+                for event in events:
+                    verify_event(event)
+                if events:
+                    if str(events[0]["event_id"]) != str(segment["first_event_id"]):
+                        failures.append(
+                            {
+                                "segment_id": segment["segment_id"],
+                                "reason": "segment_first_event_mismatch",
+                            }
+                        )
+                    if str(events[-1]["event_id"]) != str(segment["last_event_id"]):
+                        failures.append(
+                            {
+                                "segment_id": segment["segment_id"],
+                                "reason": "segment_last_event_mismatch",
+                            }
+                        )
+                    if previous != str(segment["last_event_hash"]):
+                        failures.append(
+                            {
+                                "segment_id": segment["segment_id"],
+                                "reason": "segment_last_hash_mismatch",
+                            }
+                        )
+                retained_event_count += count
+            else:
+                # The detailed payload was deliberately shredded after the
+                # snapshot covered it. Receipts preserve exact event refs and
+                # checksum links without pretending the discarded payload can
+                # still be recomputed.
+                digest_only_event_count += count
+                try:
+                    receipts = self.store.list_journal_event_receipts(
+                        str(segment["segment_id"])
+                    )
+                except Exception as exc:
+                    failures.append(
+                        {
+                            "segment_id": segment["segment_id"],
+                            "reason": "segment_compact_receipt_invalid",
+                            "error": str(exc),
+                        }
+                    )
+                    receipts = []
+                if len(receipts) != count:
+                    failures.append(
+                        {
+                            "segment_id": segment["segment_id"],
+                            "reason": "segment_compact_receipt_count_mismatch",
+                            "expected": count,
+                            "actual": len(receipts),
+                        }
+                    )
+                for receipt in receipts:
+                    graph_version = int(receipt["graph_version"])
+                    if graph_version != expected_graph_version:
+                        failures.append(
+                            {
+                                "event_id": receipt["event_id"],
+                                "reason": "compact_receipt_graph_version_gap",
+                                "expected": expected_graph_version,
+                                "actual": graph_version,
+                            }
+                        )
+                    if str(receipt["previous_event_hash"]) != previous:
+                        failures.append(
+                            {
+                                "event_id": receipt["event_id"],
+                                "reason": "compact_receipt_chain_mismatch",
+                                "expected": previous,
+                                "actual": receipt["previous_event_hash"],
+                            }
+                        )
+                    previous = str(receipt["checksum"])
+                    expected_graph_version = graph_version + 1
+                compact_receipt_count += len(receipts)
+                if receipts:
+                    if str(receipts[0]["event_id"]) != str(
+                        segment["first_event_id"]
+                    ) or str(receipts[-1]["event_id"]) != str(
+                        segment["last_event_id"]
+                    ):
+                        failures.append(
+                            {
+                                "segment_id": segment["segment_id"],
+                                "reason": "segment_compact_receipt_boundary_mismatch",
+                            }
+                        )
+                    if previous != str(segment["last_event_hash"]):
+                        failures.append(
+                            {
+                                "segment_id": segment["segment_id"],
+                                "reason": "segment_compact_receipt_hash_mismatch",
+                            }
+                        )
+                else:
+                    previous = str(segment["last_event_hash"])
+                    expected_graph_version = end + 1
+
+        live_events = self.store.list_live_events()
+        for event in live_events:
+            verify_event(event)
+
+        try:
+            snapshot = self.store.latest_journal_snapshot()
+        except Exception as exc:
+            snapshot = None
+            failures.append(
+                {
+                    "reason": "journal_snapshot_invalid",
+                    "error": str(exc),
+                }
+            )
+        if snapshot is not None:
+            through = int(snapshot["through_graph_version"])
+            covering = next(
+                (
+                    segment
+                    for segment in segments
+                    if int(segment["end_graph_version"]) == through
+                ),
+                None,
+            )
+            if (
+                covering is None
+                or str(covering["last_event_hash"])
+                != str(snapshot["through_event_hash"])
+                or str(covering["last_event_id"])
+                != str(snapshot["through_event_id"])
+            ):
+                failures.append(
+                    {
+                        "snapshot_id": snapshot["snapshot_id"],
+                        "reason": "snapshot_segment_boundary_mismatch",
+                    }
+                )
+
+        journal_head = self.store.last_event_hash()
+        if previous != journal_head:
+            failures.append(
+                {
+                    "reason": "journal_head_mismatch",
+                    "expected": previous,
+                    "actual": journal_head,
+                }
+            )
+        event_count = (
+            retained_event_count
+            + digest_only_event_count
+            + len(live_events)
+        )
         return {
             "status": "ok" if not failures else "failed",
-            "event_count": len(events),
+            "event_count": event_count,
+            "fully_verified_event_count": retained_event_count + len(live_events),
+            "digest_only_event_count": digest_only_event_count,
+            "compact_receipt_count": compact_receipt_count,
+            "verification_scope": (
+                "retained_payloads_plus_compacted_boundaries"
+                if digest_only_event_count
+                else "full_event_payloads"
+            ),
             "graph_version": self.store.graph_version(),
-            "journal_head": self.store.last_event_hash(),
+            "journal_head": journal_head,
             "failures": failures,
         }
 
@@ -144,166 +371,24 @@ class DiagnosticsService:
             return self._replay_graph()
 
     def _replay_graph(self) -> dict[str, Any]:
-        atoms: dict[str, dict[str, Any]] = {}
-        edges: dict[str, dict[str, Any]] = {}
-        # SQLite retains deleted edge rows, and insert-only writers use
-        # ``ON CONFLICT DO NOTHING``.  Keep that physical identity history so a
-        # later duplicate journal projection is replayed as the same no-op.
-        known_edge_ids: set[str] = set()
-        heads: dict[str, dict[str, Any]] = {}
-        tombstones: dict[str, dict[str, Any]] = {}
-
-        def replay_edge_projection(edge: dict[str, Any]) -> dict[str, Any]:
-            projected = dict(edge)
-            derivation = projected.get("derivation")
-            if not isinstance(derivation, dict) or not derivation:
-                projected["derivation"] = migrated_edge_derivation(
-                    str(projected.get("relation") or "")
-                )
-            return projected
-
-        def replay_inserted_edge(edge: dict[str, Any]) -> None:
-            edge_id = str(edge["edge_id"])
-            if edge_id in known_edge_ids:
-                return
-            known_edge_ids.add(edge_id)
-            if not edge.get("deleted"):
-                edges[edge_id] = replay_edge_projection(edge)
-
-        def replay_upserted_edge(edge: dict[str, Any]) -> None:
-            edge_id = str(edge["edge_id"])
-            known_edge_ids.add(edge_id)
-            if edge.get("deleted"):
-                edges.pop(edge_id, None)
-            else:
-                edges[edge_id] = replay_edge_projection(edge)
-
-        def replay_legacy_retrieval_edge_feedback(
-            payload: dict[str, Any],
-        ) -> None:
-            """Replay feedback events written before full edges were journaled."""
-
-            if payload.get("projected_edges"):
-                return
-            feedback = payload.get("feedback") or {}
-            summaries = feedback.get("updated_edges") or []
-            if not summaries:
-                return
-            projected_atoms = payload.get("projected_atoms") or []
-            timestamp = None
-            label = None
-            for atom in projected_atoms:
-                telemetry = (atom.get("decay_policy") or {}).get(
-                    "retrieval_telemetry"
-                ) or {}
-                timestamp = telemetry.get("last_outcome_at") or atom.get("updated_at")
-                label = telemetry.get("last_outcome_label")
-                if timestamp:
-                    break
-            for summary in summaries:
-                edge_id = str(summary.get("edge_id") or "")
-                prior = edges.get(edge_id)
-                if not edge_id or prior is None:
-                    continue
-                changed = dict(prior)
-                derivation = dict(changed.get("derivation") or {})
-                telemetry = dict(derivation.get("retrieval_telemetry") or {})
-                telemetry.update(
-                    {
-                        "used_count": int(summary.get("used_count", 0) or 0),
-                        "correction_count": int(
-                            summary.get("correction_count", 0) or 0
-                        ),
-                        "last_outcome_label": label,
-                        "last_outcome_at": timestamp,
-                    }
-                )
-                derivation["retrieval_telemetry"] = telemetry
-                changed["derivation"] = derivation
-                if timestamp:
-                    changed["updated_at"] = timestamp
-                changed["version"] = int(changed.get("version", 0) or 0) + 1
-                edges[edge_id] = replay_edge_projection(changed)
-
-        for event in self.store.list_events():
-            payload = event["payload"]
-            event_type = event["event_type"]
-            if event_type == "atom_committed":
-                atom = payload["atom"]
-                atoms[atom["id"]] = atom
-                for edge in payload.get("projected_edges", []):
-                    replay_inserted_edge(edge)
-            elif event_type == "atom_updated":
-                atom = payload["after"]
-                atoms[atom["id"]] = atom
-                for edge in payload.get("projected_edges", []):
-                    replay_upserted_edge(edge)
-            elif event_type == "atom_deleted":
-                before = payload["before"]
-                atom_id = before["id"]
-                atoms.pop(atom_id, None)
-                tombstone = payload["tombstone"]
-                tombstones[tombstone["target_ref"]] = tombstone
-                for edge in payload.get("projected_edges", []):
-                    replay_upserted_edge(edge)
-            elif event_type == "memories_distilled":
-                atom = payload["atom"]
-                atoms[atom["id"]] = atom
-                for edge in payload.get("projected_edges", []):
-                    replay_inserted_edge(edge)
-            elif event_type == "edge_committed":
-                for edge in payload.get("projected_edges", []):
-                    replay_upserted_edge(edge)
-            elif event_type == "memory_transaction_committed":
-                for atom in payload.get("projected_atoms", []):
-                    if atom.get("deleted"):
-                        atoms.pop(atom["id"], None)
-                    else:
-                        atoms[atom["id"]] = atom
-                for edge in payload.get("projected_edges", []):
-                    replay_inserted_edge(edge)
-                for head in payload.get("projected_heads", []):
-                    key = (
-                        f"{digest(head.get('scope') or {})}:"
-                        f"{head.get('series_kind')}:{head.get('series_id')}"
-                    )
-                    heads[key] = {
-                        **dict(head),
-                        "scope_digest": digest(head.get("scope") or {}),
-                        "journal_event_id": event["event_id"],
-                        "updated_at": event["accepted_at"],
-                    }
-            elif event_type in {
-                "atom_merged",
-                "proposal_ratified",
-                "proposal_resolved",
-                "constitutional_record_replaced",
-                "steward_run",
-                "retrieval_outcome_recorded",
-                "memory_reference_contract_repaired",
-                "decay_policy_applied",
-                "storage_cleanup_run",
-            }:
-                for atom in payload.get("projected_atoms", []):
-                    if atom.get("deleted"):
-                        atoms.pop(atom["id"], None)
-                    else:
-                        atoms[atom["id"]] = atom
-                for edge in payload.get("projected_edges", []):
-                    if event_type == "atom_merged":
-                        replay_inserted_edge(edge)
-                    else:
-                        replay_upserted_edge(edge)
-                if event_type == "retrieval_outcome_recorded":
-                    replay_legacy_retrieval_edge_feedback(payload)
-                for tombstone in payload.get("tombstones", []):
-                    tombstones[tombstone["target_ref"]] = tombstone
+        snapshot = self.store.latest_journal_snapshot()
+        through_graph_version = int(
+            (snapshot or {}).get("through_graph_version", 0) or 0
+        )
+        replayed = replay_events(
+            self.store.list_live_events(
+                after_graph_version=through_graph_version
+            ),
+            initial_state=(snapshot or {}).get("state") or empty_replay_state(),
+            migrated_edge_derivation=migrated_edge_derivation,
+        )
         return {
             "graph_version": self.store.graph_version(),
-            "atoms": atoms,
-            "edges": edges,
-            "heads": heads,
-            "tombstones": tombstones,
+            "snapshot_graph_version": through_graph_version,
+            "atoms": replayed["atoms"],
+            "edges": replayed["edges"],
+            "heads": replayed["heads"],
+            "tombstones": replayed["tombstones"],
         }
 
 
