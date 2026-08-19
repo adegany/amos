@@ -555,119 +555,146 @@ class StewardshipService:
         scope: Mapping[str, Any] | None = None,
         actor: str = "system",
         approved_by: str | None = None,
+        max_atoms: int | None = None,
+        max_edge_mutations: int | None = None,
+        start_after: str | None = None,
     ) -> dict[str, Any]:
         scope = dict(scope or {})
         actions: list[dict[str, Any]] = []
         projected_atoms: list[dict[str, Any]] = []
         projected_edges: list[dict[str, Any]] = []
-        # Clustering and conflict detection dominate steward cost. Compute
-        # them on a pinned WAL snapshot so foreground writers can continue,
-        # then fail closed if that canonical base moved before publication.
+        atom_limit = None if max_atoms is None else max(1, int(max_atoms or 1))
+        edge_limit = (
+            None
+            if max_edge_mutations is None
+            else max(1, int(max_edge_mutations or 1))
+        )
+        cursor = str(start_after or "")
+
+        # Plan every read-heavy phase on a pinned WAL snapshot. The previous
+        # implementation moved only SMP clustering out of the write
+        # transaction, while full edge scans, endpoint resolution, intrinsic
+        # projection, and duplicate analysis still monopolized SQLite's one
+        # writer. Exact reads then blocked while publishing packet receipts.
         with self.store.read_snapshot():
             planning_revision = self.store.memory_revision()
+            visible_atoms = self.store.list_atoms_filtered()
+            atoms_by_ref = {
+                str(atom["id"]): atom
+                for atom in visible_atoms
+                if str(atom.get("id") or "")
+            }
             atoms = [
                 atom
-                for atom in self.store.list_atoms_filtered(
-                    lifecycle_states=["active"],
-                )
+                for atom in visible_atoms
                 if not atom.get("deleted")
                 and atom.get("lifecycle_state") == "active"
-                and scope_visible(atom["scope"], scope)
+                and maintenance_scope_visible(atom["scope"], scope)
             ]
-            smp_outputs = self.smp.cluster(atoms) + self.smp.detect_conflicts(
-                atoms
+            atoms.sort(key=lambda atom: str(atom.get("id") or ""))
+            ordered_atoms = atoms
+            wrapped = False
+            if atom_limit is not None and atoms:
+                split_at = 0
+                if cursor:
+                    split_at = next(
+                        (
+                            index
+                            for index, atom in enumerate(atoms)
+                            if str(atom.get("id") or "") > cursor
+                        ),
+                        len(atoms),
+                    )
+                    wrapped = split_at == len(atoms)
+                ordered_atoms = atoms[split_at:] + atoms[:split_at]
+            selected_atoms = (
+                ordered_atoms
+                if atom_limit is None
+                else ordered_atoms[:atom_limit]
             )
-        with self.store.transaction() as conn:
-            current_revision = self.store.memory_revision()
-            if current_revision != planning_revision:
-                return {
-                    "status": "stale",
-                    "reason": "canonical_revision_advanced_during_steward_planning",
-                    "actions": [],
-                    "event": None,
-                    "planned_revision": planning_revision,
-                    "current_revision": current_revision,
-                    "graph_version": int(current_revision["graph_version"]),
-                }
+            selected_atom_ids = {
+                str(atom["id"]) for atom in selected_atoms
+            }
+            next_cursor = (
+                str(selected_atoms[-1]["id"])
+                if atom_limit is not None
+                and len(atoms) > len(selected_atoms)
+                and selected_atoms
+                else None
+            )
+
+            smp_outputs = self.smp.cluster(
+                selected_atoms
+            ) + self.smp.detect_conflicts(selected_atoms)
+            edges = self.store.list_edges()
             live_attachment_relations = {
                 "rel:attributed_to",
                 "rel:has_capability",
                 "rel:has_limitation",
                 "rel:made_commitment",
             }
-            invalid_attachment_edge_ids: list[str] = []
-            for edge in self.store.list_edges():
-                if edge.get("relation") not in live_attachment_relations:
-                    continue
+            invalid_attachment_candidates: list[str] = []
+            proposed_endpoint_candidates: list[str] = []
+            for edge in edges:
+                edge_id = str(edge.get("edge_id") or "")
                 endpoints = (
-                    self.store.get_atom(str(edge.get("source_ref") or "")),
-                    self.store.get_atom(str(edge.get("target_ref") or "")),
+                    atoms_by_ref.get(str(edge.get("source_ref") or "")),
+                    atoms_by_ref.get(str(edge.get("target_ref") or "")),
                 )
-                if any(
-                    atom is None
-                    or atom.get("deleted")
-                    or atom.get("lifecycle_state") != "active"
-                    for atom in endpoints
+                if edge.get("relation") in live_attachment_relations and any(
+                    endpoint is None
+                    or endpoint.get("deleted")
+                    or endpoint.get("lifecycle_state") != "active"
+                    for endpoint in endpoints
                 ):
-                    invalid_attachment_edge_ids.append(str(edge.get("edge_id") or ""))
-            invalid_attachment_edges = self.store.mark_edges_deleted(
-                conn, invalid_attachment_edge_ids
-            )
-            if invalid_attachment_edges:
-                projected_edges.extend(invalid_attachment_edges)
-                actions.append(
-                    {
-                        "action": "prune_inactive_attachment_edges",
-                        "edge_count": len(invalid_attachment_edges),
-                        "relations": sorted(
-                            {
-                                str(edge.get("relation") or "")
-                                for edge in invalid_attachment_edges
-                            }
-                        ),
-                    }
-                )
-            proposed_endpoint_edge_ids: list[str] = []
-            for edge in self.store.list_edges():
-                if edge.get("lifecycle_state") != "active":
+                    invalid_attachment_candidates.append(edge_id)
                     continue
-                endpoints = (
-                    self.store.get_atom(str(edge.get("source_ref") or "")),
-                    self.store.get_atom(str(edge.get("target_ref") or "")),
-                )
-                if any(
-                    atom is not None
-                    and not atom.get("deleted")
-                    and atom.get("lifecycle_state") == "proposed"
-                    for atom in endpoints
+                if edge.get("lifecycle_state") == "active" and any(
+                    endpoint is not None
+                    and not endpoint.get("deleted")
+                    and endpoint.get("lifecycle_state") == "proposed"
+                    for endpoint in endpoints
                 ):
-                    proposed_endpoint_edge_ids.append(str(edge.get("edge_id") or ""))
-            proposed_endpoint_edges = self.store.mark_edges_deleted(
-                conn, proposed_endpoint_edge_ids
-            )
-            if proposed_endpoint_edges:
-                projected_edges.extend(proposed_endpoint_edges)
-                actions.append(
-                    {
-                        "action": "isolate_proposed_endpoint_edges",
-                        "edge_count": len(proposed_endpoint_edges),
-                        "policy": "proposed_atoms_do_not_participate_in_active_graph",
-                    }
+                    proposed_endpoint_candidates.append(edge_id)
+
+            invalid_attachment_candidates.sort()
+            proposed_endpoint_candidates.sort()
+            if edge_limit is None:
+                invalid_attachment_edge_ids = invalid_attachment_candidates
+                proposed_endpoint_edge_ids = proposed_endpoint_candidates
+            else:
+                invalid_attachment_edge_ids = invalid_attachment_candidates[
+                    :edge_limit
+                ]
+                remaining_edge_budget = max(
+                    0, edge_limit - len(invalid_attachment_edge_ids)
                 )
-            existing_edges = {
-                edge["edge_id"]: edge for edge in self.store.list_edges()
+                proposed_endpoint_edge_ids = proposed_endpoint_candidates[
+                    :remaining_edge_budget
+                ]
+            planned_deleted_edge_ids = {
+                *invalid_attachment_edge_ids,
+                *proposed_endpoint_edge_ids,
             }
-            intrinsic_edge_count = 0
-            refreshed_intrinsic_edge_count = 0
-            for atom in atoms:
+
+            existing_edges = {
+                str(edge["edge_id"]): edge
+                for edge in edges
+                if str(edge.get("edge_id") or "")
+                not in planned_deleted_edge_ids
+            }
+            intrinsic_edge_plans: list[tuple[str, dict[str, Any]]] = []
+            for atom in selected_atoms:
                 for edge in self._intrinsic_edges_for_atom(atom):
-                    existing_edge = existing_edges.get(edge["edge_id"])
+                    existing_edge = existing_edges.get(str(edge["edge_id"]))
                     if existing_edge is not None:
                         evidence_refs = sorted(
                             {
                                 *(
                                     str(ref)
-                                    for ref in existing_edge.get("evidence_refs", [])
+                                    for ref in existing_edge.get(
+                                        "evidence_refs", []
+                                    )
                                     if str(ref)
                                 ),
                                 *(
@@ -712,15 +739,167 @@ class StewardshipService:
                             "updated_at": utc_now(),
                             "version": int(existing_edge.get("version", 1)) + 1,
                         }
-                        self.store.upsert_edge(conn, edge)
-                        existing_edges[edge["edge_id"]] = edge
-                        projected_edges.append(edge)
-                        refreshed_intrinsic_edge_count += 1
-                        continue
+                        intrinsic_edge_plans.append(("upsert", edge))
+                    else:
+                        intrinsic_edge_plans.append(("insert", edge))
+                    existing_edges[str(edge["edge_id"])] = edge
+
+            exact_seen: dict[str, dict[str, Any]] = {}
+            exact_duplicates: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+            for atom in sorted(
+                atoms,
+                key=lambda row: (
+                    str(row.get("created_at") or ""),
+                    str(row.get("id") or ""),
+                ),
+            ):
+                key = digest(
+                    {
+                        "type": atom["type"],
+                        "payload": atom["payload"],
+                        "scope": atom["scope"],
+                    }
+                )
+                existing = exact_seen.get(key)
+                if existing is None:
+                    exact_seen[key] = atom
+                else:
+                    exact_duplicates[str(atom["id"])] = (atom, existing)
+            exact_duplicate_plans = [
+                exact_duplicates[atom_id]
+                for atom_id in sorted(
+                    selected_atom_ids.intersection(exact_duplicates)
+                )
+            ]
+
+            structured_groups: dict[
+                tuple[Any, ...], list[dict[str, Any]]
+            ] = {}
+            for atom in atoms:
+                if str(atom["id"]) in exact_duplicates:
+                    continue
+                key = self._structured_duplicate_key(atom)
+                if key is not None:
+                    structured_groups.setdefault(key, []).append(atom)
+            structured_duplicate_plans: list[
+                tuple[tuple[Any, ...], dict[str, Any], dict[str, Any]]
+            ] = []
+            for key, group in structured_groups.items():
+                if len(group) < 2:
+                    continue
+                kept = max(
+                    group,
+                    key=lambda atom: (
+                        self._structured_duplicate_quality(atom),
+                        str(atom.get("updated_at") or ""),
+                        str(atom.get("id") or ""),
+                    ),
+                )
+                for atom in group:
+                    if (
+                        atom["id"] != kept["id"]
+                        and str(atom["id"]) in selected_atom_ids
+                    ):
+                        structured_duplicate_plans.append((key, atom, kept))
+
+            duplicate_ids = set(exact_duplicates)
+            duplicate_ids.update(
+                str(atom["id"])
+                for _key, atom, _kept in structured_duplicate_plans
+            )
+            contradiction_groups: dict[
+                tuple[Any, ...], dict[str, dict[str, Any]]
+            ] = {}
+            for atom in atoms:
+                if str(atom["id"]) in duplicate_ids:
+                    continue
+                signature = self._contradiction_signature(atom)
+                if signature is None:
+                    continue
+                key, value = signature
+                contradiction_groups.setdefault(key, {})[value] = atom
+            contradiction_plans = [
+                list(values.values())
+                for values in contradiction_groups.values()
+                if len(values) >= 2
+                and any(
+                    str(atom["id"]) in selected_atom_ids
+                    for atom in values.values()
+                )
+            ]
+
+            window = {
+                "cursor": cursor or None,
+                "next_cursor": next_cursor,
+                "wrapped": wrapped,
+                "total_atom_count": len(atoms),
+                "selected_atom_count": len(selected_atoms),
+                "max_atoms": atom_limit,
+                "total_edge_count": len(edges),
+                "candidate_edge_mutation_count": len(
+                    {
+                        *invalid_attachment_candidates,
+                        *proposed_endpoint_candidates,
+                    }
+                ),
+                "selected_edge_mutation_count": len(
+                    planned_deleted_edge_ids
+                ),
+                "max_edge_mutations": edge_limit,
+            }
+
+        with self.store.transaction() as conn:
+            current_revision = self.store.memory_revision()
+            if current_revision != planning_revision:
+                return {
+                    "status": "stale",
+                    "reason": "canonical_revision_advanced_during_steward_planning",
+                    "actions": [],
+                    "event": None,
+                    "planned_revision": planning_revision,
+                    "current_revision": current_revision,
+                    "graph_version": int(current_revision["graph_version"]),
+                    "window": window,
+                }
+            invalid_attachment_edges = self.store.mark_edges_deleted(
+                conn, invalid_attachment_edge_ids
+            )
+            if invalid_attachment_edges:
+                projected_edges.extend(invalid_attachment_edges)
+                actions.append(
+                    {
+                        "action": "prune_inactive_attachment_edges",
+                        "edge_count": len(invalid_attachment_edges),
+                        "relations": sorted(
+                            {
+                                str(edge.get("relation") or "")
+                                for edge in invalid_attachment_edges
+                            }
+                        ),
+                    }
+                )
+            proposed_endpoint_edges = self.store.mark_edges_deleted(
+                conn, proposed_endpoint_edge_ids
+            )
+            if proposed_endpoint_edges:
+                projected_edges.extend(proposed_endpoint_edges)
+                actions.append(
+                    {
+                        "action": "isolate_proposed_endpoint_edges",
+                        "edge_count": len(proposed_endpoint_edges),
+                        "policy": "proposed_atoms_do_not_participate_in_active_graph",
+                    }
+                )
+            intrinsic_edge_count = 0
+            refreshed_intrinsic_edge_count = 0
+            for operation, edge in intrinsic_edge_plans:
+                if operation == "upsert":
+                    self.store.upsert_edge(conn, edge)
+                    refreshed_intrinsic_edge_count += 1
+                else:
                     self.store.insert_edge(conn, edge)
-                    existing_edges[edge["edge_id"]] = edge
-                    projected_edges.append(edge)
                     intrinsic_edge_count += 1
+                projected_edges.append(edge)
             if intrinsic_edge_count:
                 actions.append(
                     {
@@ -737,19 +916,7 @@ class StewardshipService:
                         "policy": "merge_structured_edge_provenance",
                     }
                 )
-            seen: dict[str, dict[str, Any]] = {}
-            for atom in sorted(atoms, key=lambda row: row["created_at"]):
-                key = digest(
-                    {
-                        "type": atom["type"],
-                        "payload": atom["payload"],
-                        "scope": atom["scope"],
-                    }
-                )
-                existing = seen.get(key)
-                if existing is None:
-                    seen[key] = atom
-                    continue
+            for atom, existing in exact_duplicate_plans:
                 duplicate, deleted_edges = self._archive_atom_projection(
                     conn,
                     atom,
@@ -772,69 +939,27 @@ class StewardshipService:
                         ],
                     }
                 )
-            structured_groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
-            archived_ids = {atom["id"] for atom in projected_atoms}
-            for atom in atoms:
-                if atom["id"] in archived_ids:
-                    continue
-                key = self._structured_duplicate_key(atom)
-                if key is None:
-                    continue
-                structured_groups.setdefault(key, []).append(atom)
-            for key, group in structured_groups.items():
-                active_group = [
-                    atom
-                    for atom in group
-                    if atom["id"] not in archived_ids
-                    and atom.get("lifecycle_state") == "active"
-                    and not atom.get("deleted")
-                ]
-                if len(active_group) < 2:
-                    continue
-                kept = max(
-                    active_group,
-                    key=lambda atom: (
-                        self._structured_duplicate_quality(atom),
-                        str(atom.get("updated_at") or ""),
-                        str(atom.get("id") or ""),
-                    ),
+            for key, atom, kept in structured_duplicate_plans:
+                duplicate, deleted_edges = self._archive_atom_projection(
+                    conn,
+                    atom,
+                    reason=f"structured_duplicate:{key[0]}",
+                    superseded_by=kept["id"],
+                    actor=actor,
                 )
-                for atom in active_group:
-                    if atom["id"] == kept["id"]:
-                        continue
-                    duplicate, deleted_edges = self._archive_atom_projection(
-                        conn,
-                        atom,
-                        reason=f"structured_duplicate:{key[0]}",
-                        superseded_by=kept["id"],
-                        actor=actor,
-                    )
-                    archived_ids.add(duplicate["id"])
-                    projected_atoms.append(duplicate)
-                    projected_edges.extend(deleted_edges)
-                    actions.append(
-                        {
-                            "action": "archive_structured_duplicate",
-                            "kind": key[0],
-                            "kept": kept["id"],
-                            "archived": duplicate["id"],
-                            "deleted_edge_count": len(deleted_edges),
-                        }
-                    )
+                projected_atoms.append(duplicate)
+                projected_edges.extend(deleted_edges)
+                actions.append(
+                    {
+                        "action": "archive_structured_duplicate",
+                        "kind": key[0],
+                        "kept": kept["id"],
+                        "archived": duplicate["id"],
+                        "deleted_edge_count": len(deleted_edges),
+                    }
+                )
 
-            contradiction_groups: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = {}
-            for atom in atoms:
-                if atom["id"] in archived_ids:
-                    continue
-                signature = self._contradiction_signature(atom)
-                if signature is None:
-                    continue
-                key, value = signature
-                contradiction_groups.setdefault(key, {})[value] = atom
-            for values in contradiction_groups.values():
-                if len(values) < 2:
-                    continue
-                group_atoms = list(values.values())
+            for group_atoms in contradiction_plans:
                 if approved_by:
                     for atom in group_atoms:
                         changed = dict(atom)
@@ -882,6 +1007,7 @@ class StewardshipService:
                     "actions": actions,
                     "projected_atoms": projected_atoms,
                     "projected_edges": projected_edges,
+                    "window": window,
                 },
                 target_refs=[
                     ref
@@ -900,6 +1026,7 @@ class StewardshipService:
             "actions": actions,
             "event": event,
             "graph_version": self.store.graph_version(),
+            "window": window,
         }
 
 

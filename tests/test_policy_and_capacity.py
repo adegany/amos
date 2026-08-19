@@ -688,6 +688,98 @@ def test_memory_policy_is_due_immediately_when_hot_atom_quota_is_exceeded(amos):
     assert "memory_atom_pressure:hot" in due["reasons"]
 
 
+def test_memory_policy_pressure_trigger_observes_completion_cooldown(amos):
+    amos.configure_memory_policy(
+        schedule={
+            "every_graph_versions": 1000,
+            "every_seconds": 3600,
+            "run_on_pressure": True,
+            "pressure_min_interval_seconds": 300,
+        },
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={
+            "enabled": False,
+            "max_atoms": 1,
+            "max_active_atoms": 10,
+            "max_proposed_atoms": 10,
+        },
+        storage_cleanup={"enabled": False},
+    )
+    for index in range(2):
+        amos.commit_atom(
+            {
+                "id": f"pressure_cooldown_{index}",
+                "type": "semantic",
+                "payload": {"summary": f"Pressure cooldown {index}"},
+            }
+        )
+    first = amos.run_memory_policy(force=True, trigger="pressure_cooldown_seed")
+    assert first["status"] == "completed"
+
+    amos.commit_atom(
+        {
+            "id": "pressure_cooldown_new_growth",
+            "type": "semantic",
+            "payload": {"summary": "New growth during cooldown"},
+        }
+    )
+    due = amos.memory_policy_status()["due"]
+
+    assert due["due"] is False
+    assert due["pressure_cooldown_remaining_seconds"] > 0
+    assert not any(
+        reason.startswith("memory_atom_pressure:")
+        for reason in due["reasons"]
+    )
+
+
+def test_automatic_steward_rotates_bounded_atom_windows(amos):
+    amos.configure_memory_policy(
+        maintenance={
+            "enabled": True,
+            "repair_reference_contracts": False,
+            "run_smp": False,
+            "run_steward": True,
+            "max_steward_atoms": 2,
+            "max_steward_edge_mutations": 1,
+            "rebuild_indexes": False,
+            "rebuild_lsa": False,
+            "invalidate_packet_cache": False,
+        },
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": False},
+        storage_cleanup={"enabled": False},
+    )
+    for index in range(5):
+        amos.commit_atom(
+            {
+                "id": f"bounded_steward_{index}",
+                "type": "semantic",
+                "payload": {"summary": f"Bounded steward {index}"},
+            }
+        )
+
+    first = amos.run_memory_policy(force=True, trigger="bounded_steward_first")
+    first_window = first["results"]["steward"]["window"]
+    assert first_window["selected_atom_count"] == 2
+    assert first_window["total_atom_count"] == 5
+    assert first_window["next_cursor"] == "bounded_steward_1"
+    assert amos.memory_policy_status()["state"]["steward_cursor"] == (
+        "bounded_steward_1"
+    )
+
+    second = amos.run_memory_policy(force=True, trigger="bounded_steward_second")
+    second_window = second["results"]["steward"]["window"]
+    assert second_window["cursor"] == "bounded_steward_1"
+    assert second_window["next_cursor"] == "bounded_steward_3"
+    assert amos.memory_policy_status()["state"]["steward_cursor"] == (
+        "bounded_steward_3"
+    )
+
+
 def test_memory_policy_deduplicates_only_explicitly_keyed_proposals(amos):
     base = {
         "type": "semantic",

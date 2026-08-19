@@ -489,6 +489,72 @@ def test_steward_cpu_planning_does_not_hold_writer_and_fails_closed_when_stale(
         foreground.close()
 
 
+def test_steward_graph_planning_does_not_block_exact_read_receipt(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "amos.sqlite3"
+    maintenance = Amos(db_path)
+    reader = Amos(db_path)
+    planning_started = threading.Event()
+    release_planning = threading.Event()
+    steward_outcome: dict[str, object] = {}
+    read_outcome: dict[str, object] = {}
+    try:
+        maintenance.commit_atom(
+            {
+                "id": "steward_exact_read_seed",
+                "type": "belief",
+                "payload": {"claim": "exact reads remain responsive"},
+            }
+        )
+        original_intrinsic = maintenance.stewardship._intrinsic_edges_for_atom
+
+        def paused_intrinsic(atom):
+            planning_started.set()
+            assert release_planning.wait(timeout=5)
+            return original_intrinsic(atom)
+
+        monkeypatch.setattr(
+            maintenance.stewardship,
+            "_intrinsic_edges_for_atom",
+            paused_intrinsic,
+        )
+
+        steward_thread = threading.Thread(
+            target=lambda: steward_outcome.setdefault(
+                "result", maintenance.run_steward()
+            )
+        )
+        steward_thread.start()
+        assert planning_started.wait(timeout=5)
+
+        read_thread = threading.Thread(
+            target=lambda: read_outcome.setdefault(
+                "packet",
+                reader.retrieve_atom(
+                    "steward_exact_read_seed",
+                    run_policy=False,
+                ),
+            )
+        )
+        read_thread.start()
+        read_thread.join(timeout=2)
+
+        assert not read_thread.is_alive()
+        assert read_outcome["packet"]["status"] == "found"
+        assert steward_thread.is_alive()
+
+        release_planning.set()
+        steward_thread.join(timeout=5)
+        assert not steward_thread.is_alive()
+        assert steward_outcome["result"]["status"] == "completed"
+        assert maintenance.verify_replay()["status"] == "ok"
+    finally:
+        release_planning.set()
+        maintenance.close()
+        reader.close()
+
+
 def test_decay_uses_replayable_bounded_write_batches(tmp_path):
     amos = Amos(tmp_path / "amos.sqlite3")
     expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat().replace(

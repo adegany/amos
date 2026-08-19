@@ -1104,8 +1104,18 @@ class Amos:
         scope: Mapping[str, Any] | None = None,
         actor: str = "system",
         approved_by: str | None = None,
+        max_atoms: int | None = None,
+        max_edge_mutations: int | None = None,
+        start_after: str | None = None,
     ) -> dict[str, Any]:
-        return self.stewardship.run_steward(scope=scope, actor=actor, approved_by=approved_by)
+        return self.stewardship.run_steward(
+            scope=scope,
+            actor=actor,
+            approved_by=approved_by,
+            max_atoms=max_atoms,
+            max_edge_mutations=max_edge_mutations,
+            start_after=start_after,
+        )
 
     def health_memory(self, *, run_policy: bool = True) -> dict[str, Any]:
         return self.diagnostics.health_memory(run_policy=run_policy)

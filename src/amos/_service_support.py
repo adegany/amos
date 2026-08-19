@@ -68,6 +68,7 @@ DEFAULT_MEMORY_POLICY = {
         "every_graph_versions": 25,
         "every_seconds": 300,
         "run_on_pressure": True,
+        "pressure_min_interval_seconds": 300,
     },
     "maintenance": {
         "enabled": True,
@@ -76,6 +77,8 @@ DEFAULT_MEMORY_POLICY = {
         "run_smp": True,
         "max_smp_atoms": 128,
         "run_steward": True,
+        "max_steward_atoms": 128,
+        "max_steward_edge_mutations": 128,
         "rebuild_indexes": True,
         "rebuild_lsa": True,
         "lsa_dimensions": 32,

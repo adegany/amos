@@ -233,7 +233,15 @@ class PolicyService:
                     max_atoms=maintenance["max_smp_atoms"],
                 )
             if maintenance["enabled"] and maintenance["run_steward"]:
-                results["steward"] = self.run_steward(scope=scope, actor=actor)
+                results["steward"] = self.run_steward(
+                    scope=scope,
+                    actor=actor,
+                    max_atoms=maintenance["max_steward_atoms"],
+                    max_edge_mutations=maintenance[
+                        "max_steward_edge_mutations"
+                    ],
+                    start_after=str(state.get("steward_cursor") or "") or None,
+                )
                 for action in results["steward"].get("actions", []):
                     target_refs.extend(
                         ref
@@ -362,6 +370,11 @@ class PolicyService:
                     payload=event_payload,
                     target_refs=sorted(set(target_refs)),
                 )
+                steward_cursor = state.get("steward_cursor")
+                if results.get("steward", {}).get("status") == "completed":
+                    steward_cursor = (
+                        results["steward"].get("window", {}).get("next_cursor")
+                    )
                 self.store._set_meta(
                     conn,
                     "memory_policy_state",
@@ -387,6 +400,7 @@ class PolicyService:
                                 ).get("committed", [])
                                 if committed.get("atom")
                             ],
+                            "steward_cursor": steward_cursor,
                             "last_storage_cleanup_at": self.store.get_meta(
                                 "last_storage_cleanup_at"
                             ),
@@ -455,6 +469,10 @@ class PolicyService:
             0, int(schedule.get("every_seconds", 300) or 0)
         )
         schedule["run_on_pressure"] = bool(schedule.get("run_on_pressure", True))
+        schedule["pressure_min_interval_seconds"] = max(
+            0,
+            int(schedule.get("pressure_min_interval_seconds", 300) or 0),
+        )
         maintenance = normalized["maintenance"]
         for key in [
             "enabled",
@@ -473,6 +491,16 @@ class PolicyService:
         maintenance["max_smp_atoms"] = max(
             1,
             int(maintenance.get("max_smp_atoms", 128) or 128),
+        )
+        maintenance["max_steward_atoms"] = max(
+            1,
+            int(maintenance.get("max_steward_atoms", 128) or 128),
+        )
+        maintenance["max_steward_edge_mutations"] = max(
+            1,
+            int(
+                maintenance.get("max_steward_edge_mutations", 128) or 128
+            ),
         )
         maintenance["lsa_dimensions"] = max(
             0,
@@ -748,6 +776,7 @@ class PolicyService:
                 "last_due_reasons": [],
                 "last_distilled_refs": [],
                 "last_maintenance_distiller_refs": [],
+                "steward_cursor": None,
                 "last_storage_cleanup_at": self.store.get_meta(
                     "last_storage_cleanup_at"
                 ),
@@ -770,6 +799,7 @@ class PolicyService:
             "last_maintenance_distiller_refs": list(
                 data.get("last_maintenance_distiller_refs", [])
             ),
+            "steward_cursor": data.get("steward_cursor"),
             "last_storage_cleanup_at": self.store.get_meta("last_storage_cleanup_at")
             or data.get("last_storage_cleanup_at"),
             "last_vacuum_at": self.store.get_meta("last_vacuum_at")
@@ -849,7 +879,9 @@ class PolicyService:
         event_ref = event.get("event_id") if isinstance(event, Mapping) else None
         return {
             "status": result.get("status"),
+            "reason": result.get("reason"),
             "graph_version": result.get("graph_version"),
+            "window": dict(result.get("window") or {}),
             "action_count": len(actions),
             "action_counts": self._count_mapping_values(actions, "action"),
             "target_refs": self._bounded_refs(
@@ -1028,14 +1060,27 @@ class PolicyService:
         elapsed_seconds = self._seconds_since(state.get("last_run_at"))
         if every_seconds > 0 and elapsed_seconds is not None and elapsed_seconds >= every_seconds:
             reasons.append("time_interval")
+        pressure_min_interval_seconds = max(
+            0,
+            int(schedule.get("pressure_min_interval_seconds", 300) or 0),
+        )
+        pressure_interval_elapsed = (
+            elapsed_seconds is None
+            or elapsed_seconds >= pressure_min_interval_seconds
+        )
         pressure_mode = self._capacity_pressure_mode()
         if (
             schedule.get("run_on_pressure", True)
+            and pressure_interval_elapsed
             and pressure_mode in {"orange", "red"}
             and graph_delta > 0
         ):
             reasons.append(f"capacity_pressure:{pressure_mode}")
-        if schedule.get("run_on_pressure", True) and graph_delta > 0:
+        if (
+            schedule.get("run_on_pressure", True)
+            and pressure_interval_elapsed
+            and graph_delta > 0
+        ):
             decay = dict(policy.get("decay") or {})
             max_atoms = max(1, int(decay.get("max_atoms", 256) or 256))
             max_active_atoms = max(
@@ -1076,6 +1121,12 @@ class PolicyService:
             "last_graph_version": last_graph_version,
             "graph_delta": graph_delta,
             "elapsed_seconds": elapsed_seconds,
+            "pressure_min_interval_seconds": pressure_min_interval_seconds,
+            "pressure_cooldown_remaining_seconds": (
+                max(0, pressure_min_interval_seconds - elapsed_seconds)
+                if elapsed_seconds is not None
+                else 0
+            ),
             "pressure_mode": pressure_mode,
             "storage_cleanup": storage_cleanup,
         }
