@@ -25,6 +25,7 @@ from ._service_support import (
     utc_now,
 )
 from .governance_service import GovernanceService
+from .request_context import check_deadline
 
 MEMORY_MODES = {
     "deliberation",
@@ -467,9 +468,11 @@ class RetrievalService:
         run_policy: bool = True,
         _policy_already_run: bool = False,
     ) -> dict[str, Any]:
+        check_deadline("retrieval_start")
         self._mark_foreground_activity(requester)
         if run_policy and not _policy_already_run:
             self.run_memory_policy(trigger="retrieve_packet", scope=scope or {})
+        check_deadline("retrieval_policy")
         profile = DEFAULT_PACKET_PROFILES.get(
             retrieval_mode, DEFAULT_PACKET_PROFILES.get(target_processor, {})
         )
@@ -531,7 +534,9 @@ class RetrievalService:
         )
         if cached is not None:
             return cached
+        check_deadline("retrieval_cache_lookup")
         self._sync_smp_vector_model(graph_version=graph_version)
+        check_deadline("retrieval_vector_model")
 
         candidates: list[tuple[float, dict[str, Any]]] = []
         omissions: list[dict[str, Any]] = []
@@ -565,6 +570,7 @@ class RetrievalService:
             limit=candidate_scan_limit,
             prioritize_hot=True,
         )
+        check_deadline("retrieval_base_candidates")
         candidate_scan_truncated = total_candidate_count > candidate_scan_limit
         indexed_candidate_ids = self._indexed_retrieval_candidates(
             cue_tokens=cue_tokens,
@@ -578,12 +584,15 @@ class RetrievalService:
             atom_ids=sorted(set(indexed_candidate_ids or [])),
             payload_filter=payload_filter,
         )
+        check_deadline("retrieval_indexed_candidates")
         candidate_atoms_by_id = {
             str(atom["id"]): atom for atom in [*base_atoms, *indexed_atoms]
         }
         candidate_universe = list(candidate_atoms_by_id.values())
         eligible_atoms: list[dict[str, Any]] = []
-        for atom in candidate_universe:
+        for index, atom in enumerate(candidate_universe):
+            if index % 32 == 0:
+                check_deadline("retrieval_candidate_filter")
             atom_ref = str(atom["id"])
             if not scope_visible(atom["scope"], request["scope"]):
                 omissions.append({"atom_ref": atom_ref, "reason": "scope_hidden"})
@@ -611,6 +620,7 @@ class RetrievalService:
                 0.55 if indexed_candidate_ids else SEMANTIC_MATCH_THRESHOLD
             ),
         )
+        check_deadline("retrieval_latent_candidates")
         if indexed_candidate_ids is None and not latent_candidate_ids:
             atoms = eligible_atoms
         else:
@@ -640,7 +650,10 @@ class RetrievalService:
             retrieval_mode=retrieval_mode,
             superseded_refs=superseded_refs if not include_superseded else None,
         )
-        for atom in atoms:
+        check_deadline("retrieval_graph_activation")
+        for index, atom in enumerate(atoms):
+            if index % 32 == 0:
+                check_deadline("retrieval_ranking")
             atom_ref = atom["id"]
             if atom.get("deleted"):
                 omissions.append({"atom_ref": atom_ref, "reason": "deleted"})
@@ -700,7 +713,9 @@ class RetrievalService:
         byte_budget = self._byte_budget(token_or_byte_budget)
         used_bytes = 0
         items = []
-        for score, atom in candidates:
+        for index, (score, atom) in enumerate(candidates):
+            if index % 32 == 0:
+                check_deadline("retrieval_rendering")
             if len(items) >= max_items:
                 omissions.append(
                     {
@@ -802,6 +817,10 @@ class RetrievalService:
             },
             "cache_policy": {"cacheable": True, "keyed_by_graph_version": True},
         }
+        # Cache persistence is optional. Preserve enough deadline to publish
+        # the response and never turn a successful read into a timeout merely
+        # to save a rebuildable cache entry.
+        check_deadline("retrieval_response", reserve_seconds=0.05)
         self.store.persist_packet_after_read(
             packet_id=packet["packet_id"],
             request=request,
@@ -840,7 +859,9 @@ class RetrievalService:
         if not cue_vectors:
             return []
         scored: list[tuple[float, str]] = []
-        for atom in atoms:
+        for index, atom in enumerate(atoms):
+            if index % 32 == 0:
+                check_deadline("retrieval_latent_scoring")
             search_index = self._atom_search_index(atom)
             similarity = max(
                 (
@@ -1416,7 +1437,9 @@ class RetrievalService:
     ) -> tuple[dict[str, float], dict[str, list[dict[str, Any]]]]:
         eligible_refs: set[str] = set()
         seed_strengths: dict[str, float] = {}
-        for atom in atoms:
+        for index, atom in enumerate(atoms):
+            if index % 32 == 0:
+                check_deadline("retrieval_graph_seeding")
             atom_ref = str(atom.get("id") or "")
             if not atom_ref or atom.get("deleted"):
                 continue
@@ -1478,7 +1501,9 @@ class RetrievalService:
                 sorted(eligible_refs), limit=edge_scan_limit
             )
         )
-        for edge in scoped_edges:
+        for index, edge in enumerate(scoped_edges):
+            if index % 128 == 0:
+                check_deadline("retrieval_graph_filter")
             source = str(edge.get("source_ref") or "")
             target = str(edge.get("target_ref") or "")
             if source not in eligible_refs or target not in eligible_refs:
@@ -1490,7 +1515,9 @@ class RetrievalService:
             degree[target] = degree.get(target, 0) + 1
 
         adjacency: dict[str, list[tuple[str, float, Mapping[str, Any]]]] = {}
-        for edge in edges:
+        for index, edge in enumerate(edges):
+            if index % 128 == 0:
+                check_deadline("retrieval_graph_adjacency")
             source = str(edge["source_ref"])
             target = str(edge["target_ref"])
             relation = str(edge.get("relation") or "")
@@ -1538,6 +1565,7 @@ class RetrievalService:
             for seed_ref, strength in seed_strengths.items()
         ]
         for depth in (1, 2):
+            check_deadline(f"retrieval_graph_depth_{depth}")
             next_frontier: list[tuple[str, float, list[dict[str, Any]]]] = []
             depth_decay = 1.0 if depth == 1 else 0.55
             for source_ref, source_strength, source_trace in frontier:

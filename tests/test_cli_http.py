@@ -253,6 +253,10 @@ def test_http_v1_endpoints_smoke(tmp_path):
         }
         health = http_json(f"{base}/v1/health/memory")
         assert health["atoms"] == 3
+        inventory = http_json(f"{base}/v1/health/memory-inventory")
+        assert inventory["profile"] == "amos.memory-inventory-health.v1"
+        assert inventory["atoms"] == 3
+        assert "background_policy_worker" in inventory
         verify = http_json(f"{base}/v1/verify")
         assert verify["journal"]["status"] == "ok"
         assert verify["replay"]["status"] == "ok"
@@ -302,6 +306,114 @@ def test_http_maintenance_does_not_block_health_reads(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_http_full_health_does_not_block_inventory_health(tmp_path):
+    db_path = str(tmp_path / "http_inventory_health_lane.sqlite3")
+    try:
+        server = AmosHTTPServer(("127.0.0.1", 0), db_path)
+    except PermissionError as exc:
+        pytest.skip(f"loopback sockets unavailable in this sandbox: {exc}")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_health(*, run_policy=True):
+        entered.set()
+        assert release.wait(timeout=2)
+        return {"atoms": 0}
+
+    server.health_amos.health_memory = slow_health
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    full_health_thread = threading.Thread(
+        target=lambda: http_json(f"{base}/v1/health/memory"),
+        daemon=True,
+    )
+    try:
+        full_health_thread.start()
+        assert entered.wait(timeout=1)
+        started = time.monotonic()
+        inventory = http_json(f"{base}/v1/health/memory-inventory")
+        assert time.monotonic() - started < 1
+        assert inventory["atoms"] == 0
+        release.set()
+        full_health_thread.join(timeout=2)
+        assert full_health_thread.is_alive() is False
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_heavy_retrievals_reserve_two_general_request_lanes(tmp_path):
+    db_path = str(tmp_path / "http_heavy_reservation.sqlite3")
+    try:
+        server = AmosHTTPServer(("127.0.0.1", 0), db_path)
+    except PermissionError as exc:
+        pytest.skip(f"loopback sockets unavailable in this sandbox: {exc}")
+    server.amos.commit_atom({
+        "id": "reserved_exact_atom",
+        "type": "semantic",
+        "payload": {"summary": "Exact reads retain a request lane."},
+    })
+    entered = threading.Condition()
+    active = 0
+    release = threading.Event()
+
+    def slow_retrieval(**kwargs):
+        nonlocal active
+        with entered:
+            active += 1
+            entered.notify_all()
+        assert release.wait(timeout=5)
+        return {
+            "packet_id": "packet:" + str((kwargs.get("cues") or ["none"])[0]),
+            "items": [],
+            "omissions": [],
+        }
+
+    for service in server.request_services:
+        service.retrieve_packet = slow_retrieval
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    outcomes: list[dict] = []
+    retrieval_threads = [
+        threading.Thread(
+            target=lambda cue=cue: outcomes.append(http_json(
+                f"{base}/v1/packets:retrieve",
+                {"cues": [cue], "run_policy": False},
+            )),
+            daemon=True,
+        )
+        for cue in ("heavy-one", "heavy-two")
+    ]
+    try:
+        for retrieval_thread in retrieval_threads:
+            retrieval_thread.start()
+        with entered:
+            assert entered.wait_for(lambda: active == 2, timeout=2)
+        started = time.monotonic()
+        exact = http_json(
+            f"{base}/v1/atoms:get",
+            {
+                "atom_id": "reserved_exact_atom",
+                "run_policy": False,
+            },
+        )
+        assert time.monotonic() - started < 1
+        assert exact["status"] == "found"
+        assert server.heavy_admission.status()["active"] == 2
+    finally:
+        release.set()
+        for retrieval_thread in retrieval_threads:
+            retrieval_thread.join(timeout=2)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert len(outcomes) == 2
 
 
 def test_http_shared_view_queues_policy_instead_of_running_it_inline(

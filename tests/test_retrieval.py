@@ -36,7 +36,23 @@ from amos import (
 )
 from amos.cli import main as cli_main
 from amos.http_api import AmosHTTPServer
+from amos.errors import RequestDeadlineExceeded
+from amos.request_context import request_context
 from amos.smp import cosine
+
+
+def test_retrieval_honors_cooperative_request_deadline(amos):
+    with request_context(
+        deadline_epoch_seconds=time.time() - 0.001,
+        request_id="deadline-test",
+    ):
+        with pytest.raises(RequestDeadlineExceeded) as exc_info:
+            amos.retrieve_packet(
+                cues=["deadline"], max_items=1, run_policy=False
+            )
+
+    assert exc_info.value.stage == "retrieval_start"
+    assert exc_info.value.request_id == "deadline-test"
 
 from .helpers import ExampleTrainingFlightProcessor, item_refs
 

@@ -8,6 +8,7 @@ import queue
 import sqlite3
 import threading
 import time
+from collections import deque
 from collections.abc import Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,19 +19,101 @@ from .errors import (
     AmosError,
     CASConflict,
     CognitiveWorkspaceBudgetExceeded,
+    RequestDeadlineExceeded,
     StaleFrameError,
     ValidationError,
 )
 from .governance_service import GovernanceService
+from .request_context import remaining_seconds, request_context
 from .schemas import CONSTITUTIONAL_ATOM_TYPES
 from .service import Amos
 from .workers import BackgroundMemoryPolicyWorker
+
+
+class _FairAdmission:
+    """FIFO bounded admission with deadline-aware waiter cancellation."""
+
+    def __init__(self, capacity: int):
+        self.capacity = max(1, int(capacity))
+        self._condition = threading.Condition()
+        self._waiters: deque[object] = deque()
+        self._active = 0
+
+    def acquire(self, *, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        waiter = object()
+        with self._condition:
+            self._waiters.append(waiter)
+            while self._waiters[0] is not waiter or self._active >= self.capacity:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._waiters.remove(waiter)
+                    self._condition.notify_all()
+                    return False
+                self._condition.wait(timeout=remaining)
+            self._waiters.popleft()
+            self._active += 1
+            self._condition.notify_all()
+            return True
+
+    def release(self) -> None:
+        with self._condition:
+            self._active = max(0, self._active - 1)
+            self._condition.notify_all()
+
+    def status(self) -> dict[str, int | str]:
+        with self._condition:
+            return {
+                "policy": "fifo",
+                "capacity": self.capacity,
+                "active": self._active,
+                "waiting": len(self._waiters),
+            }
+
+
+class _SingleFlight:
+    """Coalesce identical reads until the leader publishes its cache entry."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._flights: dict[str, threading.Event] = {}
+
+    def enter(self, key: str) -> tuple[bool, threading.Event]:
+        with self._lock:
+            event = self._flights.get(key)
+            if event is not None:
+                return False, event
+            event = threading.Event()
+            self._flights[key] = event
+            return True, event
+
+    def finish(self, key: str, event: threading.Event) -> None:
+        with self._lock:
+            if self._flights.get(key) is event:
+                self._flights.pop(key, None)
+                event.set()
+
+    def status(self) -> dict[str, int]:
+        with self._lock:
+            return {"in_flight": len(self._flights)}
 
 
 class AmosHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 64
     REQUEST_SERVICE_COUNT = 4
+    HEAVY_REQUEST_CAPACITY = 2
+    ADMISSION_WAIT_SECONDS = 2.0
+    HEAVY_PATHS = frozenset({
+        "/v1/packets:retrieve",
+        "/v1/cognitive-workspaces:compile",
+        "/v1/interaction-projections:compile",
+        "/v1/reasoning-frames:compile",
+        "/v1/reasoning-pages:load",
+        "/v1/self-awareness:retrieve",
+        "/v1/agentic-recall:retrieve",
+        "/v1/shared-views:retrieve",
+    })
 
     def __init__(
         self,
@@ -61,16 +144,22 @@ class AmosHTTPServer(ThreadingHTTPServer):
                 for _ in range(self.REQUEST_SERVICE_COUNT - 1)
             ],
         ]
-        self.request_service_pool: queue.LifoQueue[Amos] = queue.LifoQueue(
+        self.request_service_pool: queue.Queue[Amos] = queue.Queue(
             maxsize=self.REQUEST_SERVICE_COUNT
         )
-        # Put the public primary service last so ordinary sequential requests
+        # Keep the public primary service first so ordinary sequential requests
         # retain the existing test/embedding seam while overlapping requests
         # receive isolated SQLite connections.
+        self.request_service_pool.put(self.amos)
         for service in self.request_services[1:]:
             self.request_service_pool.put(service)
-        self.request_service_pool.put(self.amos)
+        self.heavy_admission = _FairAdmission(self.HEAVY_REQUEST_CAPACITY)
+        self.retrieval_singleflight = _SingleFlight()
         self.health_amos = Amos(
+            db_path,
+            maintenance_processor_paths=self.maintenance_processor_paths,
+        )
+        self.inventory_amos = Amos(
             db_path,
             maintenance_processor_paths=self.maintenance_processor_paths,
         )
@@ -79,6 +168,7 @@ class AmosHTTPServer(ThreadingHTTPServer):
             maintenance_processor_paths=self.maintenance_processor_paths,
         )
         self.health_lock = threading.Lock()
+        self.inventory_lock = threading.Lock()
         self.ready_lock = threading.Lock()
         self.maintenance_amos = Amos(
             db_path,
@@ -110,6 +200,7 @@ class AmosHTTPServer(ThreadingHTTPServer):
             with self.service_lock:
                 self.policy_worker_amos.close()
                 self.health_amos.close()
+                self.inventory_amos.close()
                 self.ready_amos.close()
                 for service in self.request_services:
                     service.close()
@@ -130,6 +221,15 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
             return
 
         def _handle(self, method: str) -> None:
+            deadline = self._request_deadline_epoch()
+            request_id = str(self.headers.get("X-Request-ID") or "") or None
+            with request_context(
+                deadline_epoch_seconds=deadline,
+                request_id=request_id,
+            ):
+                self._handle_with_context(method)
+
+        def _handle_with_context(self, method: str) -> None:
             # A timed-out client must not leave a handler waiting for another
             # request on a half-closed keep-alive socket.
             self.close_connection = True
@@ -215,13 +315,62 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         )
                     finally:
                         server.health_lock.release()
+                if method == "GET" and path == "/v1/health/memory-inventory":
+                    if not server.inventory_lock.acquire(timeout=remaining):
+                        return self._write_saturated()
+                    try:
+                        return self._dispatch(
+                            server, method, body, amos=server.inventory_amos
+                        )
+                    finally:
+                        server.inventory_lock.release()
+                request_amos: Amos | None = None
+                heavy_acquired = False
+                flight_key: str | None = None
+                flight_event: threading.Event | None = None
+                flight_leader = False
                 try:
-                    request_amos = server.request_service_pool.get(
-                        timeout=remaining
-                    )
-                except queue.Empty:
-                    return self._write_saturated()
-                try:
+                    if method == "POST" and path == "/v1/packets:retrieve":
+                        flight_key = json.dumps(
+                            {"path": path, "body": body},
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        flight_leader, flight_event = (
+                            server.retrieval_singleflight.enter(flight_key)
+                        )
+                        if not flight_leader and not flight_event.wait(
+                            timeout=min(
+                                self._request_deadline_remaining(),
+                                server.ADMISSION_WAIT_SECONDS,
+                            )
+                        ):
+                            return self._write_saturated(
+                                stage="retrieval_singleflight_wait"
+                            )
+                    if method == "POST" and path in server.HEAVY_PATHS:
+                        heavy_acquired = server.heavy_admission.acquire(
+                            timeout=min(
+                                self._request_deadline_remaining(),
+                                server.ADMISSION_WAIT_SECONDS,
+                            )
+                        )
+                        if not heavy_acquired:
+                            return self._write_saturated(
+                                stage="heavy_request_admission"
+                            )
+                    try:
+                        request_amos = server.request_service_pool.get(
+                            timeout=min(
+                                self._request_deadline_remaining(),
+                                server.ADMISSION_WAIT_SECONDS,
+                            )
+                        )
+                    except queue.Empty:
+                        return self._write_saturated(
+                            stage="request_service_admission"
+                        )
                     with server.service_lock:
                         closing = server.closing
                     if closing:
@@ -236,7 +385,26 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         return
                     self._dispatch(server, method, body, amos=request_amos)
                 finally:
-                    server.request_service_pool.put(request_amos)
+                    if request_amos is not None:
+                        server.request_service_pool.put(request_amos)
+                    if heavy_acquired:
+                        server.heavy_admission.release()
+                    if flight_leader and flight_key and flight_event is not None:
+                        server.retrieval_singleflight.finish(
+                            flight_key, flight_event
+                        )
+            except RequestDeadlineExceeded as exc:
+                self._write_json(
+                    {
+                        "status": "error",
+                        "error": str(exc),
+                        "code": "request_deadline_exhausted",
+                        "stage": exc.stage,
+                        "request_id": exc.request_id,
+                        "retryable": True,
+                    },
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
             except StaleFrameError as exc:
                 self._write_json(
                     {
@@ -340,8 +508,26 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         server.memory_policy_worker.status()
                     )
                     return self._write_json(payload)
+                if path == "/v1/health/memory-inventory":
+                    payload = amos.health_memory_inventory()
+                    payload["background_policy_worker"] = (
+                        server.memory_policy_worker.status()
+                    )
+                    return self._write_json(payload)
                 if path == "/v1/health/capacity":
-                    return self._write_json(amos.health_capacity())
+                    payload = amos.health_capacity()
+                    payload["request_admission"] = {
+                        "service_capacity": server.REQUEST_SERVICE_COUNT,
+                        "service_available": server.request_service_pool.qsize(),
+                        "heavy": server.heavy_admission.status(),
+                        "retrieval_singleflight": (
+                            server.retrieval_singleflight.status()
+                        ),
+                        "max_admission_wait_seconds": (
+                            server.ADMISSION_WAIT_SECONDS
+                        ),
+                    }
+                    return self._write_json(payload)
                 if path == "/v1/llm-reviewer/policy":
                     return self._write_json(amos.llm_reviewer_policy())
                 if path == "/v1/memory-policy":
@@ -831,22 +1017,31 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 raise json.JSONDecodeError("expected JSON object", raw.decode("utf-8"), 0)
             return data
 
-        def _request_deadline_remaining(self) -> float:
+        def _request_deadline_epoch(self) -> float:
             raw = str(self.headers.get("X-Request-Deadline-Epoch-Ms") or "")
             if not raw:
-                return 30.0
+                return time.time() + 30.0
             try:
-                deadline = int(raw) / 1000.0
+                return int(raw) / 1000.0
             except ValueError:
                 return 0.0
-            return max(0.0, deadline - time.time())
 
-        def _write_saturated(self) -> None:
+        def _request_deadline_remaining(self) -> float:
+            remaining = remaining_seconds()
+            if remaining is not None:
+                return remaining
+            return max(0.0, self._request_deadline_epoch() - time.time())
+
+        def _write_saturated(
+            self, *, stage: str = "request_capacity_admission"
+        ) -> None:
             self._write_json(
                 {
                     "status": "error",
                     "error": "AMOS request capacity was unavailable before deadline",
                     "code": "request_capacity_exhausted",
+                    "stage": stage,
+                    "retry_after_ms": 250,
                     "retryable": True,
                 },
                 status=HTTPStatus.SERVICE_UNAVAILABLE,

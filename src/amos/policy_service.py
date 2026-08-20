@@ -28,6 +28,10 @@ GOVERNANCE_MAINTENANCE_PROTECTED_TYPES = {
     "self_model",
 }
 
+LEGACY_PROPOSAL_RETENTION_SECONDS = {
+    "cogito.memory-recall-strategy.v1": 6 * 60 * 60,
+}
+
 
 class PolicyService:
     def __init__(
@@ -2004,6 +2008,7 @@ class PolicyService:
             projected_edges.extend(batch_edges)
             tombstones.extend(batch_tombstones)
             deleted_refs.extend(batch_refs)
+            self.store.cooperative_maintenance_yield()
 
         housekeeping_changed = bool(
             index_prune.get("rows") or idempotency.get("rows")
@@ -2545,6 +2550,18 @@ class PolicyService:
         planned: list[tuple[dict[str, Any], dict[str, Any]]] = []
         planned_archives: set[str] = set()
         edge_degrees = self.store.edge_degree_counts()
+        current_plugin_digests: dict[str, str] = {}
+        for atom in atoms:
+            if str(atom.get("id") or "") not in current_head_refs:
+                continue
+            payload = atom.get("payload")
+            payload = payload if isinstance(payload, Mapping) else {}
+            if payload.get("profile") != "cogito.plugin-activation.v1":
+                continue
+            plugin_name = str(payload.get("plugin_name") or "")
+            package_digest = str(payload.get("package_digest") or "")
+            if plugin_name and package_digest:
+                current_plugin_digests[plugin_name] = package_digest
         historically_satisfied_commitments = {
             str(edge.get("target_ref") or "")
             for edge in self.store.list_edges(include_deleted=True)
@@ -2578,6 +2595,28 @@ class PolicyService:
                 if isinstance(atom.get("decay_policy"), Mapping)
                 else {}
             )
+            payload = atom.get("payload")
+            payload = payload if isinstance(payload, Mapping) else {}
+            plugin_name = str(payload.get("plugin_name") or "")
+            current_plugin_digest = current_plugin_digests.get(plugin_name)
+            obsolete_plugin_semantic_revision = (
+                atom.get("lifecycle_state") == "active"
+                and payload.get("profile") == "cogito.skill-semantic-node.v1"
+                and atom_policy.get("protection_reason")
+                == "authoritative_plugin_registry"
+                and current_plugin_digest is not None
+                and str(payload.get("plugin_digest") or "")
+                != current_plugin_digest
+            )
+            if obsolete_plugin_semantic_revision:
+                action = {
+                    "action": "archive",
+                    "reason": "obsolete_plugin_semantic_revision",
+                    "health_status": "stale",
+                }
+                planned.append((atom, action))
+                planned_archives.add(str(atom["id"]))
+                continue
             orphaned_authority_revision = (
                 atom.get("lifecycle_state") == "active"
                 and str(atom.get("type") or "") == "procedure"
@@ -3000,7 +3039,16 @@ class PolicyService:
         if not isinstance(payload, Mapping):
             return {}
         retention = payload.get("proposal_retention")
-        return dict(retention) if isinstance(retention, Mapping) else {}
+        if isinstance(retention, Mapping):
+            return dict(retention)
+        profile = str(payload.get("profile") or "")
+        archive_after_seconds = LEGACY_PROPOSAL_RETENTION_SECONDS.get(profile)
+        if archive_after_seconds is None:
+            return {}
+        return {
+            "profile": "amos.legacy-proposal-retention.v1",
+            "archive_after_seconds": archive_after_seconds,
+        }
 
 
     def _decay_action_for_proposed_atom(

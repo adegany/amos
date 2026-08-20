@@ -7,6 +7,7 @@ import uuid
 import json
 import math
 import threading
+import time
 import zlib
 from collections import Counter
 from contextlib import contextmanager
@@ -19,6 +20,7 @@ from .journal_replay import (
     replay_events,
     serializable_replay_state,
 )
+from .request_context import remaining_seconds
 from .schemas import SCHEMA_VERSION, canonical_json, digest, utc_now
 
 
@@ -228,6 +230,21 @@ class SQLiteStore:
     def writer_status(self) -> dict[str, Any]:
         return self._runtime.writer.status()
 
+    def cooperative_maintenance_yield(self, *, max_seconds: float = 0.01) -> bool:
+        """Yield between maintenance batches when foreground writers wait."""
+
+        status = self.writer_status()
+        waiting = dict(status.get("waiting_by_lane") or {})
+        foreground_waiting = sum(
+            int(count or 0)
+            for lane, count in waiting.items()
+            if lane not in {"maintenance", "read_effect"}
+        )
+        if foreground_waiting <= 0:
+            return False
+        time.sleep(max(0.0, min(float(max_seconds), 0.05)))
+        return True
+
     def set_write_lane(self, lane: str) -> str:
         previous = str(getattr(self._local, "write_lane", "foreground"))
         self._local.write_lane = str(lane or "foreground")
@@ -338,6 +355,15 @@ class SQLiteStore:
     ) -> None:
         """Persist all read effects in one short post-snapshot transaction."""
 
+        optional_cache_only = all(kind == "packet" for kind, _ in effects)
+        writer = self.writer_status()
+        remaining = remaining_seconds()
+        if optional_cache_only and (
+            writer.get("active_lane") is not None
+            or int(writer.get("waiting", 0) or 0) > 0
+            or (remaining is not None and remaining <= 0.25)
+        ):
+            return
         with self.transaction(lane="read_effect") as conn:
             current_graph_version = self.graph_version()
             for effect_kind, payload in effects:
@@ -459,6 +485,10 @@ class SQLiteStore:
                 retired_at TEXT NOT NULL,
                 reason TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_retired_edges_source
+                ON amos_retired_edges(source_ref);
+            CREATE INDEX IF NOT EXISTS idx_retired_edges_target
+                ON amos_retired_edges(target_ref);
 
             CREATE TABLE IF NOT EXISTS amos_tombstones (
                 tombstone_id TEXT PRIMARY KEY,
@@ -1915,6 +1945,87 @@ class SQLiteStore:
         ).fetchone()
         return int(row["count"])
 
+    def memory_integrity_summary(self) -> dict[str, int]:
+        """Return UI health counters without materializing the memory graph."""
+
+        reference_row = self.conn.execute(
+            """WITH refs AS (
+                 SELECT CAST(item.value AS TEXT) AS ref
+                 FROM amos_atoms AS atom,
+                      json_each(atom.evidence_refs) AS item
+                 WHERE atom.deleted=0
+                   AND atom.lifecycle_state IN ('active','proposed')
+                 UNION ALL
+                 SELECT CAST(item.value AS TEXT) AS ref
+                 FROM amos_edges AS edge,
+                      json_each(edge.evidence_refs) AS item
+                 WHERE edge.deleted=0
+               )
+               SELECT
+                 SUM(CASE WHEN EXISTS (
+                   SELECT 1 FROM amos_evidence AS evidence
+                   WHERE evidence.evidence_id=refs.ref
+                 ) THEN 1 ELSE 0 END) AS exact_evidence_refs,
+                 SUM(CASE WHEN NOT EXISTS (
+                   SELECT 1 FROM amos_evidence AS evidence
+                   WHERE evidence.evidence_id=refs.ref
+                 ) AND EXISTS (
+                   SELECT 1 FROM amos_atoms AS target
+                   WHERE target.id=refs.ref AND target.deleted=0
+                 ) THEN 1 ELSE 0 END) AS mistyped_atom_refs,
+                 SUM(CASE WHEN NOT EXISTS (
+                   SELECT 1 FROM amos_evidence AS evidence
+                   WHERE evidence.evidence_id=refs.ref
+                 ) AND NOT EXISTS (
+                   SELECT 1 FROM amos_atoms AS target
+                   WHERE target.id=refs.ref AND target.deleted=0
+                 ) THEN 1 ELSE 0 END) AS unresolved_refs
+               FROM refs"""
+        ).fetchone()
+        isolated_row = self.conn.execute(
+            """SELECT COUNT(*) AS count
+               FROM amos_atoms AS atom
+               WHERE atom.deleted=0 AND atom.lifecycle_state='active'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM amos_edges AS edge
+                   WHERE edge.source_ref=atom.id OR edge.target_ref=atom.id
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM amos_retired_edges AS edge
+                   WHERE edge.source_ref=atom.id OR edge.target_ref=atom.id
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM amos_memory_heads AS head
+                   WHERE head.head_ref=atom.id
+                 )"""
+        ).fetchone()
+        superseded_row = self.conn.execute(
+            """SELECT COUNT(DISTINCT edge.target_ref) AS count
+               FROM amos_edges AS edge
+               JOIN amos_atoms AS source
+                 ON source.id=edge.source_ref
+                AND source.deleted=0
+                AND source.lifecycle_state='active'
+               JOIN amos_atoms AS target
+                 ON target.id=edge.target_ref
+                AND target.deleted=0
+                AND target.lifecycle_state IN ('active','superseded')
+               WHERE edge.deleted=0
+                 AND edge.lifecycle_state='active'
+                 AND edge.relation='rel:supersedes'"""
+        ).fetchone()
+        return {
+            "exact_evidence_refs": int(
+                reference_row["exact_evidence_refs"] or 0
+            ),
+            "mistyped_atom_refs": int(
+                reference_row["mistyped_atom_refs"] or 0
+            ),
+            "unresolved_refs": int(reference_row["unresolved_refs"] or 0),
+            "isolated_active_atoms": int(isolated_row["count"] or 0),
+            "active_superseded_atoms": int(superseded_row["count"] or 0),
+        }
+
     def edge_degree_counts(
         self,
         refs: list[str] | None = None,
@@ -1934,8 +2045,18 @@ class SQLiteStore:
                     FROM amos_edges
                     WHERE source_ref IN ({placeholders})
                        OR target_ref IN ({placeholders})
+                    UNION ALL
+                    SELECT source_ref, target_ref
+                    FROM amos_retired_edges
+                    WHERE source_ref IN ({placeholders})
+                       OR target_ref IN ({placeholders})
                     """,
-                    (*sorted(ref_set), *sorted(ref_set)),
+                    (
+                        *sorted(ref_set),
+                        *sorted(ref_set),
+                        *sorted(ref_set),
+                        *sorted(ref_set),
+                    ),
                 ).fetchall()
             else:
                 rows = self.list_edges_for_refs(sorted(ref_set))
@@ -1947,14 +2068,22 @@ class SQLiteStore:
                 if target in ref_set:
                     counts[target] = counts.get(target, 0) + 1
         else:
-            deleted_filter = "" if include_deleted else "WHERE deleted = 0"
-            rows = self.conn.execute(
-                f"""
-                SELECT source_ref, target_ref
-                FROM amos_edges
-                {deleted_filter}
-                """
-            ).fetchall()
+            if include_deleted:
+                rows = self.conn.execute(
+                    """
+                    SELECT source_ref, target_ref FROM amos_edges
+                    UNION ALL
+                    SELECT source_ref, target_ref FROM amos_retired_edges
+                    """
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    """
+                    SELECT source_ref, target_ref
+                    FROM amos_edges
+                    WHERE deleted = 0
+                    """
+                ).fetchall()
             for row in rows:
                 counts[str(row["source_ref"])] = counts.get(str(row["source_ref"]), 0) + 1
                 counts[str(row["target_ref"])] = counts.get(str(row["target_ref"]), 0) + 1
@@ -2613,6 +2742,9 @@ class SQLiteStore:
                 "wal_size_bytes": 0,
                 "shm_size_bytes": 0,
                 "managed_size_bytes": 0,
+                "allocated_size_bytes": 0,
+                "freelist_space_bytes": 0,
+                "used_size_bytes": 0,
             }
 
         def file_size(path: Path) -> int:
@@ -2624,11 +2756,25 @@ class SQLiteStore:
         main_size = file_size(self.path)
         wal_size = file_size(Path(f"{self.path}-wal"))
         shm_size = file_size(Path(f"{self.path}-shm"))
+        sqlite_space = self.sqlite_space_status()
+        freelist_space = min(
+            main_size,
+            max(0, int(sqlite_space.get("freelist_bytes", 0) or 0)),
+        )
+        allocated_size = main_size + wal_size
+        used_size = max(0, main_size - freelist_space) + wal_size
         return {
             "main_size_bytes": main_size,
             "wal_size_bytes": wal_size,
             "shm_size_bytes": shm_size,
-            "managed_size_bytes": main_size + wal_size,
+            # managed_size_bytes remains the physical allocation for operators
+            # that need to reason about filesystem consumption.
+            "managed_size_bytes": allocated_size,
+            "allocated_size_bytes": allocated_size,
+            # Freelist pages are reusable by SQLite without growing the file.
+            # They are physical allocation, not live capacity consumption.
+            "freelist_space_bytes": freelist_space,
+            "used_size_bytes": used_size,
         }
 
     def sqlite_space_status(self) -> dict[str, int | str | bool]:

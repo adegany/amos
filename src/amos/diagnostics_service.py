@@ -1,5 +1,7 @@
 """DiagnosticsService implementation for the AMOS service facade."""
 
+import math
+
 from ._service_support import Any, digest
 from .journal_replay import empty_replay_state, replay_events
 from .store import migrated_edge_derivation
@@ -75,20 +77,141 @@ class DiagnosticsService:
                 "last_policy_tick": policy_tick,
             }
 
+    def health_memory_inventory(self) -> dict[str, Any]:
+        """Return exact operational counters without loading graph records."""
 
+        policy = self.memory_policy()
+        decay = dict(policy.get("decay") or {})
+        schedule = dict(policy.get("schedule") or {})
+        with self.store.read_snapshot():
+            graph_version = self.store.graph_version()
+            indexes = self.store.list_derived_index_metadata()
+            by_type = self.store.atom_counts_by("type")
+            by_lifecycle = self.store.atom_counts_by("lifecycle_state")
+            integrity = self.store.memory_integrity_summary()
+            active_count = int(by_lifecycle.get("active") or 0)
+            proposed_count = int(by_lifecycle.get("proposed") or 0)
+            hot_count = active_count + proposed_count
+            hot_limit = int(decay.get("max_atoms", 256) or 256)
+            active_limit = int(
+                decay.get("max_active_atoms", hot_limit) or hot_limit
+            )
+            proposed_limit = int(
+                decay.get("max_proposed_atoms", hot_limit) or hot_limit
+            )
+            headroom_ratio = float(
+                decay.get("capacity_headroom_ratio", 0.2) or 0.0
+            )
+            utilization = hot_count / max(1, hot_limit)
+            near_limit = utilization >= 1.0 - headroom_ratio
+            targets = sorted({
+                max(1, int(item))
+                for item in decay.get(
+                    "capacity_assessment_targets",
+                    [256, 512, 768],
+                )
+                if item not in (None, "")
+            } | {hot_limit})
+            required_with_headroom = max(
+                1,
+                int(math.ceil(hot_count / max(0.1, 1.0 - headroom_ratio))),
+            )
+            if not targets or targets[-1] < required_with_headroom:
+                targets.append(required_with_headroom)
+            recommended_target = next(
+                target for target in targets if target >= required_with_headroom
+            )
+            index_lag = {
+                str(index["index_name"]): max(
+                    0,
+                    graph_version - int(index.get("graph_version", 0) or 0),
+                )
+                for index in indexes
+            }
+            max_index_lag = max(index_lag.values(), default=0)
+            maintenance_every = int(
+                schedule.get("every_graph_versions", 25) or 25
+            )
+            warnings: list[str] = []
+            if hot_count > hot_limit:
+                warnings.append("active_atom_count_exceeds_decay_max_atoms")
+            if near_limit:
+                warnings.append("active_atom_capacity_headroom_low")
+            if active_count >= active_limit:
+                warnings.append("lifecycle_active_atom_limit_reached")
+            if proposed_count >= proposed_limit:
+                warnings.append("proposed_atom_limit_reached")
+            if integrity["active_superseded_atoms"]:
+                warnings.append("active_superseded_atoms_present")
+            if integrity["isolated_active_atoms"]:
+                warnings.append("isolated_active_atoms_present")
+            if integrity["mistyped_atom_refs"]:
+                warnings.append("atom_ids_present_in_evidence_refs")
+            if integrity["unresolved_refs"]:
+                warnings.append("unresolved_evidence_refs_present")
+            if max_index_lag >= maintenance_every:
+                warnings.append("derived_index_lag_exceeds_schedule")
+            return {
+                "profile": "amos.memory-inventory-health.v1",
+                "diagnostic_scope": "operational_inventory",
+                "graph_version": graph_version,
+                "journal_events": self.store.event_count(),
+                "memory_heads": len(self.store.list_memory_heads()),
+                "atoms": self.store.atom_count(),
+                "edges": self.store.edge_count(),
+                "by_type": by_type,
+                "by_lifecycle": by_lifecycle,
+                "projection_lag": 0,
+                "quality": {
+                    "status": "warning" if warnings else "ok",
+                    "warnings": warnings,
+                    "hot_atom_count": hot_count,
+                    "hot_atom_limit": hot_limit,
+                    "capacity_assessment": {
+                        "configured_target": hot_limit,
+                        "active_count": hot_count,
+                        "headroom_atoms": max(0, hot_limit - hot_count),
+                        "utilization": round(utilization, 4),
+                        "headroom_ratio_target": headroom_ratio,
+                        "near_limit": near_limit,
+                        "recommended_target": recommended_target,
+                    },
+                    "active_superseded_atoms": {
+                        "count": integrity["active_superseded_atoms"],
+                    },
+                    "isolated_active_atoms": {
+                        "count": integrity["isolated_active_atoms"],
+                    },
+                    "reference_contract": {
+                        "exact_evidence_refs": integrity[
+                            "exact_evidence_refs"
+                        ],
+                        "mistyped_atom_refs": integrity["mistyped_atom_refs"],
+                        "unresolved_refs": integrity["unresolved_refs"],
+                    },
+                    "derived_index_lag": {
+                        "max_graph_delta": max_index_lag,
+                        "by_index": index_lag,
+                    },
+                },
+            }
     def health_capacity(self) -> dict[str, Any]:
         path = self.store.path
         usage = self.store.storage_usage()
         with self.store.read_snapshot():
             budget = self._capacity_budget()
+            used_size_bytes = int(
+                usage.get("used_size_bytes", usage["managed_size_bytes"])
+            )
             pressure_mode = self._capacity_pressure_mode(
-                size_bytes=int(usage["managed_size_bytes"]), budget=budget
+                size_bytes=used_size_bytes, budget=budget
             )
             return {
                 "store": getattr(self.store, "backend_name", "unknown"),
                 "path": str(path),
-                # Preserve size_bytes as the total capacity-accounted value.
-                "size_bytes": int(usage["managed_size_bytes"]),
+                # Capacity pressure follows live used bytes. Physical allocation
+                # and reusable freelist space remain explicit alongside it.
+                "size_bytes": used_size_bytes,
                 **usage,
                 "sqlite_space": self.store.sqlite_space_status(),
                 "journal_storage": self.store.journal_storage_status(),

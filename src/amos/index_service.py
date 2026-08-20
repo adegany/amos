@@ -15,6 +15,7 @@ from ._service_support import (
     stable_id,
     utc_now,
 )
+from .request_context import check_deadline
 
 
 _RETRIEVAL_STOPWORDS = {
@@ -277,14 +278,40 @@ class IndexService:
     def _sync_smp_vector_model(
         self, *, graph_version: int | None = None, force: bool = False
     ) -> dict[str, Any]:
-        graph_version = (
+        canonical_graph_version = (
             self.store.graph_version() if graph_version is None else int(graph_version)
         )
-        if not force and self._smp_vector_model_graph_version == graph_version:
+        metadata = {
+            str(item.get("index_name") or ""): int(
+                item.get("graph_version", 0) or 0
+            )
+            for item in self.store.list_derived_index_metadata()
+        }
+        published_revisions = [
+            metadata[name]
+            for name in (
+                "semantic_lexical_vectors",
+                "semantic_lsa_vectors",
+            )
+            if metadata.get(name, 0) > 0
+        ]
+        vector_graph_version = (
+            min(published_revisions)
+            if published_revisions
+            else canonical_graph_version
+        )
+        if (
+            not force
+            and self._smp_vector_model_graph_version == vector_graph_version
+        ):
             return self.smp.vector_model_info()
+        check_deadline("vector_model_document_frequencies")
         document_count = self.store.atom_text_document_count()
         document_frequencies = self.store.token_document_frequencies()
-        latent_vectors = self.store.list_token_latent_vectors(graph_version=graph_version)
+        check_deadline("vector_model_latent_vectors")
+        latent_vectors = self.store.list_token_latent_vectors(
+            graph_version=vector_graph_version
+        )
         latent_dimensions = max(
             (len(vector) for vector in latent_vectors.values()),
             default=0,
@@ -292,11 +319,11 @@ class IndexService:
         self.smp.configure_vector_model(
             document_frequencies=document_frequencies,
             document_count=document_count,
-            graph_version=graph_version,
+            graph_version=vector_graph_version,
             latent_vectors=latent_vectors,
             latent_dimensions=latent_dimensions,
         )
-        self._smp_vector_model_graph_version = graph_version
+        self._smp_vector_model_graph_version = vector_graph_version
         return self.smp.vector_model_info()
 
 
@@ -338,6 +365,7 @@ class IndexService:
                     self.store.replace_atom_text_index(conn, atom)
                     rebuilt_atoms += 1
             write_batch_count += 1
+            self.store.cooperative_maintenance_yield()
 
         cleanup = policy.get("storage_cleanup", {})
         pruned_index = {"status": "skipped", "reason": "storage_cleanup_disabled"}
@@ -386,6 +414,7 @@ class IndexService:
                 if pruned_atoms:
                     pruned_index["write_batch_count"] += 1
                 remaining_prune_atoms -= pruned_atoms
+                self.store.cooperative_maintenance_yield()
                 if pruned_atoms < prune_batch_size:
                     break
 

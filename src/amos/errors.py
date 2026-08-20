@@ -5,6 +5,15 @@ class AmosError(Exception):
     """Base class for AMOS errors."""
 
 
+class RequestDeadlineExceeded(AmosError):
+    """Raised when cooperative request work reaches its caller deadline."""
+
+    def __init__(self, stage: str, *, request_id: str | None = None):
+        self.stage = str(stage or "unknown")
+        self.request_id = str(request_id or "") or None
+        super().__init__(f"request deadline exhausted during {self.stage}")
+
+
 class ValidationError(AmosError):
     """Raised when a memory object violates the AMOS schema contract."""
 

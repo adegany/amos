@@ -70,6 +70,9 @@ def test_capacity_pressure_accounts_for_main_database_and_wal(amos, monkeypatch)
             "wal_size_bytes": 30,
             "shm_size_bytes": 7,
             "managed_size_bytes": 110,
+            "allocated_size_bytes": 110,
+            "freelist_space_bytes": 50,
+            "used_size_bytes": 60,
         },
     )
     amos.configure_capacity_budget(
@@ -80,11 +83,14 @@ def test_capacity_pressure_accounts_for_main_database_and_wal(amos, monkeypatch)
 
     capacity = amos.health_capacity()
 
-    assert capacity["size_bytes"] == 110
+    assert capacity["size_bytes"] == 60
+    assert capacity["used_size_bytes"] == 60
+    assert capacity["allocated_size_bytes"] == 110
+    assert capacity["freelist_space_bytes"] == 50
     assert capacity["main_size_bytes"] == 80
     assert capacity["wal_size_bytes"] == 30
     assert capacity["shm_size_bytes"] == 7
-    assert capacity["pressure_mode"] == "red"
+    assert capacity["pressure_mode"] == "green"
 
 
 def test_worker_artifacts_update_indexes_and_observability(amos):
@@ -958,6 +964,49 @@ def test_memory_policy_archives_proposal_after_explicit_retention_window(amos):
     ]
 
 
+def test_memory_policy_archives_legacy_recall_strategy_without_retention(amos):
+    old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    proposal = amos.propose_memory_atoms(
+        [
+            {
+                "id": "legacy_recall_strategy",
+                "type": "procedure",
+                "payload": {
+                    "profile": "cogito.memory-recall-strategy.v1",
+                    "trigger_context": "Recall bounded project evidence",
+                    "steps": ["Retrieve the requested canonical refs"],
+                    "review_status": "host_validated_bounded_recall",
+                    "subject_agent": "agent:test",
+                },
+                "created_at": old,
+                "observed_at": old,
+                "updated_at": old,
+            }
+        ]
+    )["proposals"][0]["atom"]
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": True, "max_atoms": 10},
+        storage_cleanup={"enabled": False},
+    )
+
+    result = amos.run_memory_policy(force=True, trigger="legacy_recall_retention")
+
+    assert result["results"]["decay"]["actions"] == [
+        {
+            "atom_ref": proposal["id"],
+            "action": "archive",
+            "reason": "proposed_retention_elapsed",
+            "health_status": "stale",
+            "lifecycle_state": "archived",
+        }
+    ]
+
+
 def test_memory_policy_pressure_reports_residual_protected_atoms(amos):
     for index in range(2):
         amos.commit_atom(
@@ -1436,6 +1485,60 @@ def test_health_memory_reports_quality_diagnostics(amos):
     assert "maintenance_processor_effectiveness" in health["quality"]
 
 
+def test_inventory_health_reports_exact_ui_counters_without_graph_loading(
+    amos,
+    monkeypatch,
+):
+    amos.configure_memory_policy(
+        decay={
+            "max_atoms": 1,
+            "max_active_atoms": 1,
+            "max_proposed_atoms": 1,
+        },
+    )
+    old = amos.commit_atom({
+        "id": "inventory_superseded",
+        "type": "semantic",
+        "payload": {"summary": "inventory predecessor"},
+    })["atom"]
+    amos.commit_atom({
+        "id": "inventory_current",
+        "type": "semantic",
+        "payload": {"summary": "inventory current"},
+        "supersedes": [old["id"]],
+    })
+    amos.commit_atom({
+        "id": "inventory_isolated",
+        "type": "semantic",
+        "payload": {"summary": "inventory isolated"},
+    })
+    monkeypatch.setattr(
+        amos.store,
+        "list_atoms_filtered",
+        lambda **_kwargs: pytest.fail("inventory health loaded atom records"),
+    )
+    monkeypatch.setattr(
+        amos.store,
+        "list_edges",
+        lambda **_kwargs: pytest.fail("inventory health loaded edge records"),
+    )
+
+    health = amos.health_memory_inventory()
+
+    assert health["profile"] == "amos.memory-inventory-health.v1"
+    assert health["diagnostic_scope"] == "operational_inventory"
+    assert health["atoms"] == 3
+    assert health["quality"]["active_superseded_atoms"]["count"] == 1
+    assert health["quality"]["isolated_active_atoms"]["count"] == 1
+    assert health["quality"]["reference_contract"] == {
+        "exact_evidence_refs": 0,
+        "mistyped_atom_refs": 0,
+        "unresolved_refs": 0,
+    }
+    assert "active_superseded_atoms_present" in health["quality"]["warnings"]
+    assert "isolated_active_atoms_present" in health["quality"]["warnings"]
+
+
 def test_health_isolation_separates_active_graph_from_dormant_proposals(amos):
     active = amos.commit_atom(
         {
@@ -1497,13 +1600,122 @@ def test_health_does_not_call_active_memory_with_archived_lineage_isolated(amos)
         }],
     )["atoms"][0]
     amos.archive_atom(source["id"], reason="source aged out of the hot graph")
+    with amos.store.transaction() as conn:
+        amos.store.retire_and_purge_edges_for_ref(
+            conn,
+            source["id"],
+            reason="test_archived_lineage_compaction",
+        )
 
     quality = amos.health_memory(run_policy=False)["quality"]
+    inventory_quality = amos.health_memory_inventory()["quality"]
 
     assert derived["id"] not in quality["isolated_active_atoms"]["sample_refs"]
     assert quality["isolated_active_atoms"][
         "historically_connected_excluded_count"
     ] == 1
+    assert inventory_quality["isolated_active_atoms"]["count"] == 0
+    assert "isolated_active_atoms_present" not in inventory_quality["warnings"]
+
+
+def test_memory_policy_archives_obsolete_plugin_semantic_revisions(amos):
+    scope = {"system": "test", "namespace": "plugin-lifecycle"}
+    amos.commit_memory_transaction(
+        scope=scope,
+        actor="plugin-lifecycle-test",
+        atoms=[
+            {
+                "id": "current_plugin_activation",
+                "type": "procedure",
+                "payload": {
+                    "profile": "cogito.plugin-activation.v1",
+                    "plugin_name": "cogito.test-plugin",
+                    "package_digest": "sha256:current",
+                    "status": "active",
+                    "trigger_context": "test plugin activation",
+                    "steps": ["Expose the current plugin authority."],
+                    "authority_series_id": (
+                        "cogito.plugin-activation:cogito.test-plugin"
+                    ),
+                    "authority_revision": 1,
+                },
+                "decay_policy": {
+                    "enabled": False,
+                    "protection_reason": "authoritative_plugin_registry",
+                },
+            },
+            {
+                "id": "current_plugin_semantic",
+                "type": "capability",
+                "payload": {
+                    "profile": "cogito.skill-semantic-node.v1",
+                    "plugin_name": "cogito.test-plugin",
+                    "plugin_digest": "sha256:current",
+                    "semantic_kind": "semantic_capabilities",
+                    "name": "current capability",
+                    "subject_agent": "ent:agent:test",
+                    "description": "current capability",
+                },
+                "decay_policy": {
+                    "enabled": False,
+                    "protection_reason": "authoritative_plugin_registry",
+                },
+            },
+            {
+                "id": "obsolete_plugin_semantic",
+                "type": "capability",
+                "payload": {
+                    "profile": "cogito.skill-semantic-node.v1",
+                    "plugin_name": "cogito.test-plugin",
+                    "plugin_digest": "sha256:obsolete",
+                    "semantic_kind": "semantic_capabilities",
+                    "name": "obsolete capability",
+                    "subject_agent": "ent:agent:test",
+                    "description": "obsolete capability",
+                },
+                "decay_policy": {
+                    "enabled": False,
+                    "protection_reason": "authoritative_plugin_registry",
+                },
+            },
+        ],
+        edges=[{
+            "source_ref": "current_plugin_activation",
+            "target_ref": "current_plugin_semantic",
+            "relation": "rel:has_capability",
+            "evidence_refs": [],
+        }],
+        head_updates=[{
+            "series_kind": "authority_record",
+            "series_id": "cogito.plugin-activation:cogito.test-plugin",
+            "expected_head_ref": None,
+            "expected_head_version": 0,
+            "new_head_ref": "current_plugin_activation",
+        }],
+    )
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": True, "max_atoms": 10},
+        storage_cleanup={"enabled": False},
+    )
+
+    result = amos.run_memory_policy(
+        force=True, trigger="obsolete_plugin_semantic_test"
+    )
+
+    assert amos.store.get_atom("current_plugin_semantic")[
+        "lifecycle_state"
+    ] == "active"
+    assert amos.store.get_atom("obsolete_plugin_semantic")[
+        "lifecycle_state"
+    ] == "archived"
+    assert any(
+        action["atom_ref"] == "obsolete_plugin_semantic"
+        and action["reason"] == "obsolete_plugin_semantic_revision"
+        for action in result["results"]["decay"]["actions"]
+    )
 
 
 def test_quality_diagnostics_accept_superseded_atoms_as_lineage_endpoints(amos):
