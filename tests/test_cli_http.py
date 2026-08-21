@@ -428,6 +428,78 @@ def test_http_heavy_retrievals_reserve_two_general_request_lanes(tmp_path):
     assert len(outcomes) == 2
 
 
+def test_http_heavy_retrieval_waits_fifo_until_its_request_deadline(tmp_path):
+    db_path = str(tmp_path / "http_heavy_deadline_fifo.sqlite3")
+    try:
+        server = AmosHTTPServer(("127.0.0.1", 0), db_path)
+    except PermissionError as exc:
+        pytest.skip(f"loopback sockets unavailable in this sandbox: {exc}")
+    entered = threading.Condition()
+    active = 0
+    release = threading.Event()
+
+    def slow_retrieval(**kwargs):
+        nonlocal active
+        with entered:
+            active += 1
+            entered.notify_all()
+        assert release.wait(timeout=2)
+        return {
+            "packet_id": "packet:" + str((kwargs.get("cues") or ["none"])[0]),
+            "items": [],
+            "omissions": [],
+        }
+
+    for service in server.request_services:
+        service.retrieve_packet = slow_retrieval
+    # A historical fixed admission cap would fail this waiter immediately.
+    # The current contract ignores that process-local value and honors each
+    # caller's explicit deadline instead.
+    server.ADMISSION_WAIT_SECONDS = 0.01
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    outcomes: list[dict] = []
+    errors: list[Exception] = []
+    headers = {
+        "X-Request-Deadline-Epoch-Ms": str(int((time.time() + 1.5) * 1000)),
+    }
+
+    def retrieve(cue: str) -> None:
+        try:
+            outcomes.append(http_json(
+                f"{base}/v1/packets:retrieve",
+                {"cues": [cue], "run_policy": False},
+                headers=headers,
+            ))
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    request_threads = [
+        threading.Thread(target=retrieve, args=(f"heavy-{index}",), daemon=True)
+        for index in range(3)
+    ]
+    try:
+        for request_thread in request_threads:
+            request_thread.start()
+        with entered:
+            assert entered.wait_for(lambda: active == 2, timeout=1)
+        assert server.heavy_admission.status()["waiting"] == 1
+        time.sleep(0.05)
+        assert errors == []
+        release.set()
+        for request_thread in request_threads:
+            request_thread.join(timeout=2)
+            assert request_thread.is_alive() is False
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert errors == []
+    assert len(outcomes) == 3
+
+
 def test_http_shared_view_queues_policy_instead_of_running_it_inline(
     tmp_path, monkeypatch
 ):

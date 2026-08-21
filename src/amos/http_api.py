@@ -103,7 +103,7 @@ class AmosHTTPServer(ThreadingHTTPServer):
     request_queue_size = 64
     REQUEST_SERVICE_COUNT = 4
     HEAVY_REQUEST_CAPACITY = 2
-    ADMISSION_WAIT_SECONDS = 2.0
+    DEFAULT_REQUEST_DEADLINE_SECONDS = 30.0
     HEAVY_PATHS = frozenset({
         "/v1/packets:retrieve",
         "/v1/cognitive-workspaces:compile",
@@ -341,20 +341,14 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                             server.retrieval_singleflight.enter(flight_key)
                         )
                         if not flight_leader and not flight_event.wait(
-                            timeout=min(
-                                self._request_deadline_remaining(),
-                                server.ADMISSION_WAIT_SECONDS,
-                            )
+                            timeout=self._request_deadline_remaining()
                         ):
                             return self._write_saturated(
                                 stage="retrieval_singleflight_wait"
                             )
                     if method == "POST" and path in server.HEAVY_PATHS:
                         heavy_acquired = server.heavy_admission.acquire(
-                            timeout=min(
-                                self._request_deadline_remaining(),
-                                server.ADMISSION_WAIT_SECONDS,
-                            )
+                            timeout=self._request_deadline_remaining()
                         )
                         if not heavy_acquired:
                             return self._write_saturated(
@@ -362,10 +356,7 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                             )
                     try:
                         request_amos = server.request_service_pool.get(
-                            timeout=min(
-                                self._request_deadline_remaining(),
-                                server.ADMISSION_WAIT_SECONDS,
-                            )
+                            timeout=self._request_deadline_remaining()
                         )
                     except queue.Empty:
                         return self._write_saturated(
@@ -523,8 +514,9 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         "retrieval_singleflight": (
                             server.retrieval_singleflight.status()
                         ),
-                        "max_admission_wait_seconds": (
-                            server.ADMISSION_WAIT_SECONDS
+                        "wait_policy": "fifo_until_request_deadline",
+                        "default_request_deadline_seconds": (
+                            server.DEFAULT_REQUEST_DEADLINE_SECONDS
                         ),
                     }
                     return self._write_json(payload)
@@ -1029,7 +1021,9 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
         def _request_deadline_epoch(self) -> float:
             raw = str(self.headers.get("X-Request-Deadline-Epoch-Ms") or "")
             if not raw:
-                return time.time() + 30.0
+                return time.time() + cast(
+                    AmosHTTPServer, self.server
+                ).DEFAULT_REQUEST_DEADLINE_SECONDS
             try:
                 return int(raw) / 1000.0
             except ValueError:
