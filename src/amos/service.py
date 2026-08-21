@@ -20,13 +20,14 @@ from .access_service import AccessService
 from .capacity_service import CapacityService
 from .continuity_service import ContinuityService
 from .diagnostics_service import DiagnosticsService
-from .graph_service import GraphService
+from .errors import ValidationError
 from .governance_service import GovernanceService
+from .graph_service import GraphService
 from .index_service import IndexService
 from .mutations_service import MutationService
 from .policy_service import PolicyService
-from .retrieval_service import RetrievalService
 from .reasoning_service import ReasoningFrameService
+from .retrieval_service import RetrievalService
 from .stewardship_service import StewardshipService
 from .temporal_service import TemporalService
 from .views_service import ViewService
@@ -224,6 +225,42 @@ class Amos:
                 requester=requester,
                 target_processor=target_processor,
             )
+
+    def sync_reference_leases(
+        self,
+        *,
+        owner_ref: str,
+        target_refs: Sequence[str],
+        scope: Mapping[str, Any] | None = None,
+        replace: bool = True,
+    ) -> dict[str, Any]:
+        """Protect exact refs still owned by an external durable workflow."""
+
+        normalized_owner = str(owner_ref).strip()
+        if not normalized_owner or len(normalized_owner) > 512:
+            raise ValidationError("reference lease owner_ref is invalid")
+        if isinstance(target_refs, (str, bytes)) or not isinstance(
+            target_refs, Sequence
+        ):
+            raise ValidationError("reference lease target_refs must be an array")
+        if scope is not None and not isinstance(scope, Mapping):
+            raise ValidationError("reference lease scope must be an object")
+        refs = list(dict.fromkeys(
+            str(ref).strip() for ref in target_refs if str(ref).strip()
+        ))
+        if any(len(ref) > 2048 for ref in refs):
+            raise ValidationError("reference lease target_ref is invalid")
+        result = self.store.sync_reference_leases(
+            owner_ref=normalized_owner,
+            target_refs=refs,
+            scope=dict(scope or {}),
+            replace=bool(replace),
+        )
+        return {
+            "profile": "amos.reference-lease-sync.v1",
+            "status": "committed",
+            **result,
+        }
 
     def commit_atom(
         self,

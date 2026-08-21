@@ -501,6 +501,17 @@ class SQLiteStore:
             CREATE INDEX IF NOT EXISTS idx_tombstones_target ON amos_tombstones(target_ref);
             CREATE INDEX IF NOT EXISTS idx_tombstones_content ON amos_tombstones(content_digest);
 
+            CREATE TABLE IF NOT EXISTS amos_reference_leases (
+                owner_ref TEXT NOT NULL,
+                target_ref TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(owner_ref, target_ref)
+            );
+            CREATE INDEX IF NOT EXISTS idx_reference_leases_target
+                ON amos_reference_leases(target_ref);
+
             CREATE TABLE IF NOT EXISTS amos_event_journal (
                 event_id TEXT PRIMARY KEY,
                 event_type TEXT NOT NULL,
@@ -1048,6 +1059,72 @@ class SQLiteStore:
     def set_meta(self, key: str, value: str) -> None:
         with self.transaction() as conn:
             self._set_meta(conn, key, value)
+
+    def sync_reference_leases(
+        self,
+        *,
+        owner_ref: str,
+        target_refs: Sequence[str],
+        scope: Mapping[str, Any],
+        replace: bool,
+    ) -> dict[str, Any]:
+        """Publish one owner's exact cleanup-protection frontier."""
+
+        refs = list(dict.fromkeys(str(ref) for ref in target_refs if str(ref)))
+        now = utc_now()
+        encoded_scope = canonical_json(scope)
+        with self.transaction(lane="foreground") as conn:
+            if replace:
+                conn.execute(
+                    "DELETE FROM amos_reference_leases WHERE owner_ref=?",
+                    (str(owner_ref),),
+                )
+            conn.executemany(
+                """INSERT INTO amos_reference_leases(
+                       owner_ref,target_ref,scope,created_at,updated_at
+                   ) VALUES(?,?,?,?,?)
+                   ON CONFLICT(owner_ref,target_ref) DO UPDATE SET
+                       scope=excluded.scope,updated_at=excluded.updated_at""",
+                [
+                    (str(owner_ref), ref, encoded_scope, now, now)
+                    for ref in refs
+                ],
+            )
+            retained = conn.execute(
+                """SELECT COUNT(*) AS count FROM amos_reference_leases
+                   WHERE owner_ref=?""",
+                (str(owner_ref),),
+            ).fetchone()
+        return {
+            "owner_ref": str(owner_ref),
+            "published_count": len(refs),
+            "retained_count": int(retained["count"] if retained else 0),
+            "replace": bool(replace),
+            "updated_at": now,
+        }
+
+    def reference_lease_refs_from_connection(
+        self,
+        conn: sqlite3.Connection,
+    ) -> set[str]:
+        return {
+            str(row["target_ref"])
+            for row in conn.execute(
+                "SELECT DISTINCT target_ref FROM amos_reference_leases"
+            ).fetchall()
+            if str(row["target_ref"] or "")
+        }
+
+    def is_reference_leased(
+        self,
+        conn: sqlite3.Connection,
+        target_ref: str,
+    ) -> bool:
+        return conn.execute(
+            """SELECT 1 FROM amos_reference_leases
+               WHERE target_ref=? LIMIT 1""",
+            (str(target_ref),),
+        ).fetchone() is not None
 
     def append_event(
         self,

@@ -553,6 +553,15 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         "'amos.reference-classification.v1'"
                     )
                 return self._write_json(amos.classify_refs(**request))
+            if path == "/v1/reference-leases:sync":
+                request = dict(body)
+                profile = request.pop("profile", None)
+                if profile not in {None, "amos.reference-lease-sync.v1"}:
+                    raise ValidationError(
+                        "reference lease profile must be "
+                        "'amos.reference-lease-sync.v1'"
+                    )
+                return self._write_json(amos.sync_reference_leases(**request))
             if path == "/v1/memory-transactions:commit":
                 request = dict(body)
                 profile = request.pop("profile", None)

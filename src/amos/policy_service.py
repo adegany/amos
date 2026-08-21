@@ -1724,6 +1724,9 @@ class PolicyService:
                     for head in self.store.list_memory_heads()
                     if str(head.get("head_ref") or "")
                 }
+                leased_refs = self.store.reference_lease_refs_from_connection(
+                    self.store.conn
+                )
                 atoms = sorted(
                     self.store.list_atoms_filtered(include_deleted=True),
                     key=lambda atom: (
@@ -1742,6 +1745,8 @@ class PolicyService:
                     if not maintenance_scope_visible(atom["scope"], scope):
                         continue
                     if str(atom["id"]) in current_head_refs:
+                        continue
+                    if str(atom["id"]) in leased_refs:
                         continue
                     if atom["type"] in protected_types and not atom.get("deleted"):
                         continue
@@ -1861,6 +1866,9 @@ class PolicyService:
                         != int(planned_atom.get("version", 0))
                         or str(atom.get("id") or "")
                         in current_head_refs_for_batch
+                        or self.store.is_reference_leased(
+                            conn, str(planned_atom["id"])
+                        )
                         or not maintenance_scope_visible(atom["scope"], scope)
                         or (
                             atom["type"] in protected_types

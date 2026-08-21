@@ -1817,6 +1817,131 @@ def test_memory_policy_storage_cleanup_deletes_expired_archived_and_stale_atoms(
     assert amos.verify_replay()["status"] == "ok"
 
 
+def test_storage_cleanup_preserves_external_reference_leases(
+    amos, monkeypatch
+):
+    old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    leased = amos.commit_atom({
+        "id": "cleanup_leased_pending_input",
+        "type": "semantic",
+        "payload": {"summary": "Still owned by a pending external workflow"},
+        "created_at": old,
+        "observed_at": old,
+        "updated_at": old,
+        "lifecycle_state": "archived",
+        "health_status": "stale",
+    })["atom"]
+    unleased = amos.commit_atom({
+        "id": "cleanup_unleased_historical_input",
+        "type": "semantic",
+        "payload": {"summary": "No durable workflow still owns this input"},
+        "created_at": old,
+        "observed_at": old,
+        "updated_at": old,
+        "lifecycle_state": "archived",
+        "health_status": "stale",
+    })["atom"]
+    late_leased = amos.commit_atom({
+        "id": "cleanup_late_leased_pending_input",
+        "type": "semantic",
+        "payload": {"summary": "Leased after cleanup planning"},
+        "created_at": old,
+        "observed_at": old,
+        "updated_at": old,
+        "lifecycle_state": "archived",
+        "health_status": "stale",
+    })["atom"]
+    lease = amos.sync_reference_leases(
+        owner_ref="cogito:pending-work:test",
+        target_refs=[leased["id"]],
+        scope={},
+        replace=True,
+    )
+    assert lease["status"] == "committed"
+    assert lease["retained_count"] == 1
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": False},
+        storage_cleanup={
+            "enabled": True,
+            "idle_after_seconds": 0,
+            "min_interval_seconds": 0,
+            "delete_archived_after_seconds": 0,
+            "delete_stale_after_seconds": 0,
+            "sqlite_compaction": {
+                "checkpoint_wal": False,
+                "vacuum_enabled": False,
+            },
+        },
+    )
+    original_prune = amos.store.prune_atom_text_index
+    late_published = False
+
+    def publish_late_lease(conn, **kwargs):
+        nonlocal late_published
+        if not late_published:
+            late_published = True
+            amos.store.sync_reference_leases(
+                owner_ref="cogito:pending-work:test",
+                target_refs=[late_leased["id"]],
+                scope={},
+                replace=False,
+            )
+        return original_prune(conn, **kwargs)
+
+    monkeypatch.setattr(
+        amos.store,
+        "prune_atom_text_index",
+        publish_late_lease,
+    )
+
+    result = amos.run_memory_policy(force=True, trigger="reference_lease_test")
+
+    assert late_published is True
+    assert leased["id"] not in result["results"]["storage_cleanup"][
+        "deleted_atom_refs"
+    ]
+    assert amos.store.get_atom(leased["id"]) is not None
+    assert amos.store.get_atom(late_leased["id"]) is not None
+    assert amos.store.get_atom(unleased["id"]) is None
+
+    cleared = amos.sync_reference_leases(
+        owner_ref="cogito:pending-work:test",
+        target_refs=[],
+        scope={},
+        replace=True,
+    )
+    assert cleared["retained_count"] == 0
+
+    large_frontier = [f"atom:pending-{index}" for index in range(4_101)]
+    large = amos.sync_reference_leases(
+        owner_ref="cogito:pending-work:test",
+        target_refs=large_frontier,
+        scope={},
+        replace=True,
+    )
+    assert large["published_count"] == len(large_frontier)
+    assert large["retained_count"] == len(large_frontier)
+    amos.sync_reference_leases(
+        owner_ref="cogito:pending-work:test",
+        target_refs=[],
+        scope={},
+        replace=True,
+    )
+
+    with pytest.raises(ValidationError, match="target_refs must be an array"):
+        amos.sync_reference_leases(
+            owner_ref="cogito:pending-work:test",
+            target_refs="cleanup_leased_pending_input",
+            scope={},
+            replace=True,
+        )
+
+
 def test_storage_cleanup_physically_retires_atom_and_edge_payload_rows(amos):
     old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat().replace(
         "+00:00", "Z"

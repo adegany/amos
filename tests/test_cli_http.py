@@ -146,6 +146,18 @@ def test_http_v1_endpoints_smoke(tmp_path):
     thread.start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
     try:
+        lease = http_json(
+            f"{base}/v1/reference-leases:sync",
+            {
+                "profile": "amos.reference-lease-sync.v1",
+                "owner_ref": "cogito:pending-work:http-smoke",
+                "target_refs": ["http_atom", "http_atom"],
+                "scope": {"system": "test"},
+                "replace": True,
+            },
+        )
+        assert lease["status"] == "committed"
+        assert lease["published_count"] == 1
         committed = http_json(
             f"{base}/v1/atoms:commit",
             {
