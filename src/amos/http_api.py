@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hmac
 import json
-import queue
 import sqlite3
 import threading
 import time
@@ -133,6 +132,103 @@ class _SingleFlight:
             return {"in_flight": len(self._flights)}
 
 
+class _FairServicePool:
+    """Priority-aware access to independent AMOS request connections.
+
+    The heavy-work gate protects CPU and I/O capacity, but every request still
+    needs a service connection.  Keeping a second FIFO queue at that boundary
+    could otherwise place interactive work behind already queued background
+    reads after it had won heavy admission.
+    """
+
+    def __init__(self, services: list[Amos], *, interactive_burst_limit: int = 4):
+        if not services:
+            raise ValueError("service pool requires at least one service")
+        self.capacity = len(services)
+        self.interactive_burst_limit = max(1, int(interactive_burst_limit))
+        self._condition = threading.Condition()
+        self._available: deque[Amos] = deque(services)
+        self._interactive_waiters: deque[object] = deque()
+        self._standard_waiters: deque[object] = deque()
+        self._active_interactive = 0
+        self._active_standard = 0
+        self._consecutive_interactive = 0
+
+    def _next_waiter(self) -> object | None:
+        if self._interactive_waiters and (
+            not self._standard_waiters
+            or self._consecutive_interactive < self.interactive_burst_limit
+        ):
+            return self._interactive_waiters[0]
+        if self._standard_waiters:
+            return self._standard_waiters[0]
+        if self._interactive_waiters:
+            return self._interactive_waiters[0]
+        return None
+
+    def acquire(
+        self, *, timeout: float, request_class: str = "standard"
+    ) -> Amos | None:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        waiter = object()
+        interactive = str(request_class).casefold() == "interactive"
+        queue_for_class = (
+            self._interactive_waiters if interactive else self._standard_waiters
+        )
+        with self._condition:
+            queue_for_class.append(waiter)
+            while self._next_waiter() is not waiter or not self._available:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    queue_for_class.remove(waiter)
+                    self._condition.notify_all()
+                    return None
+                self._condition.wait(timeout=remaining)
+            queue_for_class.popleft()
+            service = self._available.popleft()
+            if interactive:
+                self._active_interactive += 1
+                self._consecutive_interactive += 1
+            else:
+                self._active_standard += 1
+                self._consecutive_interactive = 0
+            self._condition.notify_all()
+            return service
+
+    def release(self, service: Amos, *, request_class: str = "standard") -> None:
+        interactive = str(request_class).casefold() == "interactive"
+        with self._condition:
+            self._available.append(service)
+            if interactive:
+                self._active_interactive = max(0, self._active_interactive - 1)
+            else:
+                self._active_standard = max(0, self._active_standard - 1)
+            self._condition.notify_all()
+
+    def qsize(self) -> int:
+        with self._condition:
+            return len(self._available)
+
+    def status(self) -> dict[str, int | str]:
+        with self._condition:
+            return {
+                "policy": "interactive_priority_bounded_burst",
+                "capacity": self.capacity,
+                "available": len(self._available),
+                "active": self._active_interactive + self._active_standard,
+                "active_interactive": self._active_interactive,
+                "active_standard": self._active_standard,
+                "waiting": (
+                    len(self._interactive_waiters)
+                    + len(self._standard_waiters)
+                ),
+                "waiting_interactive": len(self._interactive_waiters),
+                "waiting_standard": len(self._standard_waiters),
+                "interactive_burst_limit": self.interactive_burst_limit,
+                "consecutive_interactive": self._consecutive_interactive,
+            }
+
+
 class AmosHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 64
@@ -179,15 +275,10 @@ class AmosHTTPServer(ThreadingHTTPServer):
                 for _ in range(self.REQUEST_SERVICE_COUNT - 1)
             ],
         ]
-        self.request_service_pool: queue.Queue[Amos] = queue.Queue(
-            maxsize=self.REQUEST_SERVICE_COUNT
-        )
         # Keep the public primary service first so ordinary sequential requests
         # retain the existing test/embedding seam while overlapping requests
         # receive isolated SQLite connections.
-        self.request_service_pool.put(self.amos)
-        for service in self.request_services[1:]:
-            self.request_service_pool.put(service)
+        self.request_service_pool = _FairServicePool(self.request_services)
         self.heavy_admission = _FairAdmission(self.HEAVY_REQUEST_CAPACITY)
         self.retrieval_singleflight = _SingleFlight()
         self.health_amos = Amos(
@@ -361,6 +452,14 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         server.inventory_lock.release()
                 request_amos: Amos | None = None
                 heavy_acquired = False
+                request_class = (
+                    "interactive"
+                    if str(
+                        self.headers.get("X-AMOS-Request-Class") or ""
+                    ).casefold()
+                    == "interactive"
+                    else "standard"
+                )
                 flight_key: str | None = None
                 flight_event: threading.Event | None = None
                 flight_leader = False
@@ -384,27 +483,17 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                     if method == "POST" and path in server.HEAVY_PATHS:
                         heavy_acquired = server.heavy_admission.acquire(
                             timeout=self._request_deadline_remaining(),
-                            request_class=(
-                                "interactive"
-                                if str(
-                                    self.headers.get(
-                                        "X-AMOS-Request-Class"
-                                    )
-                                    or ""
-                                ).casefold()
-                                == "interactive"
-                                else "standard"
-                            ),
+                            request_class=request_class,
                         )
                         if not heavy_acquired:
                             return self._write_saturated(
                                 stage="heavy_request_admission"
                             )
-                    try:
-                        request_amos = server.request_service_pool.get(
-                            timeout=self._request_deadline_remaining()
-                        )
-                    except queue.Empty:
+                    request_amos = server.request_service_pool.acquire(
+                        timeout=self._request_deadline_remaining(),
+                        request_class=request_class,
+                    )
+                    if request_amos is None:
                         return self._write_saturated(
                             stage="request_service_admission"
                         )
@@ -423,7 +512,10 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                     self._dispatch(server, method, body, amos=request_amos)
                 finally:
                     if request_amos is not None:
-                        server.request_service_pool.put(request_amos)
+                        server.request_service_pool.release(
+                            request_amos,
+                            request_class=request_class,
+                        )
                     if heavy_acquired:
                         server.heavy_admission.release()
                     if flight_leader and flight_key and flight_event is not None:
@@ -556,11 +648,12 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                     payload["request_admission"] = {
                         "service_capacity": server.REQUEST_SERVICE_COUNT,
                         "service_available": server.request_service_pool.qsize(),
+                        "service_pool": server.request_service_pool.status(),
                         "heavy": server.heavy_admission.status(),
                         "retrieval_singleflight": (
                             server.retrieval_singleflight.status()
                         ),
-                        "wait_policy": "fifo_until_request_deadline",
+                        "wait_policy": "priority_until_request_deadline",
                         "default_request_deadline_seconds": (
                             server.DEFAULT_REQUEST_DEADLINE_SECONDS
                         ),

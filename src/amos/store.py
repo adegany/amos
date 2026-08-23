@@ -447,6 +447,34 @@ class SQLiteStore:
                     json_extract(payload, '$.plugin_digest')
                 )
                 WHERE deleted = 0;
+            CREATE INDEX IF NOT EXISTS idx_atoms_interaction_stream_sequence
+                ON amos_atoms(
+                    json_extract(payload, '$.conversation_id'),
+                    CAST(json_extract(payload, '$.sequence') AS INTEGER)
+                )
+                WHERE deleted = 0 AND type = 'interaction_event';
+            CREATE INDEX IF NOT EXISTS
+                idx_atoms_discourse_thread_conversation_updated
+                ON amos_atoms(
+                    json_extract(payload, '$.conversation_id'),
+                    updated_at DESC
+                )
+                WHERE deleted = 0 AND type = 'discourse_thread';
+            CREATE INDEX IF NOT EXISTS idx_atoms_context_compaction_stream
+                ON amos_atoms(
+                    json_extract(
+                        payload,
+                        '$.context_compaction.partition.key'
+                    ),
+                    CAST(json_extract(
+                        payload,
+                        '$.context_compaction.coverage.through_sequence'
+                    ) AS INTEGER) DESC,
+                    updated_at DESC
+                )
+                WHERE deleted = 0
+                  AND type = 'semantic'
+                  AND lifecycle_state = 'active';
 
             CREATE TABLE IF NOT EXISTS amos_atom_text_index (
                 atom_id TEXT NOT NULL,
@@ -871,6 +899,7 @@ class SQLiteStore:
         *,
         scope: Mapping[str, Any] | None = None,
         series_kind: str | None = None,
+        series_ids: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -880,6 +909,18 @@ class SQLiteStore:
         if series_kind is not None:
             clauses.append("series_kind = ?")
             params.append(str(series_kind))
+        if series_ids is not None:
+            normalized_series_ids = list(dict.fromkeys(
+                str(series_id) for series_id in series_ids if str(series_id)
+            ))
+            if not normalized_series_ids:
+                return []
+            clauses.append(
+                "series_id IN ("
+                + ",".join("?" for _ in normalized_series_ids)
+                + ")"
+            )
+            params.extend(normalized_series_ids)
         query = "SELECT * FROM amos_memory_heads"
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
@@ -1600,6 +1641,111 @@ class SQLiteStore:
 
     def list_atoms(self) -> list[dict[str, Any]]:
         rows = self.conn.execute("SELECT * FROM amos_atoms ORDER BY updated_at DESC").fetchall()
+        return [self._row_dict(row) for row in rows]
+
+    def list_interaction_atoms(
+        self,
+        *,
+        conversation_id: str,
+        after_sequence: int | None = None,
+        through_sequence: int | None = None,
+        limit: int | None = None,
+        newest_first: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return one interaction stream without decoding unrelated atoms."""
+
+        clauses = [
+            "type = 'interaction_event'",
+            "deleted = 0",
+            "json_extract(payload, '$.conversation_id') = ?",
+        ]
+        params: list[Any] = [str(conversation_id)]
+        sequence_sql = "CAST(json_extract(payload, '$.sequence') AS INTEGER)"
+        if after_sequence is not None:
+            clauses.append(f"{sequence_sql} > ?")
+            params.append(int(after_sequence))
+        if through_sequence is not None:
+            clauses.append(f"{sequence_sql} <= ?")
+            params.append(int(through_sequence))
+        direction = "DESC" if newest_first else "ASC"
+        query = (
+            "SELECT * FROM amos_atoms WHERE "
+            + " AND ".join(clauses)
+            + f" ORDER BY {sequence_sql} {direction}, id {direction}"
+        )
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        return [self._row_dict(row) for row in rows]
+
+    def list_discourse_thread_atoms(
+        self, *, conversation_id: str
+    ) -> list[dict[str, Any]]:
+        """Return roots belonging to one exact conversation."""
+
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM amos_atoms
+            WHERE type = 'discourse_thread'
+              AND deleted = 0
+              AND json_extract(payload, '$.conversation_id') = ?
+            ORDER BY updated_at DESC
+            """,
+            (str(conversation_id),),
+        ).fetchall()
+        return [self._row_dict(row) for row in rows]
+
+    def list_context_compaction_atoms(
+        self,
+        *,
+        partition_key: str,
+        through_sequence: int,
+        profile: str,
+    ) -> list[dict[str, Any]]:
+        """Return viable rolling compactions for one interaction stream."""
+
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM amos_atoms
+            WHERE type = 'semantic'
+              AND deleted = 0
+              AND lifecycle_state = 'active'
+              AND (
+                    health_status IS NULL
+                    OR health_status <> 'contradicted'
+                  )
+              AND json_extract(
+                    payload,
+                    '$.context_compaction.profile'
+                  ) = ?
+              AND json_extract(
+                    payload,
+                    '$.context_compaction.mode'
+                  ) = 'rolling'
+              AND json_extract(
+                    payload,
+                    '$.context_compaction.partition.kind'
+                  ) = 'interaction_stream'
+              AND json_extract(
+                    payload,
+                    '$.context_compaction.partition.key'
+                  ) = ?
+              AND CAST(json_extract(
+                    payload,
+                    '$.context_compaction.coverage.through_sequence'
+                  ) AS INTEGER) <= ?
+            ORDER BY CAST(json_extract(
+                       payload,
+                       '$.context_compaction.coverage.through_sequence'
+                     ) AS INTEGER) DESC,
+                     updated_at DESC,
+                     id DESC
+            """,
+            (str(profile), str(partition_key), int(through_sequence)),
+        ).fetchall()
         return [self._row_dict(row) for row in rows]
 
     def list_atoms_filtered(

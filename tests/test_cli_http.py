@@ -36,7 +36,7 @@ from amos import (
     semantic_relation_proposals_from_facets,
 )
 from amos.cli import main as cli_main
-from amos.http_api import AmosHTTPServer, _FairAdmission
+from amos.http_api import AmosHTTPServer, _FairAdmission, _FairServicePool
 from amos.smp import cosine
 
 from .helpers import ExampleTrainingFlightProcessor, item_refs
@@ -484,6 +484,12 @@ def test_http_heavy_retrieval_waits_fifo_until_its_request_deadline(tmp_path):
             request_thread.start()
         with entered:
             assert entered.wait_for(lambda: active == 2, timeout=1)
+        deadline = time.monotonic() + 1
+        while (
+            server.heavy_admission.status()["waiting"] != 1
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.001)
         assert server.heavy_admission.status()["waiting"] == 1
         time.sleep(0.05)
         assert errors == []
@@ -550,6 +556,131 @@ def test_heavy_admission_prioritizes_interactive_without_reordering_its_class():
     assert admission.status()["policy"] == (
         "interactive_priority_bounded_burst"
     )
+
+
+def test_request_service_pool_prioritizes_interactive_waiters() -> None:
+    service = object()
+    pool = _FairServicePool([service])
+    holder = pool.acquire(timeout=0.1, request_class="standard")
+    assert holder is service
+    order: list[str] = []
+
+    def wait_for_service(label: str, request_class: str) -> None:
+        acquired = pool.acquire(timeout=2, request_class=request_class)
+        assert acquired is service
+        order.append(label)
+        pool.release(acquired, request_class=request_class)
+
+    standard = threading.Thread(
+        target=wait_for_service,
+        args=("standard", "standard"),
+        daemon=True,
+    )
+    interactive = threading.Thread(
+        target=wait_for_service,
+        args=("interactive", "interactive"),
+        daemon=True,
+    )
+    standard.start()
+    deadline = time.monotonic() + 1
+    while (
+        pool.status()["waiting_standard"] != 1
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+    assert pool.status()["waiting_standard"] == 1
+    interactive.start()
+    deadline = time.monotonic() + 1
+    while (
+        pool.status()["waiting_interactive"] != 1
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+    assert pool.status()["waiting_interactive"] == 1
+
+    pool.release(holder, request_class="standard")
+    interactive.join(timeout=2)
+    standard.join(timeout=2)
+
+    assert interactive.is_alive() is False
+    assert standard.is_alive() is False
+    assert order == ["interactive", "standard"]
+    assert pool.status() == {
+        "policy": "interactive_priority_bounded_burst",
+        "capacity": 1,
+        "available": 1,
+        "active": 0,
+        "active_interactive": 0,
+        "active_standard": 0,
+        "waiting": 0,
+        "waiting_interactive": 0,
+        "waiting_standard": 0,
+        "interactive_burst_limit": 4,
+        "consecutive_interactive": 0,
+    }
+
+
+def test_request_service_pool_bounds_interactive_burst() -> None:
+    service = object()
+    pool = _FairServicePool([service], interactive_burst_limit=1)
+    holder = pool.acquire(timeout=0.1, request_class="standard")
+    assert holder is service
+    order: list[str] = []
+
+    def wait_for_service(label: str, request_class: str) -> None:
+        acquired = pool.acquire(timeout=2, request_class=request_class)
+        assert acquired is service
+        order.append(label)
+        pool.release(acquired, request_class=request_class)
+
+    waiting = [
+        threading.Thread(
+            target=wait_for_service,
+            args=("standard", "standard"),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=wait_for_service,
+            args=("interactive-1", "interactive"),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=wait_for_service,
+            args=("interactive-2", "interactive"),
+            daemon=True,
+        ),
+    ]
+    waiting[0].start()
+    deadline = time.monotonic() + 1
+    while (
+        pool.status()["waiting_standard"] != 1
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+    assert pool.status()["waiting_standard"] == 1
+    waiting[1].start()
+    deadline = time.monotonic() + 1
+    while (
+        pool.status()["waiting_interactive"] != 1
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+    assert pool.status()["waiting_interactive"] == 1
+    waiting[2].start()
+    deadline = time.monotonic() + 1
+    while (
+        pool.status()["waiting_interactive"] != 2
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+    assert pool.status()["waiting"] == 3
+
+    pool.release(holder, request_class="standard")
+    for thread in waiting:
+        thread.join(timeout=2)
+
+    assert all(thread.is_alive() is False for thread in waiting)
+    assert order == ["interactive-1", "standard", "interactive-2"]
 
 
 def test_http_shared_view_queues_policy_instead_of_running_it_inline(

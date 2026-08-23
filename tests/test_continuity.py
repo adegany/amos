@@ -637,7 +637,7 @@ def thread_state(
     }
 
 
-def test_atomic_interaction_thread_head_and_workspace_visibility(amos):
+def test_atomic_interaction_thread_head_and_workspace_visibility(amos, monkeypatch):
     first = amos.commit_memory_transaction(
         scope=SCOPE,
         actor="participant-ingress",
@@ -758,6 +758,11 @@ def test_atomic_interaction_thread_head_and_workspace_visibility(amos):
         ],
     )
 
+    def reject_unbounded_atom_scan():
+        raise AssertionError("cognitive workspace must not scan every AMOS atom")
+
+    monkeypatch.setattr(amos.store, "list_atoms", reject_unbounded_atom_scan)
+
     workspace = amos.compile_cognitive_workspace(
         current_event_ref="event_human_3",
         conversation_id="main",
@@ -775,6 +780,13 @@ def test_atomic_interaction_thread_head_and_workspace_visibility(amos):
     ]
     assert workspace["thread_heads"][0]["thread_id"] == "thread_open_1"
     assert workspace["thread_heads"][0]["private_state"][0]["value"] == "orchid"
+    assert workspace["thread_heads"][0]["state_basis"] == [
+        {
+            "atom_ref": "event_agent_2",
+            "atom_type": "interaction_event",
+            "content": "Ready.",
+        }
+    ]
     assert workspace["budget"]["limit_items"] == 512
     assert workspace["budget"]["used_items"] <= 512
 

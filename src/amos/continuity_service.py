@@ -826,12 +826,12 @@ class ContinuityService:
         target_processor: str,
     ) -> list[dict[str, Any]]:
         atoms: list[dict[str, Any]] = []
-        for atom in self.store.list_atoms():
+        for atom in self.store.list_interaction_atoms(
+            conversation_id=conversation_id
+        ):
             payload = atom.get("payload") or {}
             if (
-                atom.get("type") != "interaction_event"
-                or payload.get("conversation_id") != conversation_id
-                or atom.get("deleted")
+                payload.get("conversation_id") != conversation_id
                 or not scope_visible(atom.get("scope") or {}, scope)
                 or not access_visible(
                     atom.get("access_policy") or {},
@@ -849,11 +849,36 @@ class ContinuityService:
         )
         return atoms
 
+    @staticmethod
+    def _visible_interaction(
+        atom: Mapping[str, Any] | None,
+        *,
+        conversation_id: str,
+        scope: Mapping[str, Any],
+        requester: str,
+        target_processor: str,
+    ) -> bool:
+        if not isinstance(atom, Mapping):
+            return False
+        payload = atom.get("payload") or {}
+        return bool(
+            atom.get("type") == "interaction_event"
+            and payload.get("conversation_id") == conversation_id
+            and not atom.get("deleted")
+            and scope_visible(atom.get("scope") or {}, scope)
+            and access_visible(
+                atom.get("access_policy") or {}, requester, target_processor
+            )
+        )
+
     def _reply_chain(
         self,
         current: Mapping[str, Any],
         *,
-        by_ref: Mapping[str, Mapping[str, Any]],
+        conversation_id: str,
+        scope: Mapping[str, Any],
+        requester: str,
+        target_processor: str,
         limit: int,
     ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = [dict(current)]
@@ -863,13 +888,77 @@ class ContinuityService:
             reply_ref = str((cursor.get("payload") or {}).get("in_reply_to") or "")
             if not reply_ref or reply_ref in seen:
                 break
-            prior = by_ref.get(reply_ref)
-            if prior is None:
+            prior = self.store.get_atom(reply_ref)
+            if not self._visible_interaction(
+                prior,
+                conversation_id=conversation_id,
+                scope=scope,
+                requester=requester,
+                target_processor=target_processor,
+            ):
                 break
+            assert prior is not None
             result.append(dict(prior))
             seen.add(reply_ref)
             cursor = prior
         return list(reversed(result))
+
+    def _recent_interaction_window(
+        self,
+        *,
+        conversation_id: str,
+        through_sequence: int,
+        scope: Mapping[str, Any],
+        requester: str,
+        target_processor: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Load a bounded visible tail when explicit reply lineage is absent."""
+
+        selected: list[dict[str, Any]] = []
+        cursor = max(0, int(through_sequence))
+        batch_limit = max(16, int(limit) * 2)
+        seen: set[str] = set()
+        while cursor > 0 and len(selected) < limit:
+            batch = self.store.list_interaction_atoms(
+                conversation_id=conversation_id,
+                through_sequence=cursor,
+                limit=batch_limit,
+                newest_first=True,
+            )
+            if not batch:
+                break
+            oldest_sequence = cursor
+            for atom in batch:
+                payload = atom.get("payload") or {}
+                sequence = int(payload.get("sequence") or 0)
+                oldest_sequence = min(oldest_sequence, sequence)
+                atom_ref = str(atom.get("id") or "")
+                if atom_ref in seen or not self._visible_interaction(
+                    atom,
+                    conversation_id=conversation_id,
+                    scope=scope,
+                    requester=requester,
+                    target_processor=target_processor,
+                ):
+                    continue
+                seen.add(atom_ref)
+                selected.append(dict(atom))
+                if len(selected) >= limit:
+                    break
+            if len(batch) < batch_limit or oldest_sequence <= 1:
+                break
+            next_cursor = oldest_sequence - 1
+            if next_cursor >= cursor:
+                break
+            cursor = next_cursor
+        selected.sort(
+            key=lambda atom: (
+                int((atom.get("payload") or {}).get("sequence", 0)),
+                str(atom.get("id") or ""),
+            )
+        )
+        return selected[-limit:]
 
     def _thread_roots(
         self,
@@ -880,12 +969,12 @@ class ContinuityService:
         target_processor: str,
     ) -> dict[str, dict[str, Any]]:
         roots: dict[str, dict[str, Any]] = {}
-        for atom in self.store.list_atoms():
+        for atom in self.store.list_discourse_thread_atoms(
+            conversation_id=conversation_id
+        ):
             payload = atom.get("payload") or {}
             if (
-                atom.get("type") == "discourse_thread"
-                and payload.get("conversation_id") == conversation_id
-                and not atom.get("deleted")
+                payload.get("conversation_id") == conversation_id
                 and scope_visible(atom.get("scope") or {}, scope)
                 and access_visible(
                     atom.get("access_policy") or {},
@@ -975,13 +1064,13 @@ class ContinuityService:
 
         candidates: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         omissions: list[dict[str, Any]] = []
-        for atom in self.store.list_atoms():
+        for atom in self.store.list_context_compaction_atoms(
+            partition_key=conversation_id,
+            through_sequence=current_sequence,
+            profile=CONTEXT_COMPACTION_PROFILE,
+        ):
             if (
-                atom.get("type") != "semantic"
-                or atom.get("deleted")
-                or atom.get("lifecycle_state") != "active"
-                or atom.get("health_status") == "contradicted"
-                or not scope_visible(atom.get("scope") or {}, scope)
+                not scope_visible(atom.get("scope") or {}, scope)
                 or not access_visible(
                     atom.get("access_policy") or {},
                     requester,
@@ -1242,32 +1331,27 @@ class ContinuityService:
                 }
             )
 
-        interactions = self._interaction_atoms(
+        temporal = self._reply_chain(
+            current,
             conversation_id=conversation_id,
             scope=request_scope,
             requester=requester,
             target_processor=target_processor,
-        )
-        by_ref = {str(atom["id"]): atom for atom in interactions}
-        temporal = self._reply_chain(
-            current, by_ref=by_ref, limit=temporal_limit
+            limit=temporal_limit,
         )
         temporal_refs = {str(atom["id"]) for atom in temporal}
         # If an event has no explicit reply pointer, preserve the immediately
         # preceding exchange.  This is sequence closure, not semantic routing.
         if len(temporal) == 1:
-            position = next(
-                (
-                    index
-                    for index, atom in enumerate(interactions)
-                    if atom["id"] == current_event_ref
-                ),
-                None,
+            temporal = self._recent_interaction_window(
+                conversation_id=conversation_id,
+                through_sequence=current_sequence,
+                scope=request_scope,
+                requester=requester,
+                target_processor=target_processor,
+                limit=min(4, temporal_limit),
             )
-            if position is not None:
-                start = max(0, position - min(3, temporal_limit - 1))
-                temporal = interactions[start : position + 1]
-                temporal_refs = {str(atom["id"]) for atom in temporal}
+            temporal_refs = {str(atom["id"]) for atom in temporal}
 
         compacted_context, compaction_omissions = (
             self._context_compaction_projection(
@@ -1304,7 +1388,9 @@ class ContinuityService:
 
         thread_candidates: list[dict[str, Any]] = []
         for head in self.store.list_memory_heads(
-            scope=request_scope, series_kind="discourse_thread"
+            scope=request_scope,
+            series_kind="discourse_thread",
+            series_ids=tuple(roots),
         ):
             thread_id = str(head["series_id"])
             root = roots.get(thread_id)
@@ -1384,6 +1470,34 @@ class ContinuityService:
         for index, item in enumerate(selected_threads):
             state = item["state"]
             payload = state.get("payload") or {}
+            state_basis: list[dict[str, Any]] = []
+            seen_basis_refs: set[str] = set()
+            for private_state in payload.get("private_state") or []:
+                if not isinstance(private_state, Mapping):
+                    continue
+                for raw_ref in private_state.get("basis_refs") or []:
+                    basis_ref = str(raw_ref or "")
+                    if not basis_ref or basis_ref in seen_basis_refs:
+                        continue
+                    seen_basis_refs.add(basis_ref)
+                    basis = self.store.get_atom(basis_ref)
+                    if (
+                        basis is None
+                        or basis.get("deleted")
+                        or not scope_visible(basis.get("scope") or {}, request_scope)
+                        or not access_visible(
+                            basis.get("access_policy") or {},
+                            requester,
+                            target_processor,
+                        )
+                    ):
+                        continue
+                    basis_payload = basis.get("payload") or {}
+                    state_basis.append({
+                        "atom_ref": basis_ref,
+                        "atom_type": str(basis.get("type") or ""),
+                        "content": str(basis_payload.get("content") or "")[:1000],
+                    })
             thread_projection.append(
                 {
                     "alias": f"thread_{index + 1}",
@@ -1402,6 +1516,7 @@ class ContinuityService:
                     ),
                     "shared_state": list(payload.get("shared_state") or []),
                     "private_state": list(payload.get("private_state") or []),
+                    "state_basis": state_basis,
                     "unresolved_items": list(
                         payload.get("unresolved_items") or []
                     ),
@@ -1440,6 +1555,11 @@ class ContinuityService:
                         *[item["atom_ref"] for item in compacted_context],
                         *[item["root_ref"] for item in thread_projection],
                         *[item["state_ref"] for item in thread_projection],
+                        *[
+                            basis["atom_ref"]
+                            for item in thread_projection
+                            for basis in item.get("state_basis") or []
+                        ],
                         *[item["atom_ref"] for item in canonical_context],
                     ],
                     "omissions": omissions,
@@ -1559,6 +1679,11 @@ class ContinuityService:
                 *[item["atom_ref"] for item in compacted_context],
                 *[item["root_ref"] for item in thread_projection],
                 *[item["state_ref"] for item in thread_projection],
+                *[
+                    basis["atom_ref"]
+                    for item in thread_projection
+                    for basis in item.get("state_basis") or []
+                ],
                 *[item["atom_ref"] for item in canonical_context],
             ],
             "omissions": [
@@ -1742,7 +1867,15 @@ class ContinuityService:
             and not workspace["thread_heads"][-1]["directly_linked"]
         ):
             removed = workspace["thread_heads"].pop()
-            removed_refs = {removed["root_ref"], removed["state_ref"]}
+            removed_refs = {
+                removed["root_ref"],
+                removed["state_ref"],
+                *(
+                    str(item.get("atom_ref") or "")
+                    for item in removed.get("state_basis") or []
+                    if isinstance(item, Mapping)
+                ),
+            }
             workspace["protected_refs"] = [
                 ref
                 for ref in workspace["protected_refs"]
