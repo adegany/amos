@@ -778,6 +778,22 @@ def test_atomic_interaction_thread_head_and_workspace_visibility(amos):
     assert workspace["budget"]["limit_items"] == 512
     assert workspace["budget"]["used_items"] <= 512
 
+    deferred = amos.compile_cognitive_workspace(
+        current_event_ref="event_human_3",
+        conversation_id="main",
+        scope=SCOPE,
+        requester="agent:participant",
+        target_processor="primary-reasoner",
+        participant_refs=["human:participant", "agent:participant"],
+        token_or_byte_budget={"bytes": 48_000, "items": 512},
+        include_associative_memory=False,
+    )
+    assert deferred["request"]["include_associative_memory"] is False
+    assert deferred["associative_memory"] is None
+    assert {item["reason"] for item in deferred["omissions"]} >= {
+        "associative_memory_deferred"
+    }
+
     with pytest.raises(
         CognitiveWorkspaceBudgetExceeded,
         match="too small for protected cognitive workspace context",

@@ -665,6 +665,7 @@ class Amos:
         thread_limit: int = 8,
         recent_event_floor: int = 4,
         prior_workspace_revision: Mapping[str, Any] | None = None,
+        include_associative_memory: bool = True,
         run_policy: bool = False,
     ) -> dict[str, Any]:
         if run_policy:
@@ -687,6 +688,7 @@ class Amos:
                 thread_limit=thread_limit,
                 recent_event_floor=recent_event_floor,
                 prior_workspace_revision=prior_workspace_revision,
+                include_associative_memory=include_associative_memory,
                 run_policy=run_policy,
                 _policy_already_run=True,
             )

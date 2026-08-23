@@ -31,28 +31,56 @@ from .workers import BackgroundMemoryPolicyWorker
 
 
 class _FairAdmission:
-    """FIFO bounded admission with deadline-aware waiter cancellation."""
+    """Bounded priority admission with FIFO classes and starvation control."""
 
-    def __init__(self, capacity: int):
+    def __init__(self, capacity: int, *, interactive_burst_limit: int = 4):
         self.capacity = max(1, int(capacity))
+        self.interactive_burst_limit = max(1, int(interactive_burst_limit))
         self._condition = threading.Condition()
-        self._waiters: deque[object] = deque()
+        self._interactive_waiters: deque[object] = deque()
+        self._standard_waiters: deque[object] = deque()
         self._active = 0
+        self._consecutive_interactive = 0
 
-    def acquire(self, *, timeout: float) -> bool:
+    def _next_waiter(self) -> object | None:
+        if self._interactive_waiters and (
+            not self._standard_waiters
+            or self._consecutive_interactive < self.interactive_burst_limit
+        ):
+            return self._interactive_waiters[0]
+        if self._standard_waiters:
+            return self._standard_waiters[0]
+        if self._interactive_waiters:
+            return self._interactive_waiters[0]
+        return None
+
+    def acquire(
+        self, *, timeout: float, request_class: str = "standard"
+    ) -> bool:
         deadline = time.monotonic() + max(0.0, float(timeout))
         waiter = object()
+        interactive = str(request_class).casefold() == "interactive"
+        queue_for_class = (
+            self._interactive_waiters if interactive else self._standard_waiters
+        )
         with self._condition:
-            self._waiters.append(waiter)
-            while self._waiters[0] is not waiter or self._active >= self.capacity:
+            queue_for_class.append(waiter)
+            while (
+                self._next_waiter() is not waiter
+                or self._active >= self.capacity
+            ):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    self._waiters.remove(waiter)
+                    queue_for_class.remove(waiter)
                     self._condition.notify_all()
                     return False
                 self._condition.wait(timeout=remaining)
-            self._waiters.popleft()
+            queue_for_class.popleft()
             self._active += 1
+            if interactive:
+                self._consecutive_interactive += 1
+            else:
+                self._consecutive_interactive = 0
             self._condition.notify_all()
             return True
 
@@ -64,10 +92,17 @@ class _FairAdmission:
     def status(self) -> dict[str, int | str]:
         with self._condition:
             return {
-                "policy": "fifo",
+                "policy": "interactive_priority_bounded_burst",
                 "capacity": self.capacity,
                 "active": self._active,
-                "waiting": len(self._waiters),
+                "waiting": (
+                    len(self._interactive_waiters)
+                    + len(self._standard_waiters)
+                ),
+                "waiting_interactive": len(self._interactive_waiters),
+                "waiting_standard": len(self._standard_waiters),
+                "interactive_burst_limit": self.interactive_burst_limit,
+                "consecutive_interactive": self._consecutive_interactive,
             }
 
 
@@ -348,7 +383,18 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                             )
                     if method == "POST" and path in server.HEAVY_PATHS:
                         heavy_acquired = server.heavy_admission.acquire(
-                            timeout=self._request_deadline_remaining()
+                            timeout=self._request_deadline_remaining(),
+                            request_class=(
+                                "interactive"
+                                if str(
+                                    self.headers.get(
+                                        "X-AMOS-Request-Class"
+                                    )
+                                    or ""
+                                ).casefold()
+                                == "interactive"
+                                else "standard"
+                            ),
                         )
                         if not heavy_acquired:
                             return self._write_saturated(

@@ -1133,6 +1133,7 @@ class ContinuityService:
         thread_limit: int = 8,
         recent_event_floor: int = 4,
         prior_workspace_revision: Mapping[str, Any] | None = None,
+        include_associative_memory: bool = True,
         run_policy: bool = False,
         _policy_already_run: bool = False,
     ) -> dict[str, Any]:
@@ -1171,6 +1172,8 @@ class ContinuityService:
         ]
         if prior_workspace_revision is not None:
             self._mapping(prior_workspace_revision, "prior_workspace_revision")
+        if not isinstance(include_associative_memory, bool):
+            raise ValidationError("include_associative_memory must be a boolean")
         self._mark_foreground_activity(requester)
         if run_policy and not _policy_already_run:
             self.reasoning.run_memory_policy(
@@ -1447,32 +1450,33 @@ class ContinuityService:
                 int(budget["items"]) - fixed_projection_items - 16,
             )
         need = str(current_payload.get("content") or "").strip() or "current interaction"
-        try:
-            associative = self.reasoning.compile_memory_frame(
-                need=need,
-                purpose="support current interaction from canonical memory",
-                depth="working_frame",
-                task_context={
-                    "conversation_id": conversation_id,
-                    "participant_refs": participants,
-                    "operation_refs": operation_refs,
-                    "project_refs": project_refs,
-                    "context_refs": context_refs,
-                    "protected_atom_refs": [
-                        current_event_ref,
-                        *[item["state_ref"] for item in thread_projection],
-                        *[item["atom_ref"] for item in canonical_context],
-                    ],
-                },
-                scope=request_scope,
-                requester=requester,
-                target_processor=target_processor,
-                memory_mode="operational_recall",
-                token_or_byte_budget=associative_request_budget,
-                run_policy=False,
-            )
-        except ValidationError as exc:
-            associative_error = str(exc)
+        if include_associative_memory:
+            try:
+                associative = self.reasoning.compile_memory_frame(
+                    need=need,
+                    purpose="support current interaction from canonical memory",
+                    depth="working_frame",
+                    task_context={
+                        "conversation_id": conversation_id,
+                        "participant_refs": participants,
+                        "operation_refs": operation_refs,
+                        "project_refs": project_refs,
+                        "context_refs": context_refs,
+                        "protected_atom_refs": [
+                            current_event_ref,
+                            *[item["state_ref"] for item in thread_projection],
+                            *[item["atom_ref"] for item in canonical_context],
+                        ],
+                    },
+                    scope=request_scope,
+                    requester=requester,
+                    target_processor=target_processor,
+                    memory_mode="operational_recall",
+                    token_or_byte_budget=associative_request_budget,
+                    run_policy=False,
+                )
+            except ValidationError as exc:
+                associative_error = str(exc)
 
         request_binding = {
             "current_event_ref": current_event_ref,
@@ -1484,6 +1488,14 @@ class ContinuityService:
             "operation_refs": operation_refs,
             "project_refs": project_refs,
             "context_refs": context_refs,
+            # Preserve canonical refs for the established full-workspace
+            # request. The opt-out is material and participates in the binding;
+            # the default must not perturb existing workspace identities.
+            **(
+                {"include_associative_memory": False}
+                if not include_associative_memory
+                else {}
+            ),
             "revision": revision,
         }
         page_aliases = [
@@ -1516,6 +1528,11 @@ class ContinuityService:
                 "conversation_id": conversation_id,
                 "requester": requester,
                 "target_processor": target_processor,
+                **(
+                    {"include_associative_memory": False}
+                    if not include_associative_memory
+                    else {}
+                ),
             },
             "current_event": next(
                 item
@@ -1564,6 +1581,11 @@ class ContinuityService:
                         }
                     ]
                     if associative_error
+                    else []
+                ),
+                *(
+                    [{"reason": "associative_memory_deferred"}]
+                    if not include_associative_memory
                     else []
                 ),
             ],

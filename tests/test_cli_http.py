@@ -36,7 +36,7 @@ from amos import (
     semantic_relation_proposals_from_facets,
 )
 from amos.cli import main as cli_main
-from amos.http_api import AmosHTTPServer
+from amos.http_api import AmosHTTPServer, _FairAdmission
 from amos.smp import cosine
 
 from .helpers import ExampleTrainingFlightProcessor, item_refs
@@ -498,6 +498,58 @@ def test_http_heavy_retrieval_waits_fifo_until_its_request_deadline(tmp_path):
         thread.join(timeout=2)
     assert errors == []
     assert len(outcomes) == 3
+
+
+def test_heavy_admission_prioritizes_interactive_without_reordering_its_class():
+    admission = _FairAdmission(1, interactive_burst_limit=2)
+    assert admission.acquire(timeout=0.1, request_class="standard")
+    order: list[str] = []
+
+    def wait_for_slot(label: str, request_class: str) -> None:
+        assert admission.acquire(
+            timeout=2,
+            request_class=request_class,
+        )
+        order.append(label)
+        admission.release()
+
+    standard = threading.Thread(
+        target=wait_for_slot,
+        args=("standard", "standard"),
+        daemon=True,
+    )
+    interactive = threading.Thread(
+        target=wait_for_slot,
+        args=("interactive", "interactive"),
+        daemon=True,
+    )
+    standard.start()
+    deadline = time.monotonic() + 1
+    while (
+        admission.status()["waiting_standard"] != 1
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+    assert admission.status()["waiting_standard"] == 1
+    interactive.start()
+    deadline = time.monotonic() + 1
+    while (
+        admission.status()["waiting_interactive"] != 1
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+    assert admission.status()["waiting_interactive"] == 1
+
+    admission.release()
+    interactive.join(timeout=2)
+    standard.join(timeout=2)
+
+    assert interactive.is_alive() is False
+    assert standard.is_alive() is False
+    assert order == ["interactive", "standard"]
+    assert admission.status()["policy"] == (
+        "interactive_priority_bounded_burst"
+    )
 
 
 def test_http_shared_view_queues_policy_instead_of_running_it_inline(
