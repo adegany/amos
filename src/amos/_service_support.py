@@ -153,6 +153,7 @@ DEFAULT_MEMORY_POLICY = {
         "max_deletions_per_tick": 256,
         "write_batch_size": 32,
         "max_index_prune_atoms_per_tick": 512,
+        "protect_hot_references": True,
         "remove_archived_from_hot_index": True,
         "remove_superseded_from_hot_index": True,
         "remove_stale_from_hot_index": True,
@@ -164,6 +165,7 @@ DEFAULT_MEMORY_POLICY = {
         "pressure_delete_stale_after_seconds": 604800,
         "pressure_delete_superseded_after_seconds": 86400,
         "pressure_purge_deleted_after_seconds": 0,
+        "pressure_profiles": {},
         "protected_types": [
             "adjudication",
             "commitment",

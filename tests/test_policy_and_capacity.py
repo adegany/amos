@@ -1942,6 +1942,215 @@ def test_storage_cleanup_preserves_external_reference_leases(
         )
 
 
+def test_storage_cleanup_preserves_exact_hot_dependencies_without_prose_inference(
+    amos,
+):
+    old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+    def archived_atom(atom_id):
+        return amos.commit_atom({
+            "id": atom_id,
+            "type": "semantic",
+            "payload": {"summary": atom_id},
+            "created_at": old,
+            "observed_at": old,
+            "updated_at": old,
+            "lifecycle_state": "archived",
+            "health_status": "stale",
+        })["atom"]
+
+    referenced = archived_atom("cleanup_exact_hot_dependency")
+    prose_only = archived_atom("cleanup_prose_only_reference")
+    unreferenced = archived_atom("cleanup_unreferenced_archive")
+    predecessor = amos.commit_atom({
+        "id": "cleanup_superseded_predecessor",
+        "type": "semantic",
+        "payload": {"summary": "superseded predecessor"},
+        "created_at": old,
+        "observed_at": old,
+        "updated_at": old,
+        "lifecycle_state": "superseded",
+    })["atom"]
+    amos.commit_atom({
+        "id": "cleanup_active_dependency_owner",
+        "type": "semantic",
+        "payload": {
+            "summary": (
+                "The text mentions cleanup_prose_only_reference but does not "
+                "bind it as a structured value."
+            ),
+            "nested_contract": {"exact_source": referenced["id"]},
+        },
+    })
+    amos.commit_atom({
+        "id": "cleanup_active_successor",
+        "type": "semantic",
+        "payload": {"summary": "canonical successor"},
+        "supersedes": [predecessor["id"]],
+    })
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": False},
+        storage_cleanup={
+            "enabled": True,
+            "idle_after_seconds": 0,
+            "min_interval_seconds": 0,
+            "delete_archived_after_seconds": 0,
+            "delete_superseded_after_seconds": 0,
+            "delete_stale_after_seconds": 0,
+            "protect_hot_references": True,
+            "journal_compaction": {"enabled": False},
+            "sqlite_compaction": {
+                "checkpoint_wal": False,
+                "incremental_vacuum": False,
+                "vacuum_enabled": False,
+            },
+        },
+    )
+
+    result = amos.run_memory_policy(
+        force=True, trigger="hot_reference_cleanup_test"
+    )
+    cleanup = result["results"]["storage_cleanup"]
+
+    assert amos.store.get_atom(referenced["id"]) is not None
+    assert amos.store.get_atom(prose_only["id"]) is None
+    assert amos.store.get_atom(unreferenced["id"]) is None
+    assert amos.store.get_atom(predecessor["id"]) is None
+    assert cleanup["reference_protection"]["protected_candidate_count"] == 1
+    assert cleanup["reference_protection"]["by_reason"]["hot_payload"] == 1
+
+
+def test_storage_cleanup_uses_mode_specific_pressure_retention(amos):
+    two_hours_old = (
+        datetime.now(timezone.utc) - timedelta(hours=2)
+    ).isoformat().replace("+00:00", "Z")
+    target = amos.commit_atom({
+        "id": "cleanup_red_pressure_archive",
+        "type": "semantic",
+        "payload": {"summary": "eligible only under red profile"},
+        "created_at": two_hours_old,
+        "observed_at": two_hours_old,
+        "updated_at": two_hours_old,
+        "lifecycle_state": "archived",
+        "health_status": "stale",
+    })["atom"]
+    amos.configure_capacity_budget(hard_capacity_bytes=1)
+    configured = amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": False},
+        storage_cleanup={
+            "enabled": True,
+            "run_on_pressure": True,
+            "pressure_min_interval_seconds": 0,
+            "pressure_delete_archived_after_seconds": 86400,
+            "pressure_profiles": {
+                "orange": {"delete_archived_after_seconds": 21600},
+                "red": {
+                    "delete_archived_after_seconds": 3600,
+                    "max_deletions_per_tick": 1,
+                },
+            },
+            "journal_compaction": {"enabled": False},
+            "sqlite_compaction": {
+                "checkpoint_wal": False,
+                "incremental_vacuum": False,
+                "vacuum_enabled": False,
+            },
+        },
+    )
+
+    assert configured["policy"]["storage_cleanup"]["pressure_profiles"][
+        "orange"
+    ]["delete_superseded_after_seconds"] == 86400
+    result = amos.run_memory_policy(trigger="red_pressure_retention_test")
+    cleanup = result["results"]["storage_cleanup"]
+
+    assert cleanup["retention_profile"]["pressure_mode"] == "red"
+    assert cleanup["retention_profile"]["delete_archived_after_seconds"] == 3600
+    assert cleanup["retention_profile"]["max_deletions_per_tick"] == 1
+    assert amos.store.get_atom(target["id"]) is None
+
+
+def test_pressure_cleanup_precedes_maintenance_and_rechecks_wal_after_indexes(
+    amos, monkeypatch
+):
+    calls = []
+    amos.configure_capacity_budget(hard_capacity_bytes=1)
+    amos.configure_memory_policy(
+        maintenance={
+            "enabled": True,
+            "repair_reference_contracts": False,
+            "run_smp": False,
+            "run_steward": False,
+            "rebuild_indexes": True,
+            "invalidate_packet_cache": False,
+        },
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": False},
+        storage_cleanup={
+            "enabled": True,
+            "run_on_pressure": True,
+            "pressure_min_interval_seconds": 0,
+            "max_deletions_per_tick": 0,
+            "max_idempotency_compactions_per_tick": 0,
+            "journal_compaction": {"enabled": False},
+            "sqlite_compaction": {
+                "checkpoint_wal": True,
+                "pressure_checkpoint_mode": "TRUNCATE",
+                "incremental_vacuum": False,
+                "vacuum_enabled": False,
+            },
+        },
+    )
+    original_cleanup = amos.policy._run_storage_cleanup
+
+    def tracked_cleanup(**kwargs):
+        calls.append("cleanup")
+        return original_cleanup(**kwargs)
+
+    def tracked_index(*, graph_version, publish_revision_offset):
+        calls.append("index")
+        return {
+            "status": "completed",
+            "graph_version": graph_version + publish_revision_offset,
+            "indexes": [],
+        }
+
+    def tracked_checkpoint(*, mode="PASSIVE"):
+        calls.append(f"checkpoint:{mode}")
+        return {
+            "status": "completed",
+            "mode": mode,
+            "busy": 0,
+            "log_pages": 0,
+            "checkpointed_pages": 0,
+        }
+
+    monkeypatch.setattr(amos.policy, "_run_storage_cleanup", tracked_cleanup)
+    monkeypatch.setattr(amos.policy, "_rebuild_derived_indexes", tracked_index)
+    monkeypatch.setattr(amos.store, "checkpoint_wal", tracked_checkpoint)
+
+    result = amos.run_memory_policy(trigger="pressure_ordering_test")
+
+    assert calls == [
+        "cleanup",
+        "checkpoint:TRUNCATE",
+        "index",
+        "checkpoint:TRUNCATE",
+    ]
+    assert result["results"]["post_maintenance_checkpoint"]["status"] == (
+        "completed"
+    )
+
+
 def test_storage_cleanup_physically_retires_atom_and_edge_payload_rows(amos):
     old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat().replace(
         "+00:00", "Z"

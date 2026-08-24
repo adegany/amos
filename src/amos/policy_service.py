@@ -68,6 +68,36 @@ class PolicyService:
         self.run_steward = stewardship.run_steward
         self.run_maintenance_distiller = stewardship.run_maintenance_distiller
 
+    @staticmethod
+    def _merge_storage_cleanup_config(
+        base: Mapping[str, Any], update: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        cleanup = dict(base)
+        for key, value in dict(update).items():
+            if (
+                key in {"sqlite_compaction", "journal_compaction"}
+                and isinstance(value, Mapping)
+                and isinstance(cleanup.get(key), Mapping)
+            ):
+                cleanup[key] = {**dict(cleanup[key]), **dict(value)}
+            elif key == "pressure_profiles" and isinstance(value, Mapping):
+                profiles = {
+                    str(mode): dict(profile)
+                    for mode, profile in dict(cleanup.get(key) or {}).items()
+                    if isinstance(profile, Mapping)
+                }
+                for mode, profile in dict(value).items():
+                    if not isinstance(profile, Mapping):
+                        continue
+                    profiles[str(mode)] = {
+                        **dict(profiles.get(str(mode), {})),
+                        **dict(profile),
+                    }
+                cleanup[key] = profiles
+            else:
+                cleanup[key] = value
+        return cleanup
+
     def configure_memory_policy(
         self,
         *,
@@ -103,20 +133,9 @@ class PolicyService:
                 decay_update.setdefault("max_proposed_atoms", decay_update["max_atoms"])
             policy["decay"] = {**policy["decay"], **decay_update}
         if storage_cleanup is not None:
-            cleanup = dict(policy["storage_cleanup"])
-            for key, value in dict(storage_cleanup).items():
-                if (
-                    key in {"sqlite_compaction", "journal_compaction"}
-                    and isinstance(value, Mapping)
-                    and isinstance(cleanup.get(key), Mapping)
-                ):
-                    cleanup[key] = {
-                        **dict(cleanup[key]),
-                        **dict(value),
-                    }
-                else:
-                    cleanup[key] = value
-            policy["storage_cleanup"] = cleanup
+            policy["storage_cleanup"] = self._merge_storage_cleanup_config(
+                policy["storage_cleanup"], storage_cleanup
+            )
         policy = self._normalize_memory_policy(policy)
         self.store.set_meta("memory_policy", canonical_json(policy))
         return {
@@ -217,6 +236,27 @@ class PolicyService:
             scope = dict(scope or {})
             results: dict[str, Any] = {}
             target_refs: list[str] = []
+            storage_cleanup = policy["storage_cleanup"]
+            cleanup_due = dict(due.get("storage_cleanup") or {})
+            if (
+                storage_cleanup["enabled"]
+                and cleanup_due.get("due")
+                and cleanup_due.get("pressure_triggered")
+            ):
+                # Capacity recovery must not wait behind semantic maintenance
+                # and index rebuilding. Bounded batches still yield to queued
+                # foreground writers between transactions.
+                results["storage_cleanup"] = self._run_storage_cleanup(
+                    cleanup=storage_cleanup,
+                    due=cleanup_due,
+                    scope=scope,
+                    actor=actor,
+                    state=state,
+                    force=force,
+                )
+                target_refs.extend(
+                    results["storage_cleanup"].get("deleted_atom_refs", [])
+                )
             maintenance = policy["maintenance"]
             if maintenance["enabled"] and maintenance["repair_reference_contracts"]:
                 results["reference_contracts"] = (
@@ -307,11 +347,14 @@ class PolicyService:
                     if action.get("atom_ref")
                 )
 
-            storage_cleanup = policy["storage_cleanup"]
-            if storage_cleanup["enabled"] and due.get("storage_cleanup", {}).get("due"):
+            if (
+                storage_cleanup["enabled"]
+                and cleanup_due.get("due")
+                and "storage_cleanup" not in results
+            ):
                 results["storage_cleanup"] = self._run_storage_cleanup(
                     cleanup=storage_cleanup,
-                    due=due["storage_cleanup"],
+                    due=cleanup_due,
                     scope=scope,
                     actor=actor,
                     state=state,
@@ -329,6 +372,39 @@ class PolicyService:
                 results["packet_cache"] = self._invalidate_packet_cache(
                     graph_version=policy_event_graph_version
                 )
+
+            sqlite_compaction = dict(
+                storage_cleanup.get("sqlite_compaction") or {}
+            )
+            if (
+                "storage_cleanup" in results
+                and ("index" in results or "packet_cache" in results)
+                and sqlite_compaction.get("checkpoint_wal", True)
+            ):
+                checkpoint_mode = str(
+                    sqlite_compaction.get(
+                        "pressure_checkpoint_mode"
+                        if due.get("storage_cleanup", {}).get(
+                            "pressure_triggered"
+                        )
+                        else "checkpoint_mode",
+                        "TRUNCATE"
+                        if due.get("storage_cleanup", {}).get(
+                            "pressure_triggered"
+                        )
+                        else "PASSIVE",
+                    )
+                )
+                try:
+                    results["post_maintenance_checkpoint"] = (
+                        self.store.checkpoint_wal(mode=checkpoint_mode)
+                    )
+                except Exception as exc:
+                    results["post_maintenance_checkpoint"] = {
+                        "status": "error",
+                        "mode": checkpoint_mode,
+                        "error": str(exc),
+                    }
 
             completed_at = utc_now()
             with self.store.transaction() as conn:
@@ -445,21 +521,9 @@ class PolicyService:
                 "storage_cleanup",
             } and isinstance(value, Mapping):
                 if key == "storage_cleanup":
-                    cleanup = dict(normalized[key])
-                    for cleanup_key, cleanup_value in dict(value).items():
-                        if (
-                            cleanup_key
-                            in {"sqlite_compaction", "journal_compaction"}
-                            and isinstance(cleanup_value, Mapping)
-                            and isinstance(cleanup.get(cleanup_key), Mapping)
-                        ):
-                            cleanup[cleanup_key] = {
-                                **dict(cleanup[cleanup_key]),
-                                **dict(cleanup_value),
-                            }
-                        else:
-                            cleanup[cleanup_key] = cleanup_value
-                    normalized[key] = cleanup
+                    normalized[key] = self._merge_storage_cleanup_config(
+                        normalized[key], value
+                    )
                 else:
                     normalized[key].update(dict(value))
             else:
@@ -659,6 +723,9 @@ class PolicyService:
         ):
             cleanup[key] = max(0, int(cleanup.get(key, default) or 0))
         cleanup["write_batch_size"] = max(1, cleanup["write_batch_size"])
+        cleanup["protect_hot_references"] = bool(
+            cleanup.get("protect_hot_references", True)
+        )
         for key, default in (
             ("delete_archived_after_seconds", 604800),
             ("delete_stale_after_seconds", 1209600),
@@ -673,6 +740,49 @@ class PolicyService:
         ):
             value = cleanup.get(key, default)
             cleanup[key] = None if value in (None, "") else max(0, int(value))
+        raw_pressure_profiles = dict(cleanup.get("pressure_profiles") or {})
+        pressure_profiles: dict[str, dict[str, int | None]] = {}
+        pressure_fallbacks = {
+            "delete_archived_after_seconds": cleanup[
+                "pressure_delete_archived_after_seconds"
+            ],
+            "delete_stale_after_seconds": cleanup[
+                "pressure_delete_stale_after_seconds"
+            ],
+            "delete_superseded_after_seconds": cleanup[
+                "pressure_delete_superseded_after_seconds"
+            ],
+            "purge_deleted_after_seconds": cleanup[
+                "pressure_purge_deleted_after_seconds"
+            ],
+        }
+        for mode in ("orange", "red"):
+            configured_profile = raw_pressure_profiles.get(mode)
+            profile = (
+                dict(configured_profile)
+                if isinstance(configured_profile, Mapping)
+                else {}
+            )
+            normalized_profile: dict[str, int | None] = {}
+            for key, fallback in pressure_fallbacks.items():
+                profile_value = profile.get(key, fallback)
+                normalized_profile[key] = (
+                    None
+                    if profile_value in (None, "")
+                    else max(0, int(profile_value))
+                )
+            normalized_profile["max_deletions_per_tick"] = max(
+                0,
+                int(
+                    profile.get(
+                        "max_deletions_per_tick",
+                        cleanup["max_deletions_per_tick"],
+                    )
+                    or 0
+                ),
+            )
+            pressure_profiles[mode] = normalized_profile
+        cleanup["pressure_profiles"] = pressure_profiles
         cleanup["remove_archived_from_hot_index"] = bool(
             cleanup.get("remove_archived_from_hot_index", True)
         )
@@ -979,6 +1089,10 @@ class PolicyService:
         vacuum = dict(result.get("vacuum") or {})
         return {
             "status": result.get("status"),
+            "retention_profile": dict(result.get("retention_profile") or {}),
+            "reference_protection": dict(
+                result.get("reference_protection") or {}
+            ),
             "deleted_atom_count": int(result.get("deleted_atom_count", 0) or 0),
             "physically_purged_atom_count": int(
                 result.get("physically_purged_atom_count", 0) or 0
@@ -1000,6 +1114,9 @@ class PolicyService:
             ),
             "checkpoint_status": checkpoint.get("status"),
             "checkpoint_mode": checkpoint.get("mode"),
+            "checkpoint_busy": checkpoint.get("busy"),
+            "checkpoint_log_pages": checkpoint.get("log_pages"),
+            "checkpointed_pages": checkpoint.get("checkpointed_pages"),
             "vacuum_status": vacuum.get("status"),
             "vacuum_reason": vacuum.get("reason"),
             "event_id": event_ref,
@@ -1678,6 +1795,48 @@ class PolicyService:
             "last_storage_cleanup_at": last_cleanup,
         }
 
+    @staticmethod
+    def _storage_pressure_profile(
+        cleanup: Mapping[str, Any],
+        *,
+        pressure_mode: str,
+        pressure_triggered: bool,
+    ) -> dict[str, Any]:
+        if not pressure_triggered:
+            return {}
+        profiles = cleanup.get("pressure_profiles")
+        if not isinstance(profiles, Mapping):
+            return {}
+        profile = profiles.get(str(pressure_mode))
+        return dict(profile) if isinstance(profile, Mapping) else {}
+
+    def _storage_retention_protection(
+        self,
+        conn: Any,
+        cleanup: Mapping[str, Any],
+        candidate_refs: Sequence[str],
+    ) -> dict[str, Any]:
+        protection = self.store.retention_protected_atom_refs_from_connection(
+            conn, candidate_refs
+        )
+        by_reason = {
+            str(reason): set(refs)
+            for reason, refs in dict(protection.get("by_reason") or {}).items()
+        }
+        included_reasons = {"current_head", "reference_lease"}
+        if cleanup.get("protect_hot_references", True):
+            included_reasons.update({"hot_payload", "hot_edge"})
+        protected_refs = set().union(
+            *(by_reason.get(reason, set()) for reason in included_reasons)
+        )
+        return {
+            "refs": protected_refs,
+            "by_reason": by_reason,
+            "hot_reference_protection_enabled": bool(
+                cleanup.get("protect_hot_references", True)
+            ),
+        }
+
 
     def _run_storage_cleanup(
         self,
@@ -1691,8 +1850,23 @@ class PolicyService:
     ) -> dict[str, Any]:
         now = utc_now()
         pressure_triggered = bool(due.get("pressure_triggered"))
+        pressure_mode = str(due.get("pressure_mode") or "green")
+        pressure_profile = self._storage_pressure_profile(
+            cleanup,
+            pressure_mode=pressure_mode,
+            pressure_triggered=pressure_triggered,
+        )
         protected_types = {str(item) for item in cleanup.get("protected_types", [])}
-        max_deletions = max(0, int(cleanup.get("max_deletions_per_tick", 256) or 0))
+        max_deletions = max(
+            0,
+            int(
+                pressure_profile.get(
+                    "max_deletions_per_tick",
+                    cleanup.get("max_deletions_per_tick", 256),
+                )
+                or 0
+            ),
+        )
         write_batch_size = max(1, int(cleanup.get("write_batch_size", 32) or 32))
         projected_atoms: list[dict[str, Any]] = []
         projected_edges: list[dict[str, Any]] = []
@@ -1717,16 +1891,15 @@ class PolicyService:
         # Plan from a coherent read, then revalidate each candidate immediately
         # before mutation. The plan never holds SQLite's single-writer slot.
         candidates: list[dict[str, Any]] = []
+        protected_candidate_refs: set[str] = set()
+        protected_refs_by_reason: dict[str, set[str]] = {
+            "current_head": set(),
+            "reference_lease": set(),
+            "hot_payload": set(),
+            "hot_edge": set(),
+        }
         if max_deletions:
             with self.store.read_snapshot():
-                current_head_refs = {
-                    str(head.get("head_ref") or "")
-                    for head in self.store.list_memory_heads()
-                    if str(head.get("head_ref") or "")
-                }
-                leased_refs = self.store.reference_lease_refs_from_connection(
-                    self.store.conn
-                )
                 atoms = sorted(
                     self.store.list_atoms_filtered(include_deleted=True),
                     key=lambda atom: (
@@ -1739,23 +1912,32 @@ class PolicyService:
                         str(atom.get("id") or ""),
                     ),
                 )
+                eligible_candidates: list[dict[str, Any]] = []
                 for atom in atoms:
-                    if len(candidates) >= max_deletions:
-                        break
                     if not maintenance_scope_visible(atom["scope"], scope):
-                        continue
-                    if str(atom["id"]) in current_head_refs:
-                        continue
-                    if str(atom["id"]) in leased_refs:
                         continue
                     if atom["type"] in protected_types and not atom.get("deleted"):
                         continue
                     if self._storage_deletion_reason(
                         atom,
                         cleanup,
+                        pressure_mode=pressure_mode,
                         pressure_triggered=pressure_triggered,
                     ) is not None:
-                        candidates.append(atom)
+                        eligible_candidates.append(atom)
+                protection = self._storage_retention_protection(
+                    self.store.conn,
+                    cleanup,
+                    [str(atom["id"]) for atom in eligible_candidates],
+                )
+                protected_candidate_refs.update(protection["refs"])
+                for reason, refs in protection["by_reason"].items():
+                    protected_refs_by_reason.setdefault(reason, set()).update(refs)
+                candidates = [
+                    atom
+                    for atom in eligible_candidates
+                    if str(atom["id"]) not in protected_candidate_refs
+                ][:max_deletions]
 
         # Derived-index pruning is bounded by atom and yields between batches.
         # Keep it separate from canonical deletion batches so clients can enter
@@ -1853,11 +2035,14 @@ class PolicyService:
             batch_tombstones: list[dict[str, Any]] = []
             batch_refs: list[str] = []
             with self.store.transaction() as conn:
-                current_head_refs_for_batch = {
-                    str(head.get("head_ref") or "")
-                    for head in self.store.list_memory_heads_from_connection(conn)
-                    if str(head.get("head_ref") or "")
-                }
+                batch_protection = self._storage_retention_protection(
+                    conn,
+                    cleanup,
+                    [str(atom["id"]) for atom in batch],
+                )
+                protected_candidate_refs.update(batch_protection["refs"])
+                for reason, refs in batch_protection["by_reason"].items():
+                    protected_refs_by_reason.setdefault(reason, set()).update(refs)
                 for planned_atom in batch:
                     atom = self.store.get_atom(str(planned_atom["id"]))
                     if (
@@ -1865,10 +2050,7 @@ class PolicyService:
                         or int(atom.get("version", 0))
                         != int(planned_atom.get("version", 0))
                         or str(atom.get("id") or "")
-                        in current_head_refs_for_batch
-                        or self.store.is_reference_leased(
-                            conn, str(planned_atom["id"])
-                        )
+                        in batch_protection["refs"]
                         or not maintenance_scope_visible(atom["scope"], scope)
                         or (
                             atom["type"] in protected_types
@@ -1879,6 +2061,7 @@ class PolicyService:
                     reason = self._storage_deletion_reason(
                         atom,
                         cleanup,
+                        pressure_mode=pressure_mode,
                         pressure_triggered=pressure_triggered,
                     )
                     if reason is None:
@@ -2140,6 +2323,41 @@ class PolicyService:
         return {
             "status": "completed",
             "due": dict(due),
+            "retention_profile": {
+                "pressure_mode": pressure_mode,
+                "pressure_triggered": pressure_triggered,
+                "delete_archived_after_seconds": (
+                    pressure_profile.get("delete_archived_after_seconds")
+                    if pressure_triggered
+                    else cleanup.get("delete_archived_after_seconds")
+                ),
+                "delete_stale_after_seconds": (
+                    pressure_profile.get("delete_stale_after_seconds")
+                    if pressure_triggered
+                    else cleanup.get("delete_stale_after_seconds")
+                ),
+                "delete_superseded_after_seconds": (
+                    pressure_profile.get("delete_superseded_after_seconds")
+                    if pressure_triggered
+                    else cleanup.get("delete_superseded_after_seconds")
+                ),
+                "purge_deleted_after_seconds": (
+                    pressure_profile.get("purge_deleted_after_seconds")
+                    if pressure_triggered
+                    else cleanup.get("purge_deleted_after_seconds")
+                ),
+                "max_deletions_per_tick": max_deletions,
+            },
+            "reference_protection": {
+                "hot_reference_protection_enabled": bool(
+                    cleanup.get("protect_hot_references", True)
+                ),
+                "protected_candidate_count": len(protected_candidate_refs),
+                "by_reason": {
+                    reason: len(refs)
+                    for reason, refs in sorted(protected_refs_by_reason.items())
+                },
+            },
             "index_prune": index_prune,
             "deleted_atom_count": len(actions),
             "physically_purged_atom_count": len(actions),
@@ -2162,8 +2380,14 @@ class PolicyService:
         atom: Mapping[str, Any],
         cleanup: Mapping[str, Any],
         *,
+        pressure_mode: str = "green",
         pressure_triggered: bool = False,
     ) -> str | None:
+        pressure_profile = self._storage_pressure_profile(
+            cleanup,
+            pressure_mode=pressure_mode,
+            pressure_triggered=pressure_triggered,
+        )
         observed_ages = [
             age
             for timestamp in (
@@ -2175,10 +2399,10 @@ class PolicyService:
         ]
         updated_age = min(observed_ages) if observed_ages else None
         if atom.get("deleted"):
-            purge_after = cleanup.get(
-                "pressure_purge_deleted_after_seconds"
+            purge_after = (
+                pressure_profile.get("purge_deleted_after_seconds")
                 if pressure_triggered
-                else "purge_deleted_after_seconds"
+                else cleanup.get("purge_deleted_after_seconds")
             )
             if (
                 purge_after is not None
@@ -2187,10 +2411,10 @@ class PolicyService:
             ):
                 return "storage_cleanup_deleted_projection_retention_elapsed"
             return None
-        archived_after = cleanup.get(
-            "pressure_delete_archived_after_seconds"
+        archived_after = (
+            pressure_profile.get("delete_archived_after_seconds")
             if pressure_triggered
-            else "delete_archived_after_seconds"
+            else cleanup.get("delete_archived_after_seconds")
         )
         if (
             archived_after is not None
@@ -2199,10 +2423,10 @@ class PolicyService:
             and updated_age >= int(archived_after)
         ):
             return "storage_cleanup_archived_retention_elapsed"
-        superseded_after = cleanup.get(
-            "pressure_delete_superseded_after_seconds"
+        superseded_after = (
+            pressure_profile.get("delete_superseded_after_seconds")
             if pressure_triggered
-            else "delete_superseded_after_seconds"
+            else cleanup.get("delete_superseded_after_seconds")
         )
         if (
             superseded_after is not None
@@ -2211,10 +2435,10 @@ class PolicyService:
             and updated_age >= int(superseded_after)
         ):
             return "storage_cleanup_superseded_retention_elapsed"
-        stale_after = cleanup.get(
-            "pressure_delete_stale_after_seconds"
+        stale_after = (
+            pressure_profile.get("delete_stale_after_seconds")
             if pressure_triggered
-            else "delete_stale_after_seconds"
+            else cleanup.get("delete_stale_after_seconds")
         )
         if (
             stale_after is not None

@@ -630,6 +630,7 @@ storage_cleanup:
   idle_after_seconds: 300
   min_interval_seconds: 900
   max_deletions_per_tick: 256
+  protect_hot_references: true
   remove_archived_from_hot_index: true
   remove_superseded_from_hot_index: true
   remove_stale_from_hot_index: true
@@ -641,6 +642,19 @@ storage_cleanup:
   pressure_delete_stale_after_seconds: 604800
   pressure_delete_superseded_after_seconds: 86400
   pressure_purge_deleted_after_seconds: 0
+  pressure_profiles:
+    orange:
+      delete_archived_after_seconds: 86400
+      delete_stale_after_seconds: 604800
+      delete_superseded_after_seconds: 86400
+      purge_deleted_after_seconds: 0
+      max_deletions_per_tick: 256
+    red:
+      delete_archived_after_seconds: 86400
+      delete_stale_after_seconds: 604800
+      delete_superseded_after_seconds: 86400
+      purge_deleted_after_seconds: 0
+      max_deletions_per_tick: 256
   protected_types:
     - adjudication
     - policy
@@ -671,6 +685,17 @@ storage_cleanup:
     vacuum_idle_after_seconds: 1800
     vacuum_min_interval_seconds: 86400
 ```
+
+Pressure profiles are optional application-owned overrides. Missing values
+inherit the legacy `pressure_*` retention fields and the global deletion cap.
+Before physical purge, cleanup always preserves current memory heads and
+externally leased references. With `protect_hot_references` enabled it also
+preserves candidate atoms named as exact structured values by active/proposed
+payloads or connected to those atoms by live non-supersession graph edges.
+This is exact-ID structural protection; AMOS does not infer references from
+prose or keyword patterns. Supersession edges are excluded because a committed
+canonical successor and its journal receipt are the deletion authority for the
+older projection.
 
 The v1 HTTP service starts a background memory-policy worker. Foreground
 service calls do not need to complete maintenance before responding:

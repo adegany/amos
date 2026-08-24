@@ -1167,6 +1167,110 @@ class SQLiteStore:
             (str(target_ref),),
         ).fetchone() is not None
 
+    def retention_protected_atom_refs_from_connection(
+        self,
+        conn: sqlite3.Connection,
+        candidate_refs: Sequence[str],
+    ) -> dict[str, Any]:
+        """Resolve exact hot-state dependencies that cleanup must preserve.
+
+        Retention protection is structural rather than name- or pattern-based:
+        a payload value protects an atom only when the complete JSON string is
+        an exact candidate atom ID. Live graph relations provide the second
+        typed dependency source. Lifecycle supersession is intentionally not
+        a retention dependency because the canonical successor and durable
+        journal receipt are what make the predecessor safe to compact.
+        """
+
+        candidates = {
+            str(ref).strip() for ref in candidate_refs if str(ref).strip()
+        }
+        by_reason: dict[str, set[str]] = {
+            "current_head": set(),
+            "reference_lease": set(),
+            "hot_payload": set(),
+            "hot_edge": set(),
+        }
+        if not candidates:
+            return {"refs": set(), "by_reason": by_reason}
+
+        head_refs = {
+            str(row["head_ref"])
+            for row in conn.execute(
+                "SELECT DISTINCT head_ref FROM amos_memory_heads"
+            ).fetchall()
+            if str(row["head_ref"] or "")
+        }
+        by_reason["current_head"].update(candidates.intersection(head_refs))
+        leased_refs = self.reference_lease_refs_from_connection(conn)
+        by_reason["reference_lease"].update(
+            candidates.intersection(leased_refs)
+        )
+
+        owner_rows = conn.execute(
+            """SELECT atom.id,atom.payload,atom.evidence_refs
+               FROM amos_atoms AS atom
+               WHERE atom.deleted = 0
+                 AND (
+                   atom.lifecycle_state IN ('active','proposed')
+                   OR EXISTS (
+                     SELECT 1 FROM amos_memory_heads AS head
+                     WHERE head.head_ref = atom.id
+                   )
+                 )"""
+        ).fetchall()
+        owner_refs = {str(row["id"]) for row in owner_rows}
+
+        def collect_exact_refs(owner_ref: str, value: Any) -> None:
+            stack = [value]
+            while stack:
+                item = stack.pop()
+                if isinstance(item, str):
+                    if item != owner_ref and item in candidates:
+                        by_reason["hot_payload"].add(item)
+                elif isinstance(item, Mapping):
+                    stack.extend(item.values())
+                elif isinstance(item, Sequence) and not isinstance(
+                    item, (str, bytes, bytearray)
+                ):
+                    stack.extend(item)
+
+        for row in owner_rows:
+            owner_ref = str(row["id"])
+            collect_exact_refs(owner_ref, self._json(row["payload"]))
+            collect_exact_refs(owner_ref, self._json(row["evidence_refs"]))
+
+        # Keep SQL parameter counts bounded even when an embedding configures a
+        # large cleanup limit.
+        ordered_candidates = sorted(candidates)
+        for offset in range(0, len(ordered_candidates), 400):
+            batch = ordered_candidates[offset : offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            edge_rows = conn.execute(
+                f"""
+                SELECT source_ref,target_ref,relation
+                FROM amos_edges
+                WHERE deleted = 0
+                  AND lifecycle_state = 'active'
+                  AND relation <> 'rel:supersedes'
+                  AND (
+                    source_ref IN ({placeholders})
+                    OR target_ref IN ({placeholders})
+                  )
+                """,
+                (*batch, *batch),
+            ).fetchall()
+            for row in edge_rows:
+                source_ref = str(row["source_ref"])
+                target_ref = str(row["target_ref"])
+                if source_ref in candidates and target_ref in owner_refs:
+                    by_reason["hot_edge"].add(source_ref)
+                if target_ref in candidates and source_ref in owner_refs:
+                    by_reason["hot_edge"].add(target_ref)
+
+        protected_refs = set().union(*by_reason.values())
+        return {"refs": protected_refs, "by_reason": by_reason}
+
     def append_event(
         self,
         conn: sqlite3.Connection,
@@ -2940,14 +3044,28 @@ class SQLiteStore:
                         f"PRAGMA wal_checkpoint({safe_mode})"
                     ).fetchone()
         values = list(row) if row is not None else []
-        return {
-            "status": "completed",
-            "mode": safe_mode,
-            "busy": int(values[0]) if len(values) > 0 and values[0] is not None else None,
-            "log_pages": int(values[1]) if len(values) > 1 and values[1] is not None else None,
-            "checkpointed_pages": int(values[2])
+        busy = int(values[0]) if len(values) > 0 and values[0] is not None else None
+        log_pages = int(values[1]) if len(values) > 1 and values[1] is not None else None
+        checkpointed_pages = (
+            int(values[2])
             if len(values) > 2 and values[2] is not None
-            else None,
+            else None
+        )
+        fully_checkpointed = (
+            busy in {None, 0}
+            and (
+                log_pages is None
+                or checkpointed_pages is None
+                or checkpointed_pages >= log_pages
+            )
+        )
+        return {
+            "status": "completed" if fully_checkpointed else "deferred",
+            "mode": safe_mode,
+            "busy": busy,
+            "log_pages": log_pages,
+            "checkpointed_pages": checkpointed_pages,
+            "reason": None if fully_checkpointed else "wal_readers_active",
         }
 
     def storage_usage(self) -> dict[str, int]:
