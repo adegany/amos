@@ -489,6 +489,13 @@ Both retrieval paths queue a policy tick and return immediately. Explicit
 `POST /v1/memory-policy:run` and the CLI
 `memory-policy --run` command remain synchronous operator paths.
 
+`POST /v1/canonical-records:batch-get` is the bounded, revision-pinned exact
+read path for applications that must verify many known records and canonical
+heads without request-per-record fan-out. Foreground recovery can temporarily
+defer new background maintenance starts with the expiring
+`/v1/maintenance-leases:acquire`, `:renew`, and `:release` contract; queued work
+resumes after release or lease expiry.
+
 ### Compile revision-bound reasoning frames
 
 Historical reasoning integrations can call `POST

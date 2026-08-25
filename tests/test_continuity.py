@@ -244,6 +244,84 @@ def test_authority_record_heads_preserve_superseded_checksum_revisions(amos):
     assert amos.store.get_atom("authority_state_2")["payload"]["checksum"] == "sha256:new"
 
 
+def test_canonical_record_batch_returns_coherent_head_atoms(amos):
+    series_id = "plugin:batch-example"
+    amos.commit_memory_transaction(
+        scope=SCOPE,
+        actor="authority-test",
+        idempotency_key="authority-batch-head-1",
+        atoms=[authority_record(
+            "authority_batch_state_1",
+            series_id=series_id,
+            revision=1,
+            checksum="sha256:batch",
+        )],
+        head_updates=[authority_head(
+            "authority_batch_state_1",
+            series_id=series_id,
+            expected_head_ref=None,
+            expected_head_version=0,
+        )],
+    )
+    amos.commit_memory_transaction(
+        scope=SCOPE,
+        actor="authority-test",
+        idempotency_key="authority-batch-private-1",
+        atoms=[{
+            "id": "authority_batch_private",
+            "type": "belief",
+            "payload": {"claim": "private canonical record"},
+            "access_policy": PRIMARY_VISIBILITY,
+        }],
+    )
+
+    batch = amos.get_canonical_records(
+        atom_ids=["authority_batch_state_1", "missing_batch_atom"],
+        heads=[
+            {"series_kind": "authority_record", "series_id": series_id},
+            {
+                "series_kind": "authority_record",
+                "series_id": "plugin:missing-batch-example",
+            },
+        ],
+        scope=SCOPE,
+        requester="agent:participant",
+        target_processor="primary-reasoner",
+        include_archived=True,
+        include_low_health=True,
+        include_superseded=True,
+    )
+
+    assert batch["status"] == "completed"
+    assert batch["profile"] == "amos.canonical-record-batch.v1"
+    assert batch["items_by_id"]["authority_batch_state_1"]["payload"][
+        "checksum"
+    ] == "sha256:batch"
+    assert batch["atoms"][1] == {
+        "status": "not_found",
+        "atom_id": "missing_batch_atom",
+        "reason": "not_found",
+    }
+    assert batch["heads"][0]["head_ref"] == "authority_batch_state_1"
+    assert batch["items_by_id"][batch["heads"][0]["head_ref"]]["id"] == (
+        "authority_batch_state_1"
+    )
+    assert batch["heads"][1]["status"] == "absent"
+
+    hidden = amos.get_canonical_records(
+        atom_ids=["authority_batch_private"],
+        heads=[],
+        scope=SCOPE,
+        requester="human:participant",
+        target_processor="participant-ui",
+        include_archived=True,
+        include_low_health=True,
+        include_superseded=True,
+    )
+    assert hidden["items_by_id"] == {}
+    assert hidden["atoms"][0]["reason"] == "access_hidden"
+
+
 def test_generic_goal_work_heads_are_typed_versioned_and_superseding(amos):
     first = amos.commit_memory_transaction(
         scope=SCOPE,

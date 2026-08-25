@@ -26,7 +26,7 @@ from .governance_service import GovernanceService
 from .request_context import remaining_seconds, request_context
 from .schemas import CONSTITUTIONAL_ATOM_TYPES
 from .service import Amos
-from .workers import BackgroundMemoryPolicyWorker
+from .workers import BackgroundMemoryPolicyWorker, ExpiringMaintenanceLeaseGate
 
 
 class _FairAdmission:
@@ -320,9 +320,11 @@ class AmosHTTPServer(ThreadingHTTPServer):
             maintenance_processor_paths=self.maintenance_processor_paths,
         )
         self.maintenance_lock = threading.Lock()
+        self.maintenance_leases = ExpiringMaintenanceLeaseGate()
         self.memory_policy_worker = BackgroundMemoryPolicyWorker(
             self.policy_worker_amos,
             execution_lock=self.maintenance_lock,
+            maintenance_admission=self.maintenance_leases.admission,
         )
         self.memory_policy_worker.start()
         self.service_lock = threading.RLock()
@@ -528,6 +530,34 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                             status=HTTPStatus.SERVICE_UNAVAILABLE,
                         )
                         return
+                    maintenance_admission = (
+                        server.maintenance_leases.admission()
+                    )
+                    if not maintenance_admission["allowed"]:
+                        self._write_json(
+                            {
+                                "status": "deferred",
+                                "error": (
+                                    "AMOS maintenance is paused for foreground "
+                                    "recovery"
+                                ),
+                                "code": "maintenance_lease_active",
+                                "retryable": True,
+                                "retry_after_ms": int(
+                                    float(
+                                        maintenance_admission.get(
+                                            "retry_after_seconds", 1.0
+                                        )
+                                    )
+                                    * 1000
+                                ),
+                                "maintenance_admission": (
+                                    maintenance_admission
+                                ),
+                            },
+                            status=HTTPStatus.SERVICE_UNAVAILABLE,
+                        )
+                        return
                     # A semantic processor may make bounded model calls. Keep
                     # that work out of the request-service pool and serialize
                     # it with the service-owned policy worker so duplicate
@@ -547,6 +577,33 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         )
                         return
                     try:
+                        maintenance_admission = (
+                            server.maintenance_leases.admission()
+                        )
+                        if not maintenance_admission["allowed"]:
+                            return self._write_json(
+                                {
+                                    "status": "deferred",
+                                    "error": (
+                                        "AMOS maintenance is paused for "
+                                        "foreground recovery"
+                                    ),
+                                    "code": "maintenance_lease_active",
+                                    "retryable": True,
+                                    "retry_after_ms": int(
+                                        float(
+                                            maintenance_admission.get(
+                                                "retry_after_seconds", 1.0
+                                            )
+                                        )
+                                        * 1000
+                                    ),
+                                    "maintenance_admission": (
+                                        maintenance_admission
+                                    ),
+                                },
+                                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                            )
                         if path == "/v1/maintenance-distiller:run":
                             return self._write_json(
                                 server.maintenance_amos.run_maintenance_distiller(
@@ -814,7 +871,14 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                     payload["background_policy_worker"] = (
                         server.memory_policy_worker.status()
                     )
+                    payload["maintenance_leases"] = (
+                        server.maintenance_leases.status()
+                    )
                     return self._write_json(payload)
+                if path == "/v1/maintenance-leases":
+                    return self._write_json(
+                        server.maintenance_leases.status()
+                    )
                 if path == "/v1/maintenance-processors":
                     return self._write_json(amos.list_maintenance_processors())
                 if path == "/v1/verify":
@@ -841,6 +905,86 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         "'amos.reference-lease-sync.v1'"
                     )
                 return self._write_json(amos.sync_reference_leases(**request))
+            if path == "/v1/canonical-records:batch-get":
+                request = dict(body)
+                profile = request.pop("profile", None)
+                if profile not in {None, "amos.canonical-record-batch.v1"}:
+                    raise ValidationError(
+                        "canonical record batch profile must be "
+                        "'amos.canonical-record-batch.v1'"
+                    )
+                return self._write_json(amos.get_canonical_records(**request))
+            if path == "/v1/maintenance-leases:acquire":
+                request = dict(body)
+                profile = request.pop("profile", None)
+                if profile not in {None, "amos.maintenance-lease.v1"}:
+                    raise ValidationError(
+                        "maintenance lease profile must be "
+                        "'amos.maintenance-lease.v1'"
+                    )
+                self._authorization_context(
+                    server,
+                    request,
+                    required=bool(server.governance_principals),
+                )
+                owner_ref = str(request.get("owner_ref") or "").strip()
+                reason = str(request.get("reason") or "").strip()
+                if not owner_ref or not reason:
+                    raise ValidationError(
+                        "maintenance lease owner_ref and reason are required"
+                    )
+                return self._write_json(
+                    server.maintenance_leases.acquire(
+                        owner_ref=owner_ref,
+                        reason=reason,
+                        ttl_seconds=request.get("ttl_seconds"),
+                    )
+                )
+            if path == "/v1/maintenance-leases:renew":
+                request = dict(body)
+                profile = request.pop("profile", None)
+                if profile not in {None, "amos.maintenance-lease.v1"}:
+                    raise ValidationError(
+                        "maintenance lease profile must be "
+                        "'amos.maintenance-lease.v1'"
+                    )
+                self._authorization_context(
+                    server,
+                    request,
+                    required=bool(server.governance_principals),
+                )
+                lease_id = str(request.get("lease_id") or "").strip()
+                if not lease_id:
+                    raise ValidationError(
+                        "maintenance lease lease_id is required"
+                    )
+                return self._write_json(
+                    server.maintenance_leases.renew(
+                        lease_id=lease_id,
+                        ttl_seconds=request.get("ttl_seconds"),
+                    )
+                )
+            if path == "/v1/maintenance-leases:release":
+                request = dict(body)
+                profile = request.pop("profile", None)
+                if profile not in {None, "amos.maintenance-lease.v1"}:
+                    raise ValidationError(
+                        "maintenance lease profile must be "
+                        "'amos.maintenance-lease.v1'"
+                    )
+                self._authorization_context(
+                    server,
+                    request,
+                    required=bool(server.governance_principals),
+                )
+                lease_id = str(request.get("lease_id") or "").strip()
+                if not lease_id:
+                    raise ValidationError(
+                        "maintenance lease lease_id is required"
+                    )
+                return self._write_json(
+                    server.maintenance_leases.release(lease_id=lease_id)
+                )
             if path == "/v1/memory-transactions:commit":
                 request = dict(body)
                 profile = request.pop("profile", None)

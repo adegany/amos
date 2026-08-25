@@ -737,6 +737,32 @@ class Amos:
                 target_processor=target_processor,
             )
 
+    def get_canonical_records(
+        self,
+        *,
+        atom_ids: Sequence[str] | None = None,
+        heads: Sequence[Mapping[str, Any]] | None = None,
+        scope: Mapping[str, Any] | None,
+        requester: str = "system",
+        target_processor: str = "reasoner",
+        include_conflicts: bool = False,
+        include_archived: bool = False,
+        include_low_health: bool = False,
+        include_superseded: bool = False,
+    ) -> dict[str, Any]:
+        with self.store.read_snapshot():
+            return self.continuity.get_canonical_records(
+                atom_ids=atom_ids,
+                heads=heads,
+                scope=scope,
+                requester=requester,
+                target_processor=target_processor,
+                include_conflicts=include_conflicts,
+                include_archived=include_archived,
+                include_low_health=include_low_health,
+                include_superseded=include_superseded,
+            )
+
     def get_memory_series_versions(
         self,
         *,

@@ -2,10 +2,189 @@
 
 from __future__ import annotations
 
+import secrets
 import threading
+import time
+from collections.abc import Callable
 from typing import Any, Mapping, Sequence
 
+from .errors import ValidationError
 from .service import Amos
+
+
+class ExpiringMaintenanceLeaseGate:
+    """Bounded, crash-safe admission gate for background maintenance.
+
+    Leases intentionally live in the AMOS process rather than canonical memory:
+    they coordinate transient foreground recovery and disappear on restart. A
+    monotonic expiry makes a dead holder self-releasing without trusting wall
+    clock adjustments.
+    """
+
+    DEFAULT_TTL_SECONDS = 180.0
+    MAX_TTL_SECONDS = 900.0
+
+    def __init__(
+        self,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        epoch_time: Callable[[], float] = time.time,
+    ):
+        self._monotonic = monotonic
+        self._epoch_time = epoch_time
+        self._lock = threading.Lock()
+        self._leases: dict[str, dict[str, Any]] = {}
+
+    def acquire(
+        self,
+        *,
+        owner_ref: str,
+        reason: str,
+        ttl_seconds: float | int | None = None,
+    ) -> dict[str, Any]:
+        owner_ref = str(owner_ref or "").strip()
+        reason = str(reason or "").strip()
+        if not owner_ref:
+            raise ValidationError("maintenance lease owner_ref is required")
+        if not reason:
+            raise ValidationError("maintenance lease reason is required")
+        ttl = self._normalize_ttl(ttl_seconds)
+        now = self._monotonic()
+        lease_id = "maintenance-lease:" + secrets.token_hex(16)
+        with self._lock:
+            self._prune_locked(now)
+            replaced = [
+                existing_id
+                for existing_id, lease in self._leases.items()
+                if lease["owner_ref"] == owner_ref
+                and lease["reason"] == reason
+            ]
+            for existing_id in replaced:
+                self._leases.pop(existing_id, None)
+            self._leases[lease_id] = {
+                "lease_id": lease_id,
+                "owner_ref": owner_ref,
+                "reason": reason,
+                "acquired_at_epoch_seconds": self._epoch_time(),
+                "expires_at_monotonic": now + ttl,
+                "ttl_seconds": ttl,
+            }
+            return {
+                **self._public_lease_locked(
+                    self._leases[lease_id], now=now
+                ),
+                "replaced_lease_count": len(replaced),
+            }
+
+    def renew(
+        self,
+        *,
+        lease_id: str,
+        ttl_seconds: float | int | None = None,
+    ) -> dict[str, Any]:
+        lease_id = str(lease_id or "").strip()
+        ttl = self._normalize_ttl(ttl_seconds)
+        now = self._monotonic()
+        with self._lock:
+            self._prune_locked(now)
+            lease = self._leases.get(lease_id)
+            if lease is None:
+                return {
+                    "status": "not_found",
+                    "lease_id": lease_id,
+                    "active": False,
+                }
+            lease["expires_at_monotonic"] = now + ttl
+            lease["ttl_seconds"] = ttl
+            return {
+                **self._public_lease_locked(lease, now=now),
+                "status": "renewed",
+            }
+
+    def release(self, *, lease_id: str) -> dict[str, Any]:
+        lease_id = str(lease_id or "").strip()
+        now = self._monotonic()
+        with self._lock:
+            self._prune_locked(now)
+            lease = self._leases.pop(lease_id, None)
+            return {
+                "status": "released" if lease is not None else "not_found",
+                "lease_id": lease_id,
+                "active": False,
+            }
+
+    def admission(self) -> dict[str, Any]:
+        now = self._monotonic()
+        with self._lock:
+            self._prune_locked(now)
+            leases = [
+                self._public_lease_locked(lease, now=now)
+                for lease in self._leases.values()
+            ]
+        retry_after = min(
+            (float(lease["remaining_seconds"]) for lease in leases),
+            default=0.0,
+        )
+        return {
+            "allowed": not leases,
+            "reason": None if not leases else "foreground_recovery_lease_active",
+            "active_count": len(leases),
+            "retry_after_seconds": round(retry_after, 3),
+            "leases": sorted(leases, key=lambda lease: str(lease["lease_id"])),
+        }
+
+    def status(self) -> dict[str, Any]:
+        admission = self.admission()
+        return {
+            "status": "open" if admission["allowed"] else "held",
+            **admission,
+            "default_ttl_seconds": self.DEFAULT_TTL_SECONDS,
+            "max_ttl_seconds": self.MAX_TTL_SECONDS,
+        }
+
+    def _normalize_ttl(self, ttl_seconds: float | int | None) -> float:
+        try:
+            ttl = (
+                self.DEFAULT_TTL_SECONDS
+                if ttl_seconds is None
+                else float(ttl_seconds)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                "maintenance lease ttl_seconds must be numeric"
+            ) from exc
+        if ttl <= 0:
+            raise ValidationError(
+                "maintenance lease ttl_seconds must be positive"
+            )
+        return min(ttl, self.MAX_TTL_SECONDS)
+
+    def _prune_locked(self, now: float) -> None:
+        expired = [
+            lease_id
+            for lease_id, lease in self._leases.items()
+            if float(lease["expires_at_monotonic"]) <= now
+        ]
+        for lease_id in expired:
+            self._leases.pop(lease_id, None)
+
+    def _public_lease_locked(
+        self, lease: Mapping[str, Any], *, now: float
+    ) -> dict[str, Any]:
+        remaining = max(0.0, float(lease["expires_at_monotonic"]) - now)
+        return {
+            "status": "acquired",
+            "lease_id": str(lease["lease_id"]),
+            "owner_ref": str(lease["owner_ref"]),
+            "reason": str(lease["reason"]),
+            "active": remaining > 0,
+            "ttl_seconds": float(lease["ttl_seconds"]),
+            "remaining_seconds": round(remaining, 3),
+            "acquired_at_epoch_seconds": float(
+                lease["acquired_at_epoch_seconds"]
+            ),
+            "expires_at_epoch_seconds": round(self._epoch_time() + remaining, 3),
+        }
 
 
 class JournalProjector:
@@ -102,11 +281,13 @@ class BackgroundMemoryPolicyWorker:
         interval_seconds: float = 60.0,
         actor: str = "svc:memory_policy",
         execution_lock: threading.Lock | threading.RLock | None = None,
+        maintenance_admission: Callable[[], Mapping[str, Any]] | None = None,
     ):
         self.amos = amos
         self.interval_seconds = max(0.1, float(interval_seconds))
         self.actor = actor
         self.execution_lock = execution_lock
+        self.maintenance_admission = maintenance_admission
         self._condition = threading.Condition()
         self._pending: list[dict[str, Any]] = []
         self._running = False
@@ -116,6 +297,8 @@ class BackgroundMemoryPolicyWorker:
         self._last_error: str | None = None
         self._run_count = 0
         self._error_count = 0
+        self._deferred_count = 0
+        self._last_deferred: dict[str, Any] | None = None
 
     def start(self) -> dict[str, Any]:
         with self._condition:
@@ -188,12 +371,20 @@ class BackgroundMemoryPolicyWorker:
                 "pending_count": len(self._pending),
                 "run_count": self._run_count,
                 "error_count": self._error_count,
+                "deferred_count": self._deferred_count,
+                "last_deferred": self._last_deferred,
                 "last_result": self._last_result,
                 "last_error": self._last_error,
+                "maintenance_admission": (
+                    dict(self.maintenance_admission())
+                    if self.maintenance_admission is not None
+                    else {"allowed": True, "reason": None}
+                ),
             }
 
     def _loop(self) -> None:
         while True:
+            deferred = False
             with self._condition:
                 if not self._pending and not self._stop:
                     self._condition.wait(timeout=self.interval_seconds)
@@ -210,15 +401,27 @@ class BackgroundMemoryPolicyWorker:
                 self._running = True
             try:
                 if self.execution_lock is None:
-                    result = self._run_request(request)
+                    result = self._run_admitted_request(request)
                 else:
                     with self.execution_lock:
-                        result = self._run_request(request)
+                        result = self._run_admitted_request(request)
                 compact = self._compact_result(result)
                 with self._condition:
                     self._last_result = compact
                     self._last_error = None
-                    self._run_count += 1
+                    if compact.get("reason") == (
+                        "foreground_recovery_lease_active"
+                    ):
+                        deferred = True
+                        self._deferred_count += 1
+                        self._last_deferred = compact
+                        if (
+                            request.get("trigger") != "background_interval"
+                            and request not in self._pending
+                        ):
+                            self._pending.insert(0, request)
+                    else:
+                        self._run_count += 1
             except Exception as exc:  # pragma: no cover - defensive service guard
                 with self._condition:
                     self._last_error = str(exc)
@@ -226,6 +429,29 @@ class BackgroundMemoryPolicyWorker:
             finally:
                 with self._condition:
                     self._running = False
+                    if deferred and not self._stop:
+                        self._condition.wait(timeout=self.interval_seconds)
+
+    def _run_admitted_request(
+        self, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        admission = (
+            dict(self.maintenance_admission())
+            if self.maintenance_admission is not None
+            else {"allowed": True, "reason": None}
+        )
+        if not bool(admission.get("allowed", True)):
+            return {
+                "status": "deferred",
+                "reason": str(
+                    admission.get("reason")
+                    or "maintenance_admission_deferred"
+                ),
+                "trigger": str(request["trigger"]),
+                "maintenance_admission": admission,
+                "graph_version": self.amos.store.graph_version(),
+            }
+        return self._run_request(request)
 
     def _run_request(self, request: Mapping[str, Any]) -> dict[str, Any]:
         return self.amos.run_memory_policy(
@@ -256,6 +482,9 @@ class BackgroundMemoryPolicyWorker:
         event = result.get("event")
         if isinstance(event, Mapping):
             compact["event_id"] = event.get("event_id")
+        admission = result.get("maintenance_admission")
+        if isinstance(admission, Mapping):
+            compact["maintenance_admission"] = dict(admission)
         return compact
 
 

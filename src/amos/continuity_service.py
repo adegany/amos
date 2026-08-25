@@ -12,7 +12,7 @@ import copy
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
-from ._service_support import access_visible, scope_visible
+from ._service_support import LOW_HEALTH_STATES, access_visible, scope_visible
 from .errors import (
     CASConflict,
     CognitiveWorkspaceBudgetExceeded,
@@ -46,6 +46,7 @@ class ContinuityService:
     MEMORY_TRANSACTION_OBSERVATION_PROFILE = (
         "amos.memory-transaction-observation.v1"
     )
+    CANONICAL_RECORD_BATCH_PROFILE = "amos.canonical-record-batch.v1"
     SUPPORTED_HEAD_KINDS: ClassVar[frozenset[str]] = frozenset(
         {
             "assessment_qualification", "authority_record", "discourse_thread",
@@ -73,6 +74,7 @@ class ContinuityService:
         self._memory_identity_digest = graph._memory_identity_digest
         self._atom_projection = graph._atom_projection
         self._edge = graph._edge
+        self._active_superseded_refs = graph._active_superseded_refs
         self._assert_direct_commit_governance_safe = (
             mutations._assert_direct_commit_governance_safe
         )
@@ -2158,6 +2160,172 @@ class ContinuityService:
             "journal_event_id": str(head["journal_event_id"]),
             "updated_at": str(head["updated_at"]),
             "revision": self.store.memory_revision(),
+        }
+
+    def get_canonical_records(
+        self,
+        *,
+        atom_ids: Sequence[str] | None = None,
+        heads: Sequence[Mapping[str, Any]] | None = None,
+        scope: Mapping[str, Any] | None,
+        requester: str = "system",
+        target_processor: str = "reasoner",
+        include_conflicts: bool = False,
+        include_archived: bool = False,
+        include_low_health: bool = False,
+        include_superseded: bool = False,
+    ) -> dict[str, Any]:
+        """Read a bounded coherent set of exact atoms and canonical heads.
+
+        This is an exact administrative read model, not associative recall. It
+        preserves the same scope, access, lifecycle, health, and supersession
+        visibility boundaries while avoiding one HTTP round trip per record.
+        """
+
+        request_scope = normalize_scope(scope)
+        requester = self._required_text(requester, "requester")
+        target_processor = self._required_text(
+            target_processor, "target_processor"
+        )
+        normalized_atom_ids = list(dict.fromkeys(
+            self._required_text(atom_id, "atom_id")
+            for atom_id in (atom_ids or [])
+        ))
+        if len(normalized_atom_ids) > 2048:
+            raise ValidationError(
+                "canonical record batches are limited to 2048 atom_ids"
+            )
+        normalized_heads: list[dict[str, str]] = []
+        seen_heads: set[tuple[str, str]] = set()
+        for raw_head in heads or []:
+            if not isinstance(raw_head, Mapping):
+                raise ValidationError("canonical head requests must be objects")
+            series_kind = self._required_text(
+                raw_head.get("series_kind"), "series_kind"
+            )
+            series_id = self._required_text(
+                raw_head.get("series_id"), "series_id"
+            )
+            if series_kind not in self.SUPPORTED_HEAD_KINDS:
+                raise ValidationError(
+                    f"unsupported head series_kind: {series_kind}"
+                )
+            key = (series_kind, series_id)
+            if key not in seen_heads:
+                seen_heads.add(key)
+                normalized_heads.append({
+                    "series_kind": series_kind,
+                    "series_id": series_id,
+                })
+        if len(normalized_heads) > 1024:
+            raise ValidationError(
+                "canonical record batches are limited to 1024 heads"
+            )
+        self._mark_foreground_activity(requester)
+        revision = self.store.memory_revision()
+        head_rows: list[dict[str, Any]] = []
+        head_atoms: dict[str, Mapping[str, Any]] = {}
+        for request in normalized_heads:
+            head = self.store.get_memory_head(
+                scope=request_scope,
+                series_kind=request["series_kind"],
+                series_id=request["series_id"],
+            )
+            if head is None:
+                head_rows.append({
+                    "status": "absent",
+                    **request,
+                })
+                continue
+            head_ref = str(head["head_ref"])
+            atom = self.store.get_atom(head_ref)
+            if atom is not None:
+                head_atoms[head_ref] = atom
+            head_rows.append({
+                "status": "found",
+                **request,
+                "head_ref": head_ref,
+                "head_version": int(head["head_version"]),
+                "journal_event_id": str(head["journal_event_id"]),
+                "updated_at": str(head["updated_at"]),
+            })
+
+        all_atom_ids = list(dict.fromkeys([
+            *normalized_atom_ids,
+            *head_atoms,
+        ]))
+        superseded_refs = (
+            self._active_superseded_refs(all_atom_ids)
+            if not include_superseded
+            else {}
+        )
+
+        def visible_atom(atom_id: str) -> tuple[Mapping[str, Any] | None, str | None]:
+            atom = head_atoms.get(atom_id) or self.store.get_atom(atom_id)
+            if atom is None:
+                return None, "not_found"
+            if atom.get("deleted"):
+                return None, "deleted"
+            if not scope_visible(atom.get("scope") or {}, request_scope):
+                return None, "scope_hidden"
+            if not access_visible(
+                atom.get("access_policy") or {},
+                requester,
+                target_processor,
+            ):
+                return None, "access_hidden"
+            lifecycle = str(atom.get("lifecycle_state") or "active")
+            if lifecycle == "archived" and not include_archived:
+                return None, "archived"
+            if lifecycle == "superseded" and not include_superseded:
+                return None, "superseded"
+            if atom_id in superseded_refs and not include_superseded:
+                return None, "superseded"
+            health = str(atom.get("health_status") or "healthy")
+            if health == "contradicted" and not include_conflicts:
+                return None, "contradicted"
+            if health in LOW_HEALTH_STATES and not include_low_health:
+                return None, f"health:{health}"
+            return atom, None
+
+        atom_rows: list[dict[str, Any]] = []
+        atoms_by_id: dict[str, Mapping[str, Any]] = {}
+        for atom_id in normalized_atom_ids:
+            atom, reason = visible_atom(atom_id)
+            row: dict[str, Any] = {
+                "status": "found" if atom is not None else "not_found",
+                "atom_id": atom_id,
+            }
+            if atom is not None:
+                atoms_by_id[atom_id] = atom
+            else:
+                row["reason"] = reason
+            atom_rows.append(row)
+        for row in head_rows:
+            if row["status"] != "found":
+                continue
+            atom, reason = visible_atom(str(row["head_ref"]))
+            if atom is None:
+                series_kind = str(row["series_kind"])
+                series_id = str(row["series_id"])
+                row.clear()
+                row.update({
+                    "status": "absent",
+                    "series_kind": series_kind,
+                    "series_id": series_id,
+                    "reason": reason,
+                })
+            else:
+                atoms_by_id[str(atom["id"])] = atom
+        return {
+            "status": "completed",
+            "profile": self.CANONICAL_RECORD_BATCH_PROFILE,
+            "revision": revision,
+            "atom_count": len(atom_rows),
+            "head_count": len(head_rows),
+            "atoms": atom_rows,
+            "heads": head_rows,
+            "items_by_id": atoms_by_id,
         }
 
     def observe_memory_transaction(

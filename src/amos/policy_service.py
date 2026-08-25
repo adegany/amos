@@ -234,6 +234,31 @@ class PolicyService:
                 }
             started_graph_version = self.store.graph_version()
             scope = dict(scope or {})
+            due_reasons = {
+                str(reason) for reason in due.get("reasons", [])
+            }
+            semantic_maintenance_due = bool(
+                force
+                or due_reasons.intersection(
+                    {"force", "graph_version_interval", "time_interval"}
+                )
+            )
+            lifecycle_maintenance_due = bool(
+                semantic_maintenance_due
+                or any(
+                    reason.startswith("memory_atom_pressure:")
+                    or reason.startswith("capacity_pressure:")
+                    for reason in due_reasons
+                )
+            )
+            execution_plan = {
+                "semantic_maintenance": semantic_maintenance_due,
+                "lifecycle_maintenance": lifecycle_maintenance_due,
+                "storage_cleanup": bool(
+                    (due.get("storage_cleanup") or {}).get("due")
+                ),
+                "reasons": sorted(due_reasons),
+            }
             results: dict[str, Any] = {}
             target_refs: list[str] = []
             storage_cleanup = policy["storage_cleanup"]
@@ -258,7 +283,11 @@ class PolicyService:
                     results["storage_cleanup"].get("deleted_atom_refs", [])
                 )
             maintenance = policy["maintenance"]
-            if maintenance["enabled"] and maintenance["repair_reference_contracts"]:
+            if (
+                semantic_maintenance_due
+                and maintenance["enabled"]
+                and maintenance["repair_reference_contracts"]
+            ):
                 results["reference_contracts"] = (
                     self._run_reference_contract_repairs(
                         scope=scope,
@@ -271,12 +300,20 @@ class PolicyService:
                     for action in results["reference_contracts"].get("actions", [])
                     if action.get("record_kind") == "atom"
                 )
-            if maintenance["enabled"] and maintenance["run_smp"]:
+            if (
+                semantic_maintenance_due
+                and maintenance["enabled"]
+                and maintenance["run_smp"]
+            ):
                 results["smp"] = self.run_smp_analysis(
                     scope=scope,
                     max_atoms=maintenance["max_smp_atoms"],
                 )
-            if maintenance["enabled"] and maintenance["run_steward"]:
+            if (
+                semantic_maintenance_due
+                and maintenance["enabled"]
+                and maintenance["run_steward"]
+            ):
                 results["steward"] = self.run_steward(
                     scope=scope,
                     actor=actor,
@@ -294,7 +331,10 @@ class PolicyService:
                         if ref
                     )
 
-            if policy["distillation"]["enabled"]:
+            if (
+                semantic_maintenance_due
+                and policy["distillation"]["enabled"]
+            ):
                 results["distillation"] = self._run_policy_distillation(
                     policy=policy,
                     scope=scope,
@@ -306,7 +346,10 @@ class PolicyService:
                     target_refs.extend(distilled["source_refs"])
 
             maintenance_distiller = policy["maintenance_distiller"]
-            if maintenance_distiller["enabled"]:
+            if (
+                semantic_maintenance_due
+                and maintenance_distiller["enabled"]
+            ):
                 results["maintenance_distiller"] = self.run_maintenance_distiller(
                     scope=scope,
                     actor=actor,
@@ -335,7 +378,7 @@ class PolicyService:
             # archived in this same policy pass rather than remaining an
             # active graph-quality warning until the next interval.
             decay = policy["decay"]
-            if decay["enabled"]:
+            if lifecycle_maintenance_due and decay["enabled"]:
                 results["decay"] = self._run_decay_policy(
                     decay=decay,
                     scope=scope,
@@ -362,13 +405,44 @@ class PolicyService:
                 )
                 target_refs.extend(results["storage_cleanup"].get("deleted_atom_refs", []))
 
+            cleanup_changed_canonical = bool(
+                results.get("storage_cleanup", {}).get(
+                    "deleted_atom_count", 0
+                )
+            )
+            lifecycle_changed_canonical = bool(
+                results.get("decay", {}).get("actions", [])
+            )
+            rebuild_indexes = bool(
+                semantic_maintenance_due
+                or cleanup_changed_canonical
+                or lifecycle_changed_canonical
+            )
+            execution_plan["rebuild_indexes"] = rebuild_indexes
+            invalidate_packet_cache = bool(
+                rebuild_indexes
+                or results.get("storage_cleanup", {})
+                .get("index_prune", {})
+                .get("rows", 0)
+            )
+            execution_plan["invalidate_packet_cache"] = (
+                invalidate_packet_cache
+            )
             policy_event_graph_version = self.store.graph_version() + 1
-            if maintenance["enabled"] and maintenance["rebuild_indexes"]:
+            if (
+                rebuild_indexes
+                and maintenance["enabled"]
+                and maintenance["rebuild_indexes"]
+            ):
                 results["index"] = self._rebuild_derived_indexes(
                     graph_version=policy_event_graph_version,
                     publish_revision_offset=1,
                 )
-            if maintenance["enabled"] and maintenance["invalidate_packet_cache"]:
+            if (
+                invalidate_packet_cache
+                and maintenance["enabled"]
+                and maintenance["invalidate_packet_cache"]
+            ):
                 results["packet_cache"] = self._invalidate_packet_cache(
                     graph_version=policy_event_graph_version
                 )
@@ -378,7 +452,7 @@ class PolicyService:
             )
             if (
                 "storage_cleanup" in results
-                and ("index" in results or "packet_cache" in results)
+                and "index" in results
                 and sqlite_compaction.get("checkpoint_wal", True)
             ):
                 checkpoint_mode = str(
@@ -407,6 +481,35 @@ class PolicyService:
                     }
 
             completed_at = utc_now()
+            cleanup_atom_scan = dict(
+                results.get("storage_cleanup", {}).get("atom_scan", {})
+            )
+            atom_scan_attempted = bool(cleanup_atom_scan.get("attempted"))
+            if atom_scan_attempted:
+                next_atom_scan_noop_streak = (
+                    int(
+                        cleanup_atom_scan.get(
+                            "prior_noop_streak",
+                            state.get("storage_atom_scan_noop_streak", 0),
+                        )
+                        or 0
+                    )
+                    + 1
+                    if cleanup_atom_scan.get("noop")
+                    else 0
+                )
+                next_atom_scan_at = completed_at
+                next_atom_scan_pressure_mode = cleanup_due.get(
+                    "pressure_mode"
+                )
+            else:
+                next_atom_scan_noop_streak = int(
+                    state.get("storage_atom_scan_noop_streak", 0) or 0
+                )
+                next_atom_scan_at = state.get("last_storage_atom_scan_at")
+                next_atom_scan_pressure_mode = state.get(
+                    "last_storage_atom_scan_pressure_mode"
+                )
             with self.store.transaction() as conn:
                 # Foreground commits may run between bounded maintenance
                 # phases. Derive the final event revision only after this
@@ -438,6 +541,7 @@ class PolicyService:
                     "trigger": trigger,
                     "force": force,
                     "due": due,
+                    "execution_plan": execution_plan,
                     "policy": policy,
                     "started_graph_version": started_graph_version,
                     "completed_graph_version": completed_graph_version,
@@ -462,6 +566,20 @@ class PolicyService:
                         {
                             "last_run_at": completed_at,
                             "last_graph_version": event["graph_version"],
+                            "last_semantic_run_at": (
+                                completed_at
+                                if semantic_maintenance_due
+                                else state.get("last_semantic_run_at")
+                                or completed_at
+                            ),
+                            "last_semantic_graph_version": (
+                                event["graph_version"]
+                                if semantic_maintenance_due
+                                else state.get(
+                                    "last_semantic_graph_version", 0
+                                )
+                                or event["graph_version"]
+                            ),
                             "last_trigger": trigger,
                             "last_event_id": event["event_id"],
                             "last_due_reasons": due["reasons"],
@@ -484,6 +602,20 @@ class PolicyService:
                             "last_storage_cleanup_at": self.store.get_meta(
                                 "last_storage_cleanup_at"
                             ),
+                            "last_storage_atom_scan_at": next_atom_scan_at,
+                            "last_storage_atom_scan_graph_version": (
+                                event["graph_version"]
+                                if atom_scan_attempted
+                                else state.get(
+                                    "last_storage_atom_scan_graph_version", 0
+                                )
+                            ),
+                            "storage_atom_scan_noop_streak": (
+                                next_atom_scan_noop_streak
+                            ),
+                            "last_storage_atom_scan_pressure_mode": (
+                                next_atom_scan_pressure_mode
+                            ),
                             "last_vacuum_at": self.store.get_meta("last_vacuum_at"),
                             "last_foreground_activity_at": self.store.get_meta(
                                 "last_foreground_activity_at"
@@ -491,12 +623,17 @@ class PolicyService:
                         }
                     ),
                 )
-                if maintenance["enabled"] and maintenance["invalidate_packet_cache"]:
+                if (
+                    invalidate_packet_cache
+                    and maintenance["enabled"]
+                    and maintenance["invalidate_packet_cache"]
+                ):
                     self.store.retire_packet_cache(conn)
             return {
                 "status": "completed",
                 "trigger": trigger,
                 "due": due,
+                "execution_plan": execution_plan,
                 "policy": policy,
                 "results": results,
                 "event": event,
@@ -885,6 +1022,8 @@ class PolicyService:
             return {
                 "last_run_at": None,
                 "last_graph_version": 0,
+                "last_semantic_run_at": None,
+                "last_semantic_graph_version": 0,
                 "last_trigger": None,
                 "last_event_id": None,
                 "last_due_reasons": [],
@@ -894,6 +1033,10 @@ class PolicyService:
                 "last_storage_cleanup_at": self.store.get_meta(
                     "last_storage_cleanup_at"
                 ),
+                "last_storage_atom_scan_at": None,
+                "last_storage_atom_scan_graph_version": 0,
+                "storage_atom_scan_noop_streak": 0,
+                "last_storage_atom_scan_pressure_mode": None,
                 "last_vacuum_at": self.store.get_meta("last_vacuum_at"),
                 "last_foreground_activity_at": self.store.get_meta(
                     "last_foreground_activity_at"
@@ -906,6 +1049,19 @@ class PolicyService:
         return {
             "last_run_at": data.get("last_run_at"),
             "last_graph_version": int(data.get("last_graph_version", 0) or 0),
+            "last_semantic_run_at": (
+                data.get("last_semantic_run_at")
+                if "last_semantic_run_at" in data
+                else data.get("last_run_at")
+            ),
+            "last_semantic_graph_version": int(
+                (
+                    data.get("last_semantic_graph_version")
+                    if "last_semantic_graph_version" in data
+                    else data.get("last_graph_version", 0)
+                )
+                or 0
+            ),
             "last_trigger": data.get("last_trigger"),
             "last_event_id": data.get("last_event_id"),
             "last_due_reasons": list(data.get("last_due_reasons", [])),
@@ -916,6 +1072,18 @@ class PolicyService:
             "steward_cursor": data.get("steward_cursor"),
             "last_storage_cleanup_at": self.store.get_meta("last_storage_cleanup_at")
             or data.get("last_storage_cleanup_at"),
+            "last_storage_atom_scan_at": data.get(
+                "last_storage_atom_scan_at"
+            ),
+            "last_storage_atom_scan_graph_version": int(
+                data.get("last_storage_atom_scan_graph_version", 0) or 0
+            ),
+            "storage_atom_scan_noop_streak": max(
+                0, int(data.get("storage_atom_scan_noop_streak", 0) or 0)
+            ),
+            "last_storage_atom_scan_pressure_mode": data.get(
+                "last_storage_atom_scan_pressure_mode"
+            ),
             "last_vacuum_at": self.store.get_meta("last_vacuum_at")
             or data.get("last_vacuum_at"),
             "last_foreground_activity_at": self.store.get_meta(
@@ -1090,6 +1258,7 @@ class PolicyService:
         return {
             "status": result.get("status"),
             "retention_profile": dict(result.get("retention_profile") or {}),
+            "atom_scan": dict(result.get("atom_scan") or {}),
             "reference_protection": dict(
                 result.get("reference_protection") or {}
             ),
@@ -1171,15 +1340,30 @@ class PolicyService:
         graph_version = self.store.graph_version()
         last_graph_version = int(state.get("last_graph_version", 0) or 0)
         graph_delta = max(0, graph_version - last_graph_version)
+        last_semantic_graph_version = int(
+            state.get("last_semantic_graph_version", last_graph_version) or 0
+        )
+        semantic_graph_delta = max(
+            0, graph_version - last_semantic_graph_version
+        )
         schedule = dict(policy.get("schedule", {}))
         reasons = []
         if force:
             reasons.append("force")
-        if graph_delta >= int(schedule.get("every_graph_versions", 25)):
+        if semantic_graph_delta >= int(
+            schedule.get("every_graph_versions", 25)
+        ):
             reasons.append("graph_version_interval")
         every_seconds = int(schedule.get("every_seconds", 300) or 0)
         elapsed_seconds = self._seconds_since(state.get("last_run_at"))
-        if every_seconds > 0 and elapsed_seconds is not None and elapsed_seconds >= every_seconds:
+        semantic_elapsed_seconds = self._seconds_since(
+            state.get("last_semantic_run_at") or state.get("last_run_at")
+        )
+        if (
+            every_seconds > 0
+            and semantic_elapsed_seconds is not None
+            and semantic_elapsed_seconds >= every_seconds
+        ):
             reasons.append("time_interval")
         pressure_min_interval_seconds = max(
             0,
@@ -1241,7 +1425,10 @@ class PolicyService:
             "graph_version": graph_version,
             "last_graph_version": last_graph_version,
             "graph_delta": graph_delta,
+            "last_semantic_graph_version": last_semantic_graph_version,
+            "semantic_graph_delta": semantic_graph_delta,
             "elapsed_seconds": elapsed_seconds,
+            "semantic_elapsed_seconds": semantic_elapsed_seconds,
             "pressure_min_interval_seconds": pressure_min_interval_seconds,
             "pressure_cooldown_remaining_seconds": (
                 max(0, pressure_min_interval_seconds - elapsed_seconds)
@@ -1776,6 +1963,50 @@ class PolicyService:
                 "min_interval_seconds": min_interval,
                 "last_storage_cleanup_at": last_cleanup,
             }
+        last_atom_scan = state.get("last_storage_atom_scan_at") or last_cleanup
+        atom_scan_elapsed = self._seconds_since(last_atom_scan)
+        no_op_streak = max(
+            0, int(state.get("storage_atom_scan_noop_streak", 0) or 0)
+        )
+        previous_pressure_mode = str(
+            state.get("last_storage_atom_scan_pressure_mode") or ""
+        )
+        if previous_pressure_mode and previous_pressure_mode != pressure_mode:
+            # Escalating pressure must immediately re-open candidate scanning.
+            no_op_streak = 0
+        atom_scan_base_interval = max(
+            0,
+            int(
+                cleanup.get(
+                    "pressure_atom_scan_min_interval_seconds"
+                    if pressure_triggered
+                    else "atom_scan_min_interval_seconds",
+                    min_interval,
+                )
+                or 0
+            ),
+        )
+        atom_scan_backoff_max = max(
+            atom_scan_base_interval,
+            int(
+                cleanup.get(
+                    "pressure_atom_scan_noop_backoff_max_seconds"
+                    if pressure_triggered
+                    else "atom_scan_noop_backoff_max_seconds",
+                    1800 if pressure_triggered else 3600,
+                )
+                or 0
+            ),
+        )
+        atom_scan_interval = min(
+            atom_scan_backoff_max,
+            atom_scan_base_interval * (2 ** min(no_op_streak, 6)),
+        )
+        atom_scan_due = bool(
+            force
+            or atom_scan_elapsed is None
+            or atom_scan_elapsed >= atom_scan_interval
+        )
         return {
             "due": True,
             "reason": (
@@ -1793,6 +2024,11 @@ class PolicyService:
             "elapsed_since_cleanup_seconds": cleanup_elapsed,
             "min_interval_seconds": min_interval,
             "last_storage_cleanup_at": last_cleanup,
+            "atom_scan_due": atom_scan_due,
+            "atom_scan_elapsed_seconds": atom_scan_elapsed,
+            "atom_scan_min_interval_seconds": atom_scan_interval,
+            "atom_scan_noop_streak": no_op_streak,
+            "last_storage_atom_scan_at": last_atom_scan,
         }
 
     @staticmethod
@@ -1867,6 +2103,10 @@ class PolicyService:
                 or 0
             ),
         )
+        configured_max_deletions = max_deletions
+        atom_scan_due = bool(due.get("atom_scan_due", True))
+        if not atom_scan_due:
+            max_deletions = 0
         write_batch_size = max(1, int(cleanup.get("write_batch_size", 32) or 32))
         projected_atoms: list[dict[str, Any]] = []
         projected_edges: list[dict[str, Any]] = []
@@ -2347,6 +2587,21 @@ class PolicyService:
                     else cleanup.get("purge_deleted_after_seconds")
                 ),
                 "max_deletions_per_tick": max_deletions,
+                "configured_max_deletions_per_tick": (
+                    configured_max_deletions
+                ),
+            },
+            "atom_scan": {
+                "attempted": atom_scan_due,
+                "candidate_count": len(candidates),
+                "deleted_atom_count": len(actions),
+                "noop": atom_scan_due and not actions,
+                "deferred_by_backoff": not atom_scan_due,
+                "elapsed_seconds": due.get("atom_scan_elapsed_seconds"),
+                "min_interval_seconds": due.get(
+                    "atom_scan_min_interval_seconds"
+                ),
+                "prior_noop_streak": due.get("atom_scan_noop_streak", 0),
             },
             "reference_protection": {
                 "hot_reference_protection_enabled": bool(

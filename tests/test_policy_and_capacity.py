@@ -19,6 +19,7 @@ from amos import (
     CASConflict,
     CapacityGovernor,
     DistillerMaintenanceWorker,
+    ExpiringMaintenanceLeaseGate,
     IdempotencyConflict,
     IndexMaintainer,
     JournalProjector,
@@ -2160,7 +2161,7 @@ def test_storage_cleanup_uses_mode_specific_pressure_retention(amos):
     assert amos.store.get_atom(target["id"]) is None
 
 
-def test_pressure_cleanup_precedes_maintenance_and_rechecks_wal_after_indexes(
+def test_pressure_cleanup_does_not_trigger_unrelated_index_rebuild(
     amos, monkeypatch
 ):
     calls = []
@@ -2222,15 +2223,11 @@ def test_pressure_cleanup_precedes_maintenance_and_rechecks_wal_after_indexes(
 
     result = amos.run_memory_policy(trigger="pressure_ordering_test")
 
-    assert calls == [
-        "cleanup",
-        "checkpoint:TRUNCATE",
-        "index",
-        "checkpoint:TRUNCATE",
-    ]
-    assert result["results"]["post_maintenance_checkpoint"]["status"] == (
-        "completed"
-    )
+    assert calls == ["cleanup", "checkpoint:TRUNCATE"]
+    assert result["execution_plan"]["semantic_maintenance"] is False
+    assert result["execution_plan"]["rebuild_indexes"] is False
+    assert "index" not in result["results"]
+    assert "post_maintenance_checkpoint" not in result["results"]
 
 
 def test_storage_cleanup_physically_retires_atom_and_edge_payload_rows(amos):
@@ -2593,6 +2590,171 @@ def test_background_memory_policy_worker_runs_queued_tick(amos):
     ]
     assert semantic_atoms
     assert amos.memory_policy_status()["state"]["last_trigger"] == "retrieve_packet"
+
+
+def test_expiring_maintenance_lease_gate_releases_on_expiry_and_explicit_release():
+    monotonic_now = [100.0]
+    epoch_now = [1_800_000_000.0]
+    gate = ExpiringMaintenanceLeaseGate(
+        monotonic=lambda: monotonic_now[0],
+        epoch_time=lambda: epoch_now[0],
+    )
+
+    first = gate.acquire(
+        owner_ref="ent:agent:cogito:runtime-boot",
+        reason="canonical_runtime_boot_recovery",
+        ttl_seconds=10,
+    )
+    assert gate.admission()["allowed"] is False
+    replacement = gate.acquire(
+        owner_ref="ent:agent:cogito:runtime-boot",
+        reason="canonical_runtime_boot_recovery",
+        ttl_seconds=10,
+    )
+    assert replacement["replaced_lease_count"] == 1
+    assert gate.status()["active_count"] == 1
+    assert gate.release(lease_id=first["lease_id"])["status"] == "not_found"
+    first = replacement
+    assert gate.renew(
+        lease_id=first["lease_id"], ttl_seconds=20
+    )["status"] == "renewed"
+
+    monotonic_now[0] += 21
+    assert gate.admission()["allowed"] is True
+    assert gate.release(lease_id=first["lease_id"])["status"] == "not_found"
+
+    second = gate.acquire(
+        owner_ref="ent:agent:cogito:runtime-boot",
+        reason="canonical_runtime_boot_recovery",
+    )
+    assert gate.release(lease_id=second["lease_id"])["status"] == "released"
+    assert gate.status()["status"] == "open"
+
+
+def test_background_policy_worker_preserves_request_while_lease_is_active():
+    class Store:
+        @staticmethod
+        def graph_version():
+            return 7
+
+    class PolicyAmos:
+        def __init__(self):
+            self.store = Store()
+            self.calls = 0
+
+        def run_memory_policy(self, **request):
+            self.calls += 1
+            return {
+                "status": "completed",
+                "trigger": request["trigger"],
+                "graph_version": self.store.graph_version(),
+            }
+
+    amos = PolicyAmos()
+    gate = ExpiringMaintenanceLeaseGate()
+    lease = gate.acquire(
+        owner_ref="ent:agent:cogito:runtime-boot",
+        reason="canonical_runtime_boot_recovery",
+    )
+    worker = BackgroundMemoryPolicyWorker(
+        amos,
+        interval_seconds=0.1,
+        maintenance_admission=gate.admission,
+    )
+    try:
+        worker.start()
+        worker.request_tick(trigger="test_foreground_recovery")
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if worker.status()["deferred_count"]:
+                break
+            time.sleep(0.01)
+        assert amos.calls == 0
+        assert worker.status()["pending_count"] == 1
+
+        gate.release(lease_id=lease["lease_id"])
+        deadline = time.time() + 2
+        while time.time() < deadline and amos.calls == 0:
+            time.sleep(0.01)
+        assert amos.calls == 1
+        assert worker.status()["pending_count"] == 0
+    finally:
+        worker.stop()
+
+
+def test_storage_pressure_does_not_force_full_semantic_maintenance(amos):
+    amos.commit_atom({
+        "id": "storage_only_policy_source",
+        "type": "belief",
+        "payload": {"claim": "bounded storage-only maintenance"},
+    })
+    amos.configure_capacity_budget(hard_capacity_bytes=1)
+    amos.configure_memory_policy(
+        schedule={
+            "every_graph_versions": 1_000_000,
+            "every_seconds": 1_000_000,
+            "pressure_min_interval_seconds": 0,
+            "run_on_pressure": True,
+        },
+        decay={"enabled": False},
+        storage_cleanup={
+            "enabled": True,
+            "run_on_pressure": True,
+            "pressure_min_interval_seconds": 0,
+            "pressure_atom_scan_min_interval_seconds": 300,
+            "pressure_atom_scan_noop_backoff_max_seconds": 1800,
+            "max_deletions_per_tick": 0,
+            "pressure_profiles": {
+                "orange": {"max_deletions_per_tick": 0},
+                "red": {"max_deletions_per_tick": 0},
+            },
+            "max_index_prune_atoms_per_tick": 0,
+            "compact_idempotency_after_seconds": None,
+            "pressure_compact_idempotency_after_seconds": None,
+            "journal_compaction": {"enabled": False},
+            "sqlite_compaction": {
+                "checkpoint_wal": False,
+                "incremental_vacuum": False,
+                "vacuum": False,
+            },
+        },
+    )
+
+    first = amos.run_memory_policy(trigger="storage_pressure_test")
+
+    assert first["status"] == "completed"
+    assert first["execution_plan"] == {
+        "semantic_maintenance": False,
+        "lifecycle_maintenance": True,
+        "storage_cleanup": True,
+        "reasons": ["capacity_pressure:red", "storage_cleanup_pressure"],
+        "rebuild_indexes": False,
+        "invalidate_packet_cache": False,
+    }
+    assert "storage_cleanup" in first["results"]
+    assert "reference_contracts" not in first["results"]
+    assert "smp" not in first["results"]
+    assert "steward" not in first["results"]
+    assert "maintenance_distiller" not in first["results"]
+    assert "index" not in first["results"]
+
+    first_state = amos.memory_policy_status()["state"]
+    semantic_anchor = first_state["last_semantic_run_at"]
+    assert semantic_anchor
+    second = amos.run_memory_policy(trigger="storage_pressure_test_again")
+    second_state = amos.memory_policy_status()["state"]
+    assert second["execution_plan"]["semantic_maintenance"] is False
+    assert second["results"]["storage_cleanup"]["atom_scan"] == {
+        "attempted": False,
+        "candidate_count": 0,
+        "deleted_atom_count": 0,
+        "noop": False,
+        "deferred_by_backoff": True,
+        "elapsed_seconds": pytest.approx(0, abs=1),
+        "min_interval_seconds": 600,
+        "prior_noop_streak": 1,
+    }
+    assert second_state["last_semantic_run_at"] == semantic_anchor
 
 
 def test_automatic_memory_policy_prioritizes_outcome_evidence_over_directives(amos):

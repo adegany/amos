@@ -169,6 +169,23 @@ def test_http_v1_endpoints_smoke(tmp_path):
             },
         )
         assert committed["status"] == "committed"
+        exact_batch = http_json(
+            f"{base}/v1/canonical-records:batch-get",
+            {
+                "profile": "amos.canonical-record-batch.v1",
+                "atom_ids": ["http_atom", "missing_http_atom"],
+                "heads": [],
+                "scope": {},
+                "requester": "system",
+                "target_processor": "http-smoke",
+                "include_archived": True,
+                "include_low_health": True,
+                "include_superseded": True,
+            },
+        )
+        assert exact_batch["status"] == "completed"
+        assert exact_batch["items_by_id"]["http_atom"]["id"] == "http_atom"
+        assert exact_batch["atoms"][1]["reason"] == "not_found"
         updated = http_json(
             f"{base}/v1/atoms:update",
             {
@@ -928,6 +945,53 @@ def test_http_maintenance_admission_respects_request_deadline(tmp_path):
         assert payload["retryable"] is True
     finally:
         server.maintenance_lock.release()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_maintenance_lease_defers_and_then_releases_policy(tmp_path):
+    db_path = str(tmp_path / "http_maintenance_lease.sqlite3")
+    try:
+        server = AmosHTTPServer(("127.0.0.1", 0), db_path)
+    except PermissionError as exc:
+        pytest.skip(f"loopback sockets unavailable in this sandbox: {exc}")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        lease = http_json(
+            f"{base}/v1/maintenance-leases:acquire",
+            {
+                "profile": "amos.maintenance-lease.v1",
+                "owner_ref": "ent:agent:cogito:runtime-boot",
+                "reason": "canonical_runtime_boot_recovery",
+                "ttl_seconds": 30,
+            },
+        )
+        assert lease["status"] == "acquired"
+        assert http_json(f"{base}/v1/maintenance-leases")["status"] == "held"
+
+        with pytest.raises(urllib.error.HTTPError) as deferred:
+            http_json(
+                f"{base}/v1/memory-policy:run",
+                {"force": True, "trigger": "lease_contract_test"},
+            )
+        assert deferred.value.code == 503
+        payload = json.loads(deferred.value.read().decode("utf-8"))
+        assert payload["code"] == "maintenance_lease_active"
+        assert payload["retryable"] is True
+
+        released = http_json(
+            f"{base}/v1/maintenance-leases:release",
+            {
+                "profile": "amos.maintenance-lease.v1",
+                "lease_id": lease["lease_id"],
+            },
+        )
+        assert released["status"] == "released"
+        assert http_json(f"{base}/v1/maintenance-leases")["status"] == "open"
+    finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)

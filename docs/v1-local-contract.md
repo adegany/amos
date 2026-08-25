@@ -726,6 +726,19 @@ POST /v1/atoms:get
   visibility checks
   queues a background policy tick when run_policy is true
 
+POST /v1/canonical-records:batch-get
+  returns at most 2048 exact atom statuses and 1024 canonical heads from one
+  revision-pinned read snapshot
+  returns each visible atom payload once in items_by_id and preserves the same
+  scope, access, lifecycle, health, and supersession boundaries as exact reads
+  does not invoke associative ranking or schedule memory policy work
+
+POST /v1/maintenance-leases:acquire|renew|release
+  lets a foreground recovery phase defer new maintenance starts with an opaque,
+  bounded, expiring lease; duplicate owner/reason acquisition replaces the old
+  lease and a crashed holder self-releases on expiry
+  preserves queued worker requests for execution after the lease is released
+
 POST /v1/reasoning-frames:compile
   accepts need, purpose, depth, task_context, trusted scope and a token/byte budget
   compiles complete relational units rather than a fixed count of ranked atoms
@@ -1130,6 +1143,14 @@ maintenance evidence window:
 retrieval policy scheduling:
   packet retrieval may enqueue policy work but should not block on SMP,
   stewardship, distillation, index refresh, or cache invalidation in HTTP mode
+
+component scheduling:
+  storage pressure may run bounded cleanup and lifecycle work without invoking
+  semantic repair, SMP, stewardship, distillation, or a full index rebuild
+  cleanup and semantic clocks advance independently, so frequent cleanup cannot
+  postpone periodic semantic maintenance
+  repeated no-op retention scans back off independently from bounded index,
+  idempotency, journal, checkpoint, and incremental-vacuum housekeeping
 
 health reporting:
   reports graph size, event count, edge count, pressure, stale indexes,
