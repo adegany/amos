@@ -920,6 +920,88 @@ def test_memory_policy_protects_and_repairs_current_memory_heads(amos):
     assert amos.verify_replay()["status"] == "ok"
 
 
+def test_memory_policy_keeps_terminal_initiative_heads_out_of_hot_memory(amos):
+    scope = {"tenant": "terminal-head"}
+    terminal_payload = {
+        "profile": "cogito.internal-initiative.v1",
+        "goal_ref": "initiative:terminal",
+        "initiative_ref": "initiative:terminal",
+        "revision": 1,
+        "objective": "Complete one bounded initiative",
+        "summary": "The initiative is closed",
+        "status": "closed",
+        "lifecycle_stage": "closed",
+        "frontier_status": "closed",
+    }
+    amos.commit_memory_transaction(
+        scope=scope,
+        actor="terminal-head-test",
+        idempotency_key="terminal-head-seed",
+        atoms=[
+            {
+                "id": "legacy_terminal_initiative_head",
+                "type": "goal",
+                "payload": terminal_payload,
+            },
+            {
+                "id": "declared_terminal_initiative_head",
+                "type": "goal",
+                "payload": {
+                    **terminal_payload,
+                    "goal_ref": "initiative:declared-terminal",
+                    "initiative_ref": "initiative:declared-terminal",
+                },
+                "lifecycle_state": "archived",
+                "health_status": "healthy",
+                "decay_policy": {"retain_archived_head": True},
+            },
+        ],
+        head_updates=[
+            {
+                "series_kind": "goal_work",
+                "series_id": "initiative:terminal",
+                "expected_head_ref": None,
+                "expected_head_version": 0,
+                "new_head_ref": "legacy_terminal_initiative_head",
+            },
+            {
+                "series_kind": "goal_work",
+                "series_id": "initiative:declared-terminal",
+                "expected_head_ref": None,
+                "expected_head_version": 0,
+                "new_head_ref": "declared_terminal_initiative_head",
+            },
+        ],
+    )
+    amos.configure_memory_policy(
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": True, "max_atoms": 10},
+        storage_cleanup={"enabled": False},
+    )
+
+    result = amos.run_memory_policy(force=True, trigger="terminal-head-test")
+
+    assert amos.store.get_atom(
+        "legacy_terminal_initiative_head"
+    )["lifecycle_state"] == "archived"
+    assert amos.store.get_atom(
+        "declared_terminal_initiative_head"
+    )["lifecycle_state"] == "archived"
+    assert any(
+        action["atom_ref"] == "legacy_terminal_initiative_head"
+        and action["reason"] == "terminal_current_head"
+        for action in result["results"]["decay"]["actions"]
+    )
+    assert not any(
+        action["atom_ref"] == "declared_terminal_initiative_head"
+        and action["action"] == "restore"
+        for action in result["results"]["decay"]["actions"]
+    )
+    assert amos.verify_replay()["status"] == "ok"
+
+
 def test_memory_policy_archives_proposal_after_explicit_retention_window(amos):
     old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat().replace(
         "+00:00", "Z"

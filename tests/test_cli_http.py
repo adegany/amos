@@ -359,6 +359,95 @@ def test_http_full_health_does_not_block_inventory_health(tmp_path):
         thread.join(timeout=2)
 
 
+def test_http_full_health_does_not_block_capacity_health(tmp_path):
+    db_path = str(tmp_path / "http_capacity_health_lane.sqlite3")
+    try:
+        server = AmosHTTPServer(("127.0.0.1", 0), db_path)
+    except PermissionError as exc:
+        pytest.skip(f"loopback sockets unavailable in this sandbox: {exc}")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_health(*, run_policy=True):
+        entered.set()
+        assert release.wait(timeout=2)
+        return {"atoms": 0}
+
+    server.health_amos.health_memory = slow_health
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    full_health_thread = threading.Thread(
+        target=lambda: http_json(f"{base}/v1/health/memory"),
+        daemon=True,
+    )
+    try:
+        full_health_thread.start()
+        assert entered.wait(timeout=1)
+        started = time.monotonic()
+        capacity = http_json(f"{base}/v1/health/capacity")
+        assert time.monotonic() - started < 1
+        assert capacity["graph_version"] == 0
+        release.set()
+        full_health_thread.join(timeout=2)
+        assert full_health_thread.is_alive() is False
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_inventory_stale_while_refresh_is_nonblocking_and_marked(
+    tmp_path, monkeypatch,
+):
+    db_path = str(tmp_path / "http_inventory_cache.sqlite3")
+    try:
+        server = AmosHTTPServer(("127.0.0.1", 0), db_path)
+    except PermissionError as exc:
+        pytest.skip(f"loopback sockets unavailable in this sandbox: {exc}")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    refresh_entered = threading.Event()
+    release_refresh = threading.Event()
+    original = Amos.health_memory_inventory
+
+    def slow_inventory(service):
+        refresh_entered.set()
+        assert release_refresh.wait(timeout=2)
+        return original(service)
+
+    try:
+        initial = http_json(f"{base}/v1/health/memory-inventory")
+        assert initial["diagnostic_cache"]["consistency"] == "exact"
+        with server.inventory_cache_lock:
+            server.inventory_cache_at_monotonic = (
+                time.monotonic() - server.INVENTORY_CACHE_TTL_SECONDS - 1
+            )
+        monkeypatch.setattr(Amos, "health_memory_inventory", slow_inventory)
+        started = time.monotonic()
+        cached = http_json(
+            f"{base}/v1/health/memory-inventory",
+            headers={
+                "X-AMOS-Diagnostic-Consistency": "stale-while-refresh",
+            },
+        )
+        assert time.monotonic() - started < 1
+        assert cached["diagnostic_cache"]["consistency"] == "cached"
+        assert cached["diagnostic_cache"]["freshness"] == "stale"
+        assert cached["diagnostic_cache"]["refreshing"] is True
+        assert refresh_entered.wait(timeout=1)
+    finally:
+        release_refresh.set()
+        refresh = server.inventory_refresh_thread
+        if refresh is not None:
+            refresh.join(timeout=2)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_http_heavy_retrievals_reserve_two_general_request_lanes(tmp_path):
     db_path = str(tmp_path / "http_heavy_reservation.sqlite3")
     try:

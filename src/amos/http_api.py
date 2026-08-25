@@ -235,6 +235,7 @@ class AmosHTTPServer(ThreadingHTTPServer):
     REQUEST_SERVICE_COUNT = 4
     HEAVY_REQUEST_CAPACITY = 2
     DEFAULT_REQUEST_DEADLINE_SECONDS = 30.0
+    INVENTORY_CACHE_TTL_SECONDS = 60.0
     HEAVY_PATHS = frozenset({
         "/v1/packets:retrieve",
         "/v1/cognitive-workspaces:compile",
@@ -285,7 +286,15 @@ class AmosHTTPServer(ThreadingHTTPServer):
             db_path,
             maintenance_processor_paths=self.maintenance_processor_paths,
         )
+        self.capacity_amos = Amos(
+            db_path,
+            maintenance_processor_paths=self.maintenance_processor_paths,
+        )
         self.inventory_amos = Amos(
+            db_path,
+            maintenance_processor_paths=self.maintenance_processor_paths,
+        )
+        self.inventory_refresh_amos = Amos(
             db_path,
             maintenance_processor_paths=self.maintenance_processor_paths,
         )
@@ -294,7 +303,13 @@ class AmosHTTPServer(ThreadingHTTPServer):
             maintenance_processor_paths=self.maintenance_processor_paths,
         )
         self.health_lock = threading.Lock()
+        self.capacity_lock = threading.Lock()
         self.inventory_lock = threading.Lock()
+        self.inventory_cache_lock = threading.Lock()
+        self.inventory_cache: dict[str, Any] | None = None
+        self.inventory_cache_at_monotonic: float | None = None
+        self.inventory_cache_at_epoch_seconds: float | None = None
+        self.inventory_refresh_thread: threading.Thread | None = None
         self.ready_lock = threading.Lock()
         self.maintenance_amos = Amos(
             db_path,
@@ -314,10 +329,126 @@ class AmosHTTPServer(ThreadingHTTPServer):
         self.closing = False
         super().__init__(server_address, make_handler())
 
+    def _publish_inventory_cache(self, payload: Mapping[str, Any]) -> float:
+        """Publish one immutable operational sample for opt-in UI reads."""
+
+        sampled_at_epoch_seconds = time.time()
+        with self.inventory_cache_lock:
+            self.inventory_cache = dict(payload)
+            self.inventory_cache_at_monotonic = time.monotonic()
+            self.inventory_cache_at_epoch_seconds = sampled_at_epoch_seconds
+        return sampled_at_epoch_seconds
+
+    def inventory_health_payload(self, amos: Amos) -> dict[str, Any]:
+        """Compute and cache one exact inventory diagnostic."""
+
+        payload = amos.health_memory_inventory()
+        payload["background_policy_worker"] = self.memory_policy_worker.status()
+        sampled_at_epoch_seconds = self._publish_inventory_cache(payload)
+        return {
+            **payload,
+            "diagnostic_cache": {
+                "consistency": "exact",
+                "freshness": "fresh",
+                "age_seconds": 0.0,
+                "sampled_at_epoch_seconds": sampled_at_epoch_seconds,
+                "refreshing": False,
+                "ttl_seconds": self.INVENTORY_CACHE_TTL_SECONDS,
+            },
+        }
+
+    def _refresh_inventory_cache(self) -> None:
+        """Refresh a stale UI sample without occupying a request handler."""
+
+        try:
+            if not self.inventory_lock.acquire(
+                timeout=self.DEFAULT_REQUEST_DEADLINE_SECONDS
+            ):
+                return
+            try:
+                with self.service_lock:
+                    if self.closing:
+                        return
+                payload = self.inventory_refresh_amos.health_memory_inventory()
+                payload["background_policy_worker"] = (
+                    self.memory_policy_worker.status()
+                )
+                with self.service_lock:
+                    closing = self.closing
+                if not closing:
+                    self._publish_inventory_cache(payload)
+            finally:
+                self.inventory_lock.release()
+        finally:
+            with self.inventory_cache_lock:
+                if self.inventory_refresh_thread is threading.current_thread():
+                    self.inventory_refresh_thread = None
+            with self.service_lock:
+                closing = self.closing
+            if closing:
+                self.inventory_refresh_amos.close()
+
+    def cached_inventory_health(self) -> dict[str, Any] | None:
+        """Return a marked sample and asynchronously refresh it when stale."""
+
+        with self.inventory_cache_lock:
+            cached = (
+                dict(self.inventory_cache)
+                if self.inventory_cache is not None
+                else None
+            )
+            sampled_at = self.inventory_cache_at_monotonic
+            sampled_at_epoch_seconds = self.inventory_cache_at_epoch_seconds
+            if (
+                cached is None
+                or sampled_at is None
+                or sampled_at_epoch_seconds is None
+            ):
+                return None
+            age = max(0.0, time.monotonic() - sampled_at)
+            stale = age >= self.INVENTORY_CACHE_TTL_SECONDS
+            refreshing = bool(
+                self.inventory_refresh_thread is not None
+                and self.inventory_refresh_thread.is_alive()
+            )
+        if stale and not refreshing:
+            with self.service_lock:
+                closing = self.closing
+            if not closing:
+                with self.inventory_cache_lock:
+                    refreshing = bool(
+                        self.inventory_refresh_thread is not None
+                        and self.inventory_refresh_thread.is_alive()
+                    )
+                    if not refreshing:
+                        worker = threading.Thread(
+                            target=self._refresh_inventory_cache,
+                            name="amos-inventory-cache-refresh",
+                            daemon=True,
+                        )
+                        self.inventory_refresh_thread = worker
+                        refreshing = True
+                        worker.start()
+        return {
+            **cached,
+            "diagnostic_cache": {
+                "consistency": "cached",
+                "freshness": "stale" if stale else "fresh",
+                "age_seconds": round(age, 3),
+                "sampled_at_epoch_seconds": sampled_at_epoch_seconds,
+                "refreshing": refreshing,
+                "ttl_seconds": self.INVENTORY_CACHE_TTL_SECONDS,
+            },
+        }
+
     def server_close(self) -> None:
-        self.memory_policy_worker.stop(timeout=30.0)
         with self.service_lock:
             self.closing = True
+        self.memory_policy_worker.stop(timeout=30.0)
+        with self.inventory_cache_lock:
+            inventory_refresh = self.inventory_refresh_thread
+        if inventory_refresh is not None and inventory_refresh.is_alive():
+            inventory_refresh.join(timeout=30.0)
         try:
             super().server_close()
         finally:
@@ -326,7 +457,13 @@ class AmosHTTPServer(ThreadingHTTPServer):
             with self.service_lock:
                 self.policy_worker_amos.close()
                 self.health_amos.close()
+                self.capacity_amos.close()
                 self.inventory_amos.close()
+                if (
+                    inventory_refresh is None
+                    or not inventory_refresh.is_alive()
+                ):
+                    self.inventory_refresh_amos.close()
                 self.ready_amos.close()
                 for service in self.request_services:
                     service.close()
@@ -430,9 +567,7 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         )
                     finally:
                         server.ready_lock.release()
-                if method == "GET" and path in {
-                    "/v1/health/memory", "/v1/health/capacity",
-                }:
+                if method == "GET" and path == "/v1/health/memory":
                     if not server.health_lock.acquire(timeout=remaining):
                         return self._write_saturated()
                     try:
@@ -441,7 +576,22 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         )
                     finally:
                         server.health_lock.release()
+                if method == "GET" and path == "/v1/health/capacity":
+                    if not server.capacity_lock.acquire(timeout=remaining):
+                        return self._write_saturated()
+                    try:
+                        return self._dispatch(
+                            server, method, body, amos=server.capacity_amos
+                        )
+                    finally:
+                        server.capacity_lock.release()
                 if method == "GET" and path == "/v1/health/memory-inventory":
+                    if str(
+                        self.headers.get("X-AMOS-Diagnostic-Consistency") or ""
+                    ).casefold() == "stale-while-refresh":
+                        cached = server.cached_inventory_health()
+                        if cached is not None:
+                            return self._write_json(cached)
                     if not server.inventory_lock.acquire(timeout=remaining):
                         return self._write_saturated()
                     try:
@@ -638,11 +788,9 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                     )
                     return self._write_json(payload)
                 if path == "/v1/health/memory-inventory":
-                    payload = amos.health_memory_inventory()
-                    payload["background_policy_worker"] = (
-                        server.memory_policy_worker.status()
+                    return self._write_json(
+                        server.inventory_health_payload(amos)
                     )
-                    return self._write_json(payload)
                 if path == "/v1/health/capacity":
                     payload = amos.health_capacity()
                     payload["request_admission"] = {

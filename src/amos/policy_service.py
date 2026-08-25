@@ -2714,6 +2714,33 @@ class PolicyService:
         }
 
 
+    @staticmethod
+    def _terminal_current_head_archive_allowed(
+        atom: Mapping[str, Any],
+    ) -> bool:
+        """Return whether a canonical head deliberately represents terminal state.
+
+        Canonical-head protection preserves the identity of a series; it does
+        not require the terminal head itself to remain in the hot set.  New
+        writers declare that intent explicitly.  The typed initiative profile
+        is retained as a narrow migration rule for terminal heads authored
+        before that flag existed.
+        """
+
+        atom_policy = atom.get("decay_policy")
+        atom_policy = atom_policy if isinstance(atom_policy, Mapping) else {}
+        if atom_policy.get("retain_archived_head") is True:
+            return True
+        payload = atom.get("payload")
+        payload = payload if isinstance(payload, Mapping) else {}
+        return bool(
+            str(atom.get("type") or "") == "goal"
+            and payload.get("profile") == "cogito.internal-initiative.v1"
+            and str(payload.get("status") or "") == "closed"
+            and str(payload.get("lifecycle_stage") or "") == "closed"
+            and str(payload.get("frontier_status") or "") == "closed"
+        )
+
     def _run_decay_policy(
         self,
         *,
@@ -2746,11 +2773,27 @@ class PolicyService:
         # event. The protection follows the current head dynamically and does
         # not pin predecessors.
         restoration_plans: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        terminal_head_plans: list[
+            tuple[dict[str, Any], dict[str, Any]]
+        ] = []
         for head_ref in sorted(current_head_refs):
             atom = self.store.get_atom(head_ref)
             if atom is None or atom.get("deleted"):
                 continue
-            if atom.get("lifecycle_state") != "archived":
+            terminal_archive = self._terminal_current_head_archive_allowed(atom)
+            if atom.get("lifecycle_state") == "active" and terminal_archive:
+                terminal_head_plans.append(
+                    (
+                        atom,
+                        {
+                            "action": "archive",
+                            "reason": "terminal_current_head",
+                            "health_status": "healthy",
+                        },
+                    )
+                )
+                continue
+            if atom.get("lifecycle_state") != "archived" or terminal_archive:
                 continue
             restoration_plans.append(
                 (
@@ -2779,8 +2822,12 @@ class PolicyService:
         ):
             atoms_by_ref[atom["id"]] = atom
         atoms = list(atoms_by_ref.values())
-        planned: list[tuple[dict[str, Any], dict[str, Any]]] = []
-        planned_archives: set[str] = set()
+        planned: list[tuple[dict[str, Any], dict[str, Any]]] = list(
+            terminal_head_plans
+        )
+        planned_archives: set[str] = {
+            str(atom["id"]) for atom, _action in terminal_head_plans
+        }
         edge_degrees = self.store.edge_degree_counts()
         current_plugin_digests: dict[str, str] = {}
         for atom in atoms:
@@ -3122,7 +3169,11 @@ class PolicyService:
                                 or current.get("lifecycle_state") != "archived"
                             )
                         )
-                        or (action["action"] != "restore" and is_current_head)
+                        or (
+                            action["action"] != "restore"
+                            and is_current_head
+                            and action.get("reason") != "terminal_current_head"
+                        )
                     ):
                         skipped_stale_plans += 1
                         continue
