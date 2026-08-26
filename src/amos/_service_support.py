@@ -69,6 +69,7 @@ DEFAULT_MEMORY_POLICY = {
         "every_seconds": 300,
         "run_on_pressure": True,
         "pressure_min_interval_seconds": 300,
+        "pressure_catchup_interval_seconds": 60,
     },
     "maintenance": {
         "enabled": True,
@@ -126,6 +127,7 @@ DEFAULT_MEMORY_POLICY = {
         "proposal_pressure_min_age_seconds": 3600,
         "archive_proposed_after_seconds": None,
         "pressure_max_archives_per_run": 256,
+        "pressure_low_water_ratio": 0.8,
         "pressure_protected_types": [
             "adjudication",
             "commitment",
@@ -148,6 +150,7 @@ DEFAULT_MEMORY_POLICY = {
         "run_on_pressure": True,
         "pressure_modes": ["orange", "red"],
         "pressure_min_interval_seconds": 300,
+        "pressure_catchup_interval_seconds": 60,
         "idle_after_seconds": 300,
         "min_interval_seconds": 900,
         "max_deletions_per_tick": 256,

@@ -1185,8 +1185,12 @@ class Amos:
     def health_memory(self, *, run_policy: bool = True) -> dict[str, Any]:
         return self.diagnostics.health_memory(run_policy=run_policy)
 
-    def health_memory_inventory(self) -> dict[str, Any]:
-        return self.diagnostics.health_memory_inventory()
+    def health_memory_inventory(
+        self, *, include_integrity: bool = True
+    ) -> dict[str, Any]:
+        return self.diagnostics.health_memory_inventory(
+            include_integrity=include_integrity
+        )
 
     def health_capacity(self) -> dict[str, Any]:
         return self.diagnostics.health_capacity()

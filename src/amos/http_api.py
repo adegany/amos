@@ -294,6 +294,10 @@ class AmosHTTPServer(ThreadingHTTPServer):
             db_path,
             maintenance_processor_paths=self.maintenance_processor_paths,
         )
+        self.inventory_summary_amos = Amos(
+            db_path,
+            maintenance_processor_paths=self.maintenance_processor_paths,
+        )
         self.inventory_refresh_amos = Amos(
             db_path,
             maintenance_processor_paths=self.maintenance_processor_paths,
@@ -305,6 +309,7 @@ class AmosHTTPServer(ThreadingHTTPServer):
         self.health_lock = threading.Lock()
         self.capacity_lock = threading.Lock()
         self.inventory_lock = threading.Lock()
+        self.inventory_summary_lock = threading.Lock()
         self.inventory_cache_lock = threading.Lock()
         self.inventory_cache: dict[str, Any] | None = None
         self.inventory_cache_at_monotonic: float | None = None
@@ -390,8 +395,30 @@ class AmosHTTPServer(ThreadingHTTPServer):
             if closing:
                 self.inventory_refresh_amos.close()
 
-    def cached_inventory_health(self) -> dict[str, Any] | None:
-        """Return a marked sample and asynchronously refresh it when stale."""
+    def _ensure_inventory_refresh(self) -> bool:
+        """Start one exact refresh without making the requesting thread wait."""
+
+        with self.service_lock:
+            if self.closing:
+                return False
+        with self.inventory_cache_lock:
+            refreshing = bool(
+                self.inventory_refresh_thread is not None
+                and self.inventory_refresh_thread.is_alive()
+            )
+            if refreshing:
+                return True
+            worker = threading.Thread(
+                target=self._refresh_inventory_cache,
+                name="amos-inventory-cache-refresh",
+                daemon=True,
+            )
+            self.inventory_refresh_thread = worker
+            worker.start()
+            return True
+
+    def cached_inventory_health(self) -> dict[str, Any]:
+        """Return a bounded sample while exact integrity refreshes in background."""
 
         with self.inventory_cache_lock:
             cached = (
@@ -406,35 +433,69 @@ class AmosHTTPServer(ThreadingHTTPServer):
                 or sampled_at is None
                 or sampled_at_epoch_seconds is None
             ):
-                return None
-            age = max(0.0, time.monotonic() - sampled_at)
-            stale = age >= self.INVENTORY_CACHE_TTL_SECONDS
-            refreshing = bool(
-                self.inventory_refresh_thread is not None
-                and self.inventory_refresh_thread.is_alive()
-            )
-        if stale and not refreshing:
-            with self.service_lock:
-                closing = self.closing
-            if not closing:
-                with self.inventory_cache_lock:
-                    refreshing = bool(
-                        self.inventory_refresh_thread is not None
-                        and self.inventory_refresh_thread.is_alive()
-                    )
-                    if not refreshing:
-                        worker = threading.Thread(
-                            target=self._refresh_inventory_cache,
-                            name="amos-inventory-cache-refresh",
-                            daemon=True,
+                missing = True
+                age = 0.0
+                stale = True
+                refreshing = False
+            else:
+                missing = False
+                age = max(0.0, time.monotonic() - sampled_at)
+                stale = age >= self.INVENTORY_CACHE_TTL_SECONDS
+                refreshing = bool(
+                    self.inventory_refresh_thread is not None
+                    and self.inventory_refresh_thread.is_alive()
+                )
+        if missing:
+            refreshing = self._ensure_inventory_refresh()
+            sampled_at_epoch_seconds = time.time()
+            if self.inventory_summary_lock.acquire(timeout=1.0):
+                try:
+                    try:
+                        cached = (
+                            self.inventory_summary_amos.health_memory_inventory(
+                                include_integrity=False
+                            )
                         )
-                        self.inventory_refresh_thread = worker
-                        refreshing = True
-                        worker.start()
+                        cached["background_policy_worker"] = (
+                            self.memory_policy_worker.status()
+                        )
+                    except (AmosError, RuntimeError, sqlite3.Error, ValueError) as exc:
+                        cached = {
+                            "profile": "amos.memory-inventory-health.v1",
+                            "diagnostic_scope": "refresh_pending",
+                            "graph_version": (
+                                self.inventory_summary_amos.store.graph_version()
+                            ),
+                            "quality": {
+                                "status": "refreshing",
+                                "warnings": [
+                                    "inventory_summary_temporarily_unavailable"
+                                ],
+                                "integrity_exact": False,
+                            },
+                            "diagnostic_error": (
+                                f"{type(exc).__name__}: {exc}"
+                            )[:1000],
+                        }
+                finally:
+                    self.inventory_summary_lock.release()
+            else:
+                cached = {
+                    "profile": "amos.memory-inventory-health.v1",
+                    "diagnostic_scope": "refresh_pending",
+                    "graph_version": self.inventory_summary_amos.store.graph_version(),
+                    "quality": {
+                        "status": "refreshing",
+                        "warnings": ["inventory_summary_admission_deferred"],
+                        "integrity_exact": False,
+                    },
+                }
+        if stale and not refreshing:
+            refreshing = self._ensure_inventory_refresh()
         return {
-            **cached,
+            **dict(cached or {}),
             "diagnostic_cache": {
-                "consistency": "cached",
+                "consistency": "bounded-summary" if missing else "cached",
                 "freshness": "stale" if stale else "fresh",
                 "age_seconds": round(age, 3),
                 "sampled_at_epoch_seconds": sampled_at_epoch_seconds,
@@ -461,6 +522,7 @@ class AmosHTTPServer(ThreadingHTTPServer):
                 self.health_amos.close()
                 self.capacity_amos.close()
                 self.inventory_amos.close()
+                self.inventory_summary_amos.close()
                 if (
                     inventory_refresh is None
                     or not inventory_refresh.is_alive()

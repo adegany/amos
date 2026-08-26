@@ -465,6 +465,53 @@ def test_http_inventory_stale_while_refresh_is_nonblocking_and_marked(
         thread.join(timeout=2)
 
 
+def test_http_cold_inventory_cache_returns_bounded_summary_while_refreshing(
+    tmp_path, monkeypatch,
+):
+    db_path = str(tmp_path / "http_inventory_cold_cache.sqlite3")
+    try:
+        server = AmosHTTPServer(("127.0.0.1", 0), db_path)
+    except PermissionError as exc:
+        pytest.skip(f"loopback sockets unavailable in this sandbox: {exc}")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    refresh_entered = threading.Event()
+    release_refresh = threading.Event()
+    original = Amos.health_memory_inventory
+
+    def slow_exact_inventory(service, *, include_integrity=True):
+        if include_integrity:
+            refresh_entered.set()
+            assert release_refresh.wait(timeout=2)
+        return original(service, include_integrity=include_integrity)
+
+    monkeypatch.setattr(Amos, "health_memory_inventory", slow_exact_inventory)
+    try:
+        started = time.monotonic()
+        summary = http_json(
+            f"{base}/v1/health/memory-inventory",
+            headers={
+                "X-AMOS-Diagnostic-Consistency": "stale-while-refresh",
+            },
+        )
+        assert time.monotonic() - started < 1
+        assert summary["diagnostic_cache"]["consistency"] == "bounded-summary"
+        assert summary["diagnostic_cache"]["freshness"] == "stale"
+        assert summary["diagnostic_cache"]["refreshing"] is True
+        assert summary["quality"]["status"] == "refreshing"
+        assert summary["quality"]["integrity_exact"] is False
+        assert refresh_entered.wait(timeout=1)
+    finally:
+        release_refresh.set()
+        refresh = server.inventory_refresh_thread
+        if refresh is not None:
+            refresh.join(timeout=2)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_http_heavy_retrievals_reserve_two_general_request_lanes(tmp_path):
     db_path = str(tmp_path / "http_heavy_reservation.sqlite3")
     try:

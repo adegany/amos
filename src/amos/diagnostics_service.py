@@ -77,8 +77,10 @@ class DiagnosticsService:
                 "last_policy_tick": policy_tick,
             }
 
-    def health_memory_inventory(self) -> dict[str, Any]:
-        """Return exact operational counters without loading graph records."""
+    def health_memory_inventory(
+        self, *, include_integrity: bool = True
+    ) -> dict[str, Any]:
+        """Return bounded counters, optionally including the deep integrity scan."""
 
         policy = self.memory_policy()
         decay = dict(policy.get("decay") or {})
@@ -88,7 +90,17 @@ class DiagnosticsService:
             indexes = self.store.list_derived_index_metadata()
             by_type = self.store.atom_counts_by("type")
             by_lifecycle = self.store.atom_counts_by("lifecycle_state")
-            integrity = self.store.memory_integrity_summary()
+            integrity = (
+                self.store.memory_integrity_summary()
+                if include_integrity
+                else {
+                    "active_superseded_atoms": 0,
+                    "isolated_active_atoms": 0,
+                    "exact_evidence_refs": 0,
+                    "mistyped_atom_refs": 0,
+                    "unresolved_refs": 0,
+                }
+            )
             active_count = int(by_lifecycle.get("active") or 0)
             proposed_count = int(by_lifecycle.get("proposed") or 0)
             hot_count = active_count + proposed_count
@@ -133,6 +145,8 @@ class DiagnosticsService:
                 schedule.get("every_graph_versions", 25) or 25
             )
             warnings: list[str] = []
+            if not include_integrity:
+                warnings.append("integrity_diagnostics_refreshing")
             if hot_count > hot_limit:
                 warnings.append("active_atom_count_exceeds_decay_max_atoms")
             if near_limit:
@@ -153,7 +167,11 @@ class DiagnosticsService:
                 warnings.append("derived_index_lag_exceeds_schedule")
             return {
                 "profile": "amos.memory-inventory-health.v1",
-                "diagnostic_scope": "operational_inventory",
+                "diagnostic_scope": (
+                    "operational_inventory"
+                    if include_integrity
+                    else "operational_inventory_without_integrity"
+                ),
                 "graph_version": graph_version,
                 "journal_events": self.store.event_count(),
                 "memory_heads": len(self.store.list_memory_heads()),
@@ -163,7 +181,14 @@ class DiagnosticsService:
                 "by_lifecycle": by_lifecycle,
                 "projection_lag": 0,
                 "quality": {
-                    "status": "warning" if warnings else "ok",
+                    "status": (
+                        "refreshing"
+                        if not include_integrity
+                        else "warning"
+                        if warnings
+                        else "ok"
+                    ),
+                    "integrity_exact": bool(include_integrity),
                     "warnings": warnings,
                     "hot_atom_count": hot_count,
                     "hot_atom_limit": hot_limit,

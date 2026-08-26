@@ -383,6 +383,9 @@ class PolicyService:
                     decay=decay,
                     scope=scope,
                     actor=actor,
+                    pressure_catchup=(
+                        "memory_atom_pressure:catchup" in due_reasons
+                    ),
                 )
                 target_refs.extend(
                     action["atom_ref"]
@@ -510,6 +513,26 @@ class PolicyService:
                 next_atom_scan_pressure_mode = state.get(
                     "last_storage_atom_scan_pressure_mode"
                 )
+            if decay["enabled"]:
+                lifecycle_catchup_pending = bool(
+                    results.get("decay", {})
+                    .get("pressure", {})
+                    .get(
+                        "catchup_pending",
+                        state.get("lifecycle_catchup_pending", False),
+                    )
+                )
+            else:
+                lifecycle_catchup_pending = False
+            if storage_cleanup["enabled"]:
+                storage_cleanup_catchup_pending = bool(
+                    results.get("storage_cleanup", {}).get(
+                        "catchup_pending",
+                        state.get("storage_cleanup_catchup_pending", False),
+                    )
+                )
+            else:
+                storage_cleanup_catchup_pending = False
             with self.store.transaction() as conn:
                 # Foreground commits may run between bounded maintenance
                 # phases. Derive the final event revision only after this
@@ -599,6 +622,12 @@ class PolicyService:
                                 if committed.get("atom")
                             ],
                             "steward_cursor": steward_cursor,
+                            "lifecycle_catchup_pending": (
+                                lifecycle_catchup_pending
+                            ),
+                            "storage_cleanup_catchup_pending": (
+                                storage_cleanup_catchup_pending
+                            ),
                             "last_storage_cleanup_at": self.store.get_meta(
                                 "last_storage_cleanup_at"
                             ),
@@ -677,6 +706,10 @@ class PolicyService:
         schedule["pressure_min_interval_seconds"] = max(
             0,
             int(schedule.get("pressure_min_interval_seconds", 300) or 0),
+        )
+        schedule["pressure_catchup_interval_seconds"] = max(
+            0,
+            int(schedule.get("pressure_catchup_interval_seconds", 60) or 0),
         )
         maintenance = normalized["maintenance"]
         for key in [
@@ -792,6 +825,13 @@ class PolicyService:
             1,
             int(decay.get("pressure_max_archives_per_run", 256) or 256),
         )
+        decay["pressure_low_water_ratio"] = max(
+            0.1,
+            min(
+                1.0,
+                float(decay.get("pressure_low_water_ratio", 0.8) or 0.8),
+            ),
+        )
         decay["pressure_protected_types"] = sorted(
             {
                 str(item)
@@ -853,6 +893,7 @@ class PolicyService:
             ("idle_after_seconds", 300),
             ("min_interval_seconds", 900),
             ("pressure_min_interval_seconds", 300),
+            ("pressure_catchup_interval_seconds", 60),
             ("max_deletions_per_tick", 256),
             ("max_idempotency_compactions_per_tick", 512),
             ("write_batch_size", 32),
@@ -1030,6 +1071,8 @@ class PolicyService:
                 "last_distilled_refs": [],
                 "last_maintenance_distiller_refs": [],
                 "steward_cursor": None,
+                "lifecycle_catchup_pending": False,
+                "storage_cleanup_catchup_pending": False,
                 "last_storage_cleanup_at": self.store.get_meta(
                     "last_storage_cleanup_at"
                 ),
@@ -1070,6 +1113,12 @@ class PolicyService:
                 data.get("last_maintenance_distiller_refs", [])
             ),
             "steward_cursor": data.get("steward_cursor"),
+            "lifecycle_catchup_pending": bool(
+                data.get("lifecycle_catchup_pending", False)
+            ),
+            "storage_cleanup_catchup_pending": bool(
+                data.get("storage_cleanup_catchup_pending", False)
+            ),
             "last_storage_cleanup_at": self.store.get_meta("last_storage_cleanup_at")
             or data.get("last_storage_cleanup_at"),
             "last_storage_atom_scan_at": data.get(
@@ -1373,6 +1422,14 @@ class PolicyService:
             elapsed_seconds is None
             or elapsed_seconds >= pressure_min_interval_seconds
         )
+        pressure_catchup_interval_seconds = max(
+            0,
+            int(schedule.get("pressure_catchup_interval_seconds", 60) or 0),
+        )
+        pressure_catchup_interval_elapsed = (
+            elapsed_seconds is None
+            or elapsed_seconds >= pressure_catchup_interval_seconds
+        )
         pressure_mode = self._capacity_pressure_mode()
         if (
             schedule.get("run_on_pressure", True)
@@ -1381,12 +1438,12 @@ class PolicyService:
             and graph_delta > 0
         ):
             reasons.append(f"capacity_pressure:{pressure_mode}")
+        decay = dict(policy.get("decay") or {})
         if (
             schedule.get("run_on_pressure", True)
             and pressure_interval_elapsed
-            and graph_delta > 0
+            and decay.get("enabled", True)
         ):
-            decay = dict(policy.get("decay") or {})
             max_atoms = max(1, int(decay.get("max_atoms", 256) or 256))
             max_active_atoms = max(
                 1, int(decay.get("max_active_atoms", max_atoms) or max_atoms)
@@ -1401,12 +1458,19 @@ class PolicyService:
                 atom.get("lifecycle_state") == "active" for atom in hot_atoms
             )
             proposed_count = len(hot_atoms) - active_count
-            if len(hot_atoms) > max_atoms:
+            if len(hot_atoms) >= max_atoms:
                 reasons.append("memory_atom_pressure:hot")
-            if active_count > max_active_atoms:
+            if active_count >= max_active_atoms:
                 reasons.append("memory_atom_pressure:active")
-            if proposed_count > max_proposed_atoms:
+            if proposed_count >= max_proposed_atoms:
                 reasons.append("memory_atom_pressure:proposed")
+        if (
+            schedule.get("run_on_pressure", True)
+            and decay.get("enabled", True)
+            and state.get("lifecycle_catchup_pending", False)
+            and pressure_catchup_interval_elapsed
+        ):
+            reasons.append("memory_atom_pressure:catchup")
         storage_cleanup = self._storage_cleanup_due(
             policy.get("storage_cleanup", {}),
             state,
@@ -1430,8 +1494,16 @@ class PolicyService:
             "elapsed_seconds": elapsed_seconds,
             "semantic_elapsed_seconds": semantic_elapsed_seconds,
             "pressure_min_interval_seconds": pressure_min_interval_seconds,
+            "pressure_catchup_interval_seconds": (
+                pressure_catchup_interval_seconds
+            ),
             "pressure_cooldown_remaining_seconds": (
                 max(0, pressure_min_interval_seconds - elapsed_seconds)
+                if elapsed_seconds is not None
+                else 0
+            ),
+            "pressure_catchup_cooldown_remaining_seconds": (
+                max(0, pressure_catchup_interval_seconds - elapsed_seconds)
                 if elapsed_seconds is not None
                 else 0
             ),
@@ -1944,12 +2016,17 @@ class PolicyService:
             or state.get("last_storage_cleanup_at")
         )
         cleanup_elapsed = self._seconds_since(last_cleanup)
+        catchup_pending = bool(
+            state.get("storage_cleanup_catchup_pending", False)
+        )
         min_interval = int(
             cleanup.get(
-                "pressure_min_interval_seconds"
+                "pressure_catchup_interval_seconds"
+                if catchup_pending
+                else "pressure_min_interval_seconds"
                 if pressure_triggered
                 else "min_interval_seconds",
-                300 if pressure_triggered else 900,
+                60 if catchup_pending else 300 if pressure_triggered else 900,
             )
             or 0
         )
@@ -1973,6 +2050,10 @@ class PolicyService:
         )
         if previous_pressure_mode and previous_pressure_mode != pressure_mode:
             # Escalating pressure must immediately re-open candidate scanning.
+            no_op_streak = 0
+        if catchup_pending:
+            # A prior bounded pass proved that eligible work remains. Do not
+            # turn that known backlog into a no-op exponential backoff.
             no_op_streak = 0
         atom_scan_base_interval = max(
             0,
@@ -2004,6 +2085,7 @@ class PolicyService:
         )
         atom_scan_due = bool(
             force
+            or catchup_pending
             or atom_scan_elapsed is None
             or atom_scan_elapsed >= atom_scan_interval
         )
@@ -2012,12 +2094,15 @@ class PolicyService:
             "reason": (
                 "force"
                 if force
+                else "capacity_catchup"
+                if catchup_pending
                 else "capacity_pressure"
                 if pressure_triggered
                 else "idle_interval_elapsed"
             ),
             "pressure_mode": pressure_mode,
             "pressure_triggered": pressure_triggered,
+            "catchup_pending": catchup_pending,
             "idle_elapsed_seconds": idle_elapsed,
             "idle_after_seconds": idle_after,
             "last_foreground_activity_at": last_foreground,
@@ -2131,6 +2216,7 @@ class PolicyService:
         # Plan from a coherent read, then revalidate each candidate immediately
         # before mutation. The plan never holds SQLite's single-writer slot.
         candidates: list[dict[str, Any]] = []
+        eligible_candidate_count = 0
         protected_candidate_refs: set[str] = set()
         protected_refs_by_reason: dict[str, set[str]] = {
             "current_head": set(),
@@ -2173,11 +2259,13 @@ class PolicyService:
                 protected_candidate_refs.update(protection["refs"])
                 for reason, refs in protection["by_reason"].items():
                     protected_refs_by_reason.setdefault(reason, set()).update(refs)
-                candidates = [
+                unprotected_candidates = [
                     atom
                     for atom in eligible_candidates
                     if str(atom["id"]) not in protected_candidate_refs
-                ][:max_deletions]
+                ]
+                eligible_candidate_count = len(unprotected_candidates)
+                candidates = unprotected_candidates[:max_deletions]
 
         # Derived-index pruning is bounded by atom and yields between batches.
         # Keep it separate from canonical deletion batches so clients can enter
@@ -2560,6 +2648,17 @@ class PolicyService:
                 )
             except Exception as exc:
                 checkpoint_after_vacuum = {"status": "error", "error": str(exc)}
+        remaining_eligible_candidate_count = max(
+            0, eligible_candidate_count - len(actions)
+        )
+        catchup_pending = bool(
+            atom_scan_due
+            and (
+                remaining_eligible_candidate_count
+                or index_prune.get("limit_reached", False)
+            )
+        )
+        capacity_after = self.store.storage_usage()
         return {
             "status": "completed",
             "due": dict(due),
@@ -2594,6 +2693,10 @@ class PolicyService:
             "atom_scan": {
                 "attempted": atom_scan_due,
                 "candidate_count": len(candidates),
+                "eligible_candidate_count": eligible_candidate_count,
+                "remaining_eligible_candidate_count": (
+                    remaining_eligible_candidate_count
+                ),
                 "deleted_atom_count": len(actions),
                 "noop": atom_scan_due and not actions,
                 "deferred_by_backoff": not atom_scan_due,
@@ -2625,6 +2728,8 @@ class PolicyService:
             "checkpoint": checkpoint,
             "vacuum": vacuum,
             "checkpoint_after_vacuum": checkpoint_after_vacuum,
+            "capacity_after": capacity_after,
+            "catchup_pending": catchup_pending,
             "event": event,
             "events": events,
         }
@@ -3002,6 +3107,7 @@ class PolicyService:
         decay: Mapping[str, Any],
         scope: Mapping[str, Any],
         actor: str,
+        pressure_catchup: bool = False,
     ) -> dict[str, Any]:
         max_atoms = max(1, int(decay.get("max_atoms", 256) or 256))
         max_active_atoms = max(
@@ -3223,10 +3329,40 @@ class PolicyService:
             if atom.get("lifecycle_state") == "proposed"
             and str(atom["id"]) not in planned_archives
         )
-        total_pressure_needed = max(0, hot_count_after_rules - max_atoms)
         active_pressure_needed = max(0, active_count_after_rules - max_active_atoms)
         proposed_pressure_needed = max(
             0, proposed_count_after_rules - max_proposed_atoms
+        )
+        pressure_at_high_water = bool(
+            hot_count_after_rules >= max_atoms
+            or active_count_after_rules >= max_active_atoms
+            or proposed_count_after_rules >= max_proposed_atoms
+        )
+        pressure_required = bool(pressure_at_high_water or pressure_catchup)
+        low_water_ratio = float(
+            decay.get("pressure_low_water_ratio", 0.8) or 0.8
+        )
+        low_water_hot_atoms = max(1, int(max_atoms * low_water_ratio))
+        low_water_active_atoms = max(
+            1, int(max_active_atoms * low_water_ratio)
+        )
+        low_water_proposed_atoms = max(
+            1, int(max_proposed_atoms * low_water_ratio)
+        )
+        total_archive_target = (
+            max(0, hot_count_after_rules - low_water_hot_atoms)
+            if pressure_required
+            else 0
+        )
+        active_archive_target_for_low_water = (
+            max(0, active_count_after_rules - low_water_active_atoms)
+            if pressure_required
+            else 0
+        )
+        proposed_archive_target_for_low_water = (
+            max(0, proposed_count_after_rules - low_water_proposed_atoms)
+            if pressure_required
+            else 0
         )
         pressure_limit = int(decay.get("pressure_max_archives_per_run", 256) or 256)
         proposal_pressure_candidates = [
@@ -3247,9 +3383,6 @@ class PolicyService:
                 atom, decay=decay, scope=scope, lifecycle_state="active"
             )
         ]
-        pressure_required = bool(
-            total_pressure_needed or active_pressure_needed or proposed_pressure_needed
-        )
         proposal_pressure_candidates.sort(
             key=lambda atom: self._pressure_archive_sort_key(atom, edge_degrees)
         )
@@ -3260,7 +3393,7 @@ class PolicyService:
         proposal_archive_count = 0
         active_archive_count = 0
         proposal_archive_target = max(
-            proposed_pressure_needed, total_pressure_needed
+            proposed_archive_target_for_low_water, total_archive_target
         )
         if decay.get("pressure_archive_proposed", True) and proposal_archive_target:
             for atom in proposal_pressure_candidates[
@@ -3276,9 +3409,12 @@ class PolicyService:
                 pressure_archive_count += 1
                 proposal_archive_count += 1
         remaining_total_pressure = max(
-            0, total_pressure_needed - pressure_archive_count
+            0, total_archive_target - pressure_archive_count
         )
-        active_archive_target = max(active_pressure_needed, remaining_total_pressure)
+        active_archive_target = max(
+            active_archive_target_for_low_water,
+            remaining_total_pressure,
+        )
         remaining_archive_budget = max(0, pressure_limit - pressure_archive_count)
         if decay.get("pressure_archive_policyless", True) and active_archive_target:
             for atom in active_pressure_candidates[
@@ -3300,36 +3436,31 @@ class PolicyService:
                 or decay.get("pressure_archive_proposed", True)
             ),
             "triggered": pressure_required,
+            "high_water_triggered": pressure_at_high_water,
+            "catchup_continued": bool(pressure_catchup),
             "max_atoms": max_atoms,
             "max_active_atoms": max_active_atoms,
             "max_proposed_atoms": max_proposed_atoms,
+            "low_water_ratio": low_water_ratio,
+            "low_water_hot_atoms": low_water_hot_atoms,
+            "low_water_active_atoms": low_water_active_atoms,
+            "low_water_proposed_atoms": low_water_proposed_atoms,
             "hot_count_before": hot_count_before,
             "hot_count_after_rules": hot_count_after_rules,
             "active_count_after_rules": active_count_after_rules,
             "proposed_count_after_rules": proposed_count_after_rules,
             "active_pressure_needed": active_pressure_needed,
             "proposed_pressure_needed": proposed_pressure_needed,
+            "low_water_archive_target": total_archive_target,
+            "low_water_active_archive_target": (
+                active_archive_target_for_low_water
+            ),
+            "low_water_proposed_archive_target": (
+                proposed_archive_target_for_low_water
+            ),
             "eligible_policyless_count": len(active_pressure_candidates),
             "eligible_proposed_count": len(proposal_pressure_candidates),
             "archive_limit": pressure_limit,
-            "archive_count": pressure_archive_count,
-            "proposal_archive_count": proposal_archive_count,
-            "active_archive_count": active_archive_count,
-            "remaining_hot_count": hot_count_after_rules - pressure_archive_count,
-            "remaining_over_limit": max(
-                0,
-                hot_count_after_rules - pressure_archive_count - max_atoms,
-            ),
-            "remaining_active_over_limit": max(
-                0,
-                active_count_after_rules - active_archive_count - max_active_atoms,
-            ),
-            "remaining_proposed_over_limit": max(
-                0,
-                proposed_count_after_rules
-                - proposal_archive_count
-                - max_proposed_atoms,
-            ),
         }
 
         write_batch_size = max(1, int(decay.get("write_batch_size", 32) or 32))
@@ -3498,6 +3629,85 @@ class PolicyService:
             projected_atoms.extend(batch_atoms)
             projected_edges.extend(batch_edges)
         event = events[-1] if events else None
+        published_proposal_archives = sum(
+            action.get("reason") == "proposed_atom_pressure_fallback"
+            for action in actions
+        )
+        published_active_archives = sum(
+            action.get("reason")
+            == "active_atom_pressure_policyless_fallback"
+            for action in actions
+        )
+        published_pressure_archives = (
+            published_proposal_archives + published_active_archives
+        )
+        remaining_hot_count = hot_count_after_rules - published_pressure_archives
+        remaining_active_count = (
+            active_count_after_rules - published_active_archives
+        )
+        remaining_proposed_count = (
+            proposed_count_after_rules - published_proposal_archives
+        )
+        remaining_above_low_water = max(
+            0, remaining_hot_count - low_water_hot_atoms
+        )
+        remaining_active_above_low_water = max(
+            0, remaining_active_count - low_water_active_atoms
+        )
+        remaining_proposed_above_low_water = max(
+            0, remaining_proposed_count - low_water_proposed_atoms
+        )
+        remaining_eligible_policyless_count = max(
+            0, len(active_pressure_candidates) - published_active_archives
+        )
+        remaining_eligible_proposed_count = max(
+            0, len(proposal_pressure_candidates) - published_proposal_archives
+        )
+        pressure.update({
+            "archive_count": published_pressure_archives,
+            "proposal_archive_count": published_proposal_archives,
+            "active_archive_count": published_active_archives,
+            "remaining_hot_count": remaining_hot_count,
+            "remaining_over_limit": max(
+                0, remaining_hot_count - max_atoms
+            ),
+            "remaining_active_over_limit": max(
+                0, remaining_active_count - max_active_atoms
+            ),
+            "remaining_proposed_over_limit": max(
+                0, remaining_proposed_count - max_proposed_atoms
+            ),
+            "remaining_above_low_water": remaining_above_low_water,
+            "remaining_active_above_low_water": (
+                remaining_active_above_low_water
+            ),
+            "remaining_proposed_above_low_water": (
+                remaining_proposed_above_low_water
+            ),
+            "remaining_eligible_policyless_count": (
+                remaining_eligible_policyless_count
+            ),
+            "remaining_eligible_proposed_count": (
+                remaining_eligible_proposed_count
+            ),
+            "catchup_pending": bool(
+                (
+                    remaining_active_above_low_water
+                    and remaining_eligible_policyless_count
+                )
+                or (
+                    remaining_proposed_above_low_water
+                    and remaining_eligible_proposed_count
+                )
+                or (
+                    remaining_above_low_water
+                    and (
+                        remaining_eligible_policyless_count
+                        or remaining_eligible_proposed_count
+                    )
+                )
+            ),
+        })
         return {
             "status": "completed",
             "action_count": len(actions),

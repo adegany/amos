@@ -546,29 +546,23 @@ def test_memory_policy_pressure_archives_policyless_atoms_to_limit(amos):
     result = amos.run_memory_policy(force=True, trigger="pressure_decay_test")
     pressure = result["results"]["decay"]["pressure"]
 
-    assert pressure == {
-        "enabled": True,
-        "triggered": True,
-        "max_atoms": 3,
-        "max_active_atoms": 3,
-        "max_proposed_atoms": 3,
-        "hot_count_before": 5,
-        "hot_count_after_rules": 5,
-        "active_count_after_rules": 5,
-        "proposed_count_after_rules": 0,
-        "active_pressure_needed": 2,
-        "proposed_pressure_needed": 0,
-        "eligible_policyless_count": 3,
-        "eligible_proposed_count": 0,
-        "archive_limit": 10,
-        "archive_count": 2,
-        "proposal_archive_count": 0,
-        "active_archive_count": 2,
-        "remaining_hot_count": 3,
-        "remaining_over_limit": 0,
-        "remaining_active_over_limit": 0,
-        "remaining_proposed_over_limit": 0,
-    }
+    assert pressure["enabled"] is True
+    assert pressure["triggered"] is True
+    assert pressure["high_water_triggered"] is True
+    assert pressure["max_atoms"] == 3
+    assert pressure["low_water_ratio"] == 0.8
+    assert pressure["low_water_hot_atoms"] == 2
+    assert pressure["hot_count_before"] == 5
+    assert pressure["active_pressure_needed"] == 2
+    assert pressure["low_water_active_archive_target"] == 3
+    assert pressure["eligible_policyless_count"] == 3
+    assert pressure["archive_limit"] == 10
+    assert pressure["archive_count"] == 3
+    assert pressure["active_archive_count"] == 3
+    assert pressure["remaining_hot_count"] == 2
+    assert pressure["remaining_over_limit"] == 0
+    assert pressure["remaining_above_low_water"] == 0
+    assert pressure["catchup_pending"] is False
     pressure_actions = [
         action
         for action in result["results"]["decay"]["actions"]
@@ -577,16 +571,17 @@ def test_memory_policy_pressure_archives_policyless_atoms_to_limit(amos):
     assert [action["atom_ref"] for action in pressure_actions] == [
         low["id"],
         middle["id"],
+        high["id"],
     ]
     assert amos.store.get_atom(low["id"])["lifecycle_state"] == "archived"
     assert amos.store.get_atom(middle["id"])["lifecycle_state"] == "archived"
-    assert amos.store.get_atom(high["id"])["lifecycle_state"] == "active"
+    assert amos.store.get_atom(high["id"])["lifecycle_state"] == "archived"
     assert amos.store.get_atom(opted_out["id"])["lifecycle_state"] == "active"
     assert amos.store.get_atom(protected["id"])["lifecycle_state"] == "active"
     health = amos.health_memory(run_policy=False)
-    assert health["quality"]["active_atom_count"] == 3
+    assert health["quality"]["active_atom_count"] == 2
     assert health["quality"]["active_atom_pressure"] == "within_limit"
-    assert health["quality"]["pressure_cleanup"]["eligible_policyless_count"] == 1
+    assert health["quality"]["pressure_cleanup"]["eligible_policyless_count"] == 0
 
 
 def test_memory_policy_enforces_proposed_quota_separately_from_active_atoms(amos):
@@ -645,22 +640,27 @@ def test_memory_policy_enforces_proposed_quota_separately_from_active_atoms(amos
     assert pressure["triggered"] is True
     assert pressure["active_pressure_needed"] == 0
     assert pressure["proposed_pressure_needed"] == 1
-    assert pressure["archive_count"] == 1
-    assert pressure["proposal_archive_count"] == 1
+    assert pressure["archive_count"] == 3
+    assert pressure["proposal_archive_count"] == 2
+    assert pressure["active_archive_count"] == 1
     assert pressure["remaining_proposed_over_limit"] == 0
-    assert result["results"]["decay"]["actions"][0]["reason"] == (
-        "proposed_atom_pressure_fallback"
-    )
+    assert pressure["remaining_proposed_above_low_water"] == 0
+    assert {
+        action["reason"] for action in result["results"]["decay"]["actions"]
+    } == {
+        "proposed_atom_pressure_fallback",
+        "active_atom_pressure_policyless_fallback",
+    }
     health = amos.health_memory(run_policy=False)["quality"]
-    assert health["lifecycle_active_atom_count"] == 2
+    assert health["lifecycle_active_atom_count"] == 1
     assert health["lifecycle_active_atom_limit"] == 2
-    assert health["proposed_atom_count"] == 2
+    assert health["proposed_atom_count"] == 1
     assert health["proposed_atom_limit"] == 2
-    assert health["hot_atom_count"] == 4
+    assert health["hot_atom_count"] == 2
     assert health["hot_atom_limit"] == 10
 
 
-def test_memory_policy_is_due_immediately_when_hot_atom_quota_is_exceeded(amos):
+def test_memory_policy_is_due_immediately_when_hot_atom_quota_is_reached(amos):
     amos.configure_memory_policy(
         schedule={
             "every_graph_versions": 1000,
@@ -672,7 +672,7 @@ def test_memory_policy_is_due_immediately_when_hot_atom_quota_is_exceeded(amos):
         maintenance_distiller={"enabled": False},
         decay={
             "enabled": True,
-            "max_atoms": 1,
+            "max_atoms": 2,
             "max_active_atoms": 10,
             "max_proposed_atoms": 10,
         },
@@ -739,6 +739,64 @@ def test_memory_policy_pressure_trigger_observes_completion_cooldown(amos):
     assert not any(
         reason.startswith("memory_atom_pressure:")
         for reason in due["reasons"]
+    )
+
+
+def test_memory_policy_continues_bounded_low_water_catchup_without_new_writes(
+    amos,
+):
+    for index in range(5):
+        amos.commit_atom({
+            "id": f"low_water_catchup_{index}",
+            "type": "semantic",
+            "payload": {"summary": f"Catch-up candidate {index}"},
+        })
+    amos.configure_memory_policy(
+        schedule={
+            "every_graph_versions": 1_000_000,
+            "every_seconds": 1_000_000,
+            "pressure_min_interval_seconds": 1_000_000,
+            "pressure_catchup_interval_seconds": 0,
+            "run_on_pressure": True,
+        },
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={
+            "enabled": True,
+            "max_atoms": 3,
+            "max_active_atoms": 3,
+            "max_proposed_atoms": 10,
+            "pressure_low_water_ratio": 0.5,
+            "pressure_max_archives_per_run": 1,
+        },
+        storage_cleanup={"enabled": False},
+    )
+
+    runs = [
+        amos.run_memory_policy(force=True, trigger="low_water_seed"),
+        amos.run_memory_policy(trigger="low_water_catchup_1"),
+        amos.run_memory_policy(trigger="low_water_catchup_2"),
+        amos.run_memory_policy(trigger="low_water_catchup_3"),
+    ]
+
+    assert [
+        run["results"]["decay"]["pressure"]["remaining_hot_count"]
+        for run in runs
+    ] == [4, 3, 2, 1]
+    assert [
+        run["results"]["decay"]["pressure"]["catchup_pending"]
+        for run in runs
+    ] == [True, True, True, False]
+    assert all(
+        "memory_atom_pressure:catchup" in run["due"]["reasons"]
+        for run in runs[1:]
+    )
+    assert amos.memory_policy_status()["state"][
+        "lifecycle_catchup_pending"
+    ] is False
+    assert amos.run_memory_policy(trigger="low_water_complete")["status"] == (
+        "skipped"
     )
 
 
@@ -2161,6 +2219,84 @@ def test_storage_cleanup_uses_mode_specific_pressure_retention(amos):
     assert amos.store.get_atom(target["id"]) is None
 
 
+def test_storage_cleanup_continues_known_bounded_backlog_without_new_writes(
+    amos,
+):
+    old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    for index in range(3):
+        amos.commit_atom({
+            "id": f"storage_catchup_archive_{index}",
+            "type": "semantic",
+            "payload": {"summary": f"Archived cleanup candidate {index}"},
+            "created_at": old,
+            "observed_at": old,
+            "updated_at": old,
+            "lifecycle_state": "archived",
+            "health_status": "stale",
+        })
+    amos.configure_capacity_budget(hard_capacity_bytes=1)
+    amos.configure_memory_policy(
+        schedule={
+            "every_graph_versions": 1_000_000,
+            "every_seconds": 1_000_000,
+            "pressure_min_interval_seconds": 1_000_000,
+        },
+        maintenance={"enabled": False},
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": False},
+        storage_cleanup={
+            "enabled": True,
+            "run_on_pressure": True,
+            "pressure_min_interval_seconds": 1_000_000,
+            "pressure_catchup_interval_seconds": 0,
+            "pressure_atom_scan_min_interval_seconds": 1_000_000,
+            "pressure_profiles": {
+                "red": {
+                    "delete_archived_after_seconds": 0,
+                    "max_deletions_per_tick": 1,
+                },
+            },
+            "max_index_prune_atoms_per_tick": 0,
+            "max_idempotency_compactions_per_tick": 0,
+            "journal_compaction": {"enabled": False},
+            "sqlite_compaction": {
+                "checkpoint_wal": False,
+                "incremental_vacuum": False,
+                "vacuum_enabled": False,
+            },
+        },
+    )
+
+    first = amos.run_memory_policy(force=True, trigger="storage_catchup_seed")
+    second = amos.run_memory_policy(trigger="storage_catchup_1")
+    third = amos.run_memory_policy(trigger="storage_catchup_2")
+    cleanups = [
+        run["results"]["storage_cleanup"]
+        for run in (first, second, third)
+    ]
+
+    assert [
+        cleanup["atom_scan"]["eligible_candidate_count"]
+        for cleanup in cleanups
+    ] == [3, 2, 1]
+    assert [cleanup["deleted_atom_count"] for cleanup in cleanups] == [1, 1, 1]
+    assert [cleanup["catchup_pending"] for cleanup in cleanups] == [
+        True,
+        True,
+        False,
+    ]
+    assert second["due"]["storage_cleanup"]["reason"] == "capacity_catchup"
+    assert amos.memory_policy_status()["state"][
+        "storage_cleanup_catchup_pending"
+    ] is False
+    assert amos.run_memory_policy(trigger="storage_catchup_complete")["status"] == (
+        "skipped"
+    )
+
+
 def test_pressure_cleanup_does_not_trigger_unrelated_index_rebuild(
     amos, monkeypatch
 ):
@@ -2745,9 +2881,11 @@ def test_storage_pressure_does_not_force_full_semantic_maintenance(amos):
     second_state = amos.memory_policy_status()["state"]
     assert second["execution_plan"]["semantic_maintenance"] is False
     assert second["results"]["storage_cleanup"]["atom_scan"] == {
-        "attempted": False,
-        "candidate_count": 0,
-        "deleted_atom_count": 0,
+            "attempted": False,
+            "candidate_count": 0,
+            "eligible_candidate_count": 0,
+            "remaining_eligible_candidate_count": 0,
+            "deleted_atom_count": 0,
         "noop": False,
         "deferred_by_backoff": True,
         "elapsed_seconds": pytest.approx(0, abs=1),
