@@ -27,6 +27,7 @@ from .index_service import IndexService
 from .mutations_service import MutationService
 from .policy_service import PolicyService
 from .reasoning_service import ReasoningFrameService
+from .request_context import check_deadline
 from .retrieval_service import RetrievalService
 from .stewardship_service import StewardshipService
 from .temporal_service import TemporalService
@@ -529,10 +530,12 @@ class Amos:
         attention_context: Mapping[str, Any] | None = None,
         run_policy: bool = True,
     ) -> dict[str, Any]:
+        check_deadline("retrieval_start")
         if run_policy:
             self.policy.run_memory_policy(
                 trigger="retrieve_packet", scope=scope or {}
             )
+        check_deadline("retrieval_policy")
         with self.store.read_snapshot():
             return self.retrieval.retrieve_packet(
                 cues=cues,
@@ -571,10 +574,12 @@ class Amos:
     ) -> dict[str, Any]:
         """Resolve a known atom ID without invoking associative ranking."""
 
+        check_deadline("exact_retrieval_start")
         if run_policy:
             self.policy.run_memory_policy(
                 trigger="retrieve_atom", scope=scope or {}
             )
+        check_deadline("exact_retrieval_policy")
         with self.store.read_snapshot():
             return self.retrieval.retrieve_atom(
                 atom_id,

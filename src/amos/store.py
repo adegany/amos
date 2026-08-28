@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import sqlite3
-import uuid
 import json
 import math
+import sqlite3
 import threading
 import time
+import uuid
 import zlib
 from collections import Counter
 from contextlib import contextmanager
@@ -20,9 +20,8 @@ from .journal_replay import (
     replay_events,
     serializable_replay_state,
 )
-from .request_context import remaining_seconds
+from .request_context import check_deadline, current_stage, remaining_seconds
 from .schemas import SCHEMA_VERSION, canonical_json, digest, utc_now
-
 
 JSON_COLUMNS = {
     "access_policy",
@@ -301,8 +300,36 @@ class SQLiteStore:
 
         deferred_writes: list[tuple[str, dict[str, Any]]] = []
         completed = False
+        deadline_interrupted = False
+        deadline_reserve_seconds = 0.01
+
+        def interrupt_at_request_deadline() -> int:
+            nonlocal deadline_interrupted
+            remaining = remaining_seconds()
+            if (
+                remaining is not None
+                and remaining <= deadline_reserve_seconds
+            ):
+                deadline_interrupted = True
+                return 1
+            return 0
+
         with self._connection_lock:
-            self.conn.execute("BEGIN")
+            deadline_guard_installed = remaining_seconds() is not None
+            if deadline_guard_installed:
+                # SQLite otherwise cannot observe the cooperative checks that
+                # surround one long statement. Abort its virtual machine close
+                # to the caller deadline so the request slot is released.
+                self.conn.set_progress_handler(
+                    interrupt_at_request_deadline,
+                    1000,
+                )
+            try:
+                self.conn.execute("BEGIN")
+            except Exception:
+                if deadline_guard_installed:
+                    self.conn.set_progress_handler(None, 0)
+                raise
             self._local.read_depth = 1
             self._local.deferred_writes = deferred_writes
             try:
@@ -311,7 +338,16 @@ class SQLiteStore:
                 self.memory_revision()
                 yield self.conn
                 completed = True
+            except sqlite3.OperationalError:
+                if deadline_interrupted:
+                    check_deadline(
+                        current_stage() or "sqlite_read_snapshot",
+                        reserve_seconds=deadline_reserve_seconds,
+                    )
+                raise
             finally:
+                if deadline_guard_installed:
+                    self.conn.set_progress_handler(None, 0)
                 self.conn.rollback()
                 self._local.read_depth = 0
                 self._local.deferred_writes = []

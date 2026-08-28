@@ -37,7 +37,7 @@ from amos import (
 from amos.cli import main as cli_main
 from amos.http_api import AmosHTTPServer
 from amos.errors import RequestDeadlineExceeded
-from amos.request_context import request_context
+from amos.request_context import check_deadline, request_context
 from amos.smp import cosine
 
 
@@ -54,6 +54,37 @@ def test_retrieval_honors_cooperative_request_deadline(amos):
     assert exc_info.value.stage == "retrieval_start"
     assert exc_info.value.request_id == "deadline-test"
 
+
+def test_read_snapshot_interrupts_one_long_sqlite_stage_at_deadline(amos):
+    started = time.monotonic()
+    query_started = False
+    with (
+        request_context(
+            deadline_epoch_seconds=time.time() + 0.1,
+            request_id="sqlite-deadline-test",
+        ),
+        pytest.raises(RequestDeadlineExceeded) as exc_info,
+        amos.store.read_snapshot() as connection,
+    ):
+        check_deadline("retrieval_test_sqlite_scan")
+        query_started = True
+        connection.execute(
+            """
+            WITH RECURSIVE counter(value) AS (
+                VALUES(0)
+                UNION ALL
+                SELECT value + 1 FROM counter
+                WHERE value < 100000000
+            )
+            SELECT sum(value) FROM counter
+            """
+        ).fetchone()
+
+    assert exc_info.value.stage == "retrieval_test_sqlite_scan"
+    assert exc_info.value.request_id == "sqlite-deadline-test"
+    assert query_started is True
+    assert time.monotonic() - started < 1.0
+
 from .helpers import ExampleTrainingFlightProcessor, item_refs
 
 
@@ -67,6 +98,11 @@ def test_retrieve_packet_uses_graph_version_packet_cache(amos, monkeypatch):
     )
     first = amos.retrieve_packet(cues=["cache hit retrieval"], run_policy=False)
     assert "cache_hit_atom" in item_refs(first)
+    first_execution = first["degradation"]["request_execution"]
+    assert first_execution["profile"] == "amos.retrieval-execution.v1"
+    assert first_execution["cache_hit"] is False
+    assert first_execution["elapsed_ms"] >= 0
+    assert first_execution["stage_timings_ms"]["retrieval_response"] >= 0
 
     def fail_list_atoms_filtered(**_kwargs):
         raise AssertionError("cache hit should not scan atoms")
@@ -76,6 +112,25 @@ def test_retrieve_packet_uses_graph_version_packet_cache(amos, monkeypatch):
 
     assert second["packet_id"] == first["packet_id"]
     assert "cache_hit_atom" in item_refs(second)
+    second_execution = second["degradation"]["request_execution"]
+    assert second_execution["cache_hit"] is True
+    assert second_execution["stage_timings_ms"]["retrieval_cache_lookup"] >= 0
+
+
+def test_exact_retrieval_reports_bounded_stage_timings(amos):
+    amos.commit_atom({
+        "id": "exact_timing_atom",
+        "type": "belief",
+        "payload": {"claim": "exact retrieval exposes its execution stages"},
+    })
+
+    packet = amos.retrieve_atom("exact_timing_atom", run_policy=False)
+
+    execution = packet["degradation"]["request_execution"]
+    assert execution["profile"] == "amos.retrieval-execution.v1"
+    assert execution["cache_hit"] is False
+    assert execution["elapsed_ms"] >= 0
+    assert execution["stage_timings_ms"]["exact_retrieval_atom_lookup"] >= 0
 
 
 def test_retrieve_atom_resolves_exact_id_without_associative_ranking(

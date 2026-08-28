@@ -1,16 +1,18 @@
 """RetrievalService implementation for the AMOS service facade."""
 
+import time
+
 from ._service_support import (
     ATTENTION_POLICY_ID,
-    Any,
     CONFLICT_RELATIONS,
     DEFAULT_PACKET_PROFILES,
     LOW_HEALTH_STATES,
-    Mapping,
     RETRIEVAL_RECENCY_HORIZON_SECONDS,
     RETRIEVAL_WEIGHTS,
     SCHEMA_VERSION,
     SEMANTIC_MATCH_THRESHOLD,
+    Any,
+    Mapping,
     Sequence,
     ValidationError,
     access_visible,
@@ -26,6 +28,42 @@ from ._service_support import (
 )
 from .governance_service import GovernanceService
 from .request_context import check_deadline
+
+
+class _RetrievalStageTimer:
+    """Collect bounded request-stage latency without affecting retrieval."""
+
+    def __init__(self) -> None:
+        self.started = time.perf_counter()
+        self.checkpoint_started = self.started
+        self.timings_ms: dict[str, float] = {}
+
+    def checkpoint(
+        self,
+        stage: str,
+        *,
+        reserve_seconds: float = 0.0,
+    ) -> None:
+        check_deadline(stage, reserve_seconds=reserve_seconds)
+        now = time.perf_counter()
+        self.timings_ms[stage] = round(
+            self.timings_ms.get(stage, 0.0)
+            + ((now - self.checkpoint_started) * 1000.0),
+            3,
+        )
+        self.checkpoint_started = now
+
+    def summary(self, *, cache_hit: bool) -> dict[str, Any]:
+        return {
+            "profile": "amos.retrieval-execution.v1",
+            "cache_hit": bool(cache_hit),
+            "elapsed_ms": round(
+                (time.perf_counter() - self.started) * 1000.0,
+                3,
+            ),
+            "stage_timings_ms": dict(self.timings_ms),
+        }
+
 
 MEMORY_MODES = {
     "deliberation",
@@ -225,6 +263,8 @@ class RetrievalService:
         as associative packet retrieval.
         """
 
+        timer = _RetrievalStageTimer()
+        timer.checkpoint("exact_retrieval_start")
         atom_id = str(atom_id or "").strip()
         if not atom_id:
             raise ValidationError("atom_id is required")
@@ -236,6 +276,7 @@ class RetrievalService:
         self._mark_foreground_activity(requester)
         if run_policy and not _policy_already_run:
             self.run_memory_policy(trigger="retrieve_atom", scope=scope or {})
+        timer.checkpoint("exact_retrieval_policy")
         request = {
             "atom_id": atom_id,
             "scope": dict(scope or {}),
@@ -253,10 +294,18 @@ class RetrievalService:
         cached = self.store.get_cached_packet(
             request=request, graph_version=graph_version
         )
+        timer.checkpoint("exact_retrieval_cache_lookup")
         if cached is not None:
-            return cached
+            return {
+                **dict(cached),
+                "degradation": {
+                    **dict(cached.get("degradation") or {}),
+                    "request_execution": timer.summary(cache_hit=True),
+                },
+            }
 
         atom = self.store.get_atom(atom_id)
+        timer.checkpoint("exact_retrieval_atom_lookup")
         omissions: list[dict[str, Any]] = []
         superseded_refs: dict[str, Sequence[str]] = {}
         if atom is None:
@@ -323,6 +372,7 @@ class RetrievalService:
             for edge in self.store.list_edges_for_refs([atom_id]):
                 if edge["relation"] in CONFLICT_RELATIONS:
                     conflicts.append(edge)
+        timer.checkpoint("exact_retrieval_rendering")
         packet_id = stable_id(
             "pkt",
             {"request": request, "graph_version": graph_version, "items": items},
@@ -359,6 +409,13 @@ class RetrievalService:
             },
             "cache_policy": {"cacheable": True, "keyed_by_graph_version": True},
         }
+        timer.checkpoint(
+            "exact_retrieval_response",
+            reserve_seconds=0.05,
+        )
+        packet["degradation"]["request_execution"] = timer.summary(
+            cache_hit=False
+        )
         self.store.persist_packet_after_read(
             packet_id=packet_id,
             request=request,
@@ -468,11 +525,12 @@ class RetrievalService:
         run_policy: bool = True,
         _policy_already_run: bool = False,
     ) -> dict[str, Any]:
-        check_deadline("retrieval_start")
+        timer = _RetrievalStageTimer()
+        timer.checkpoint("retrieval_start")
         self._mark_foreground_activity(requester)
         if run_policy and not _policy_already_run:
             self.run_memory_policy(trigger="retrieve_packet", scope=scope or {})
-        check_deadline("retrieval_policy")
+        timer.checkpoint("retrieval_policy")
         profile = DEFAULT_PACKET_PROFILES.get(
             retrieval_mode, DEFAULT_PACKET_PROFILES.get(target_processor, {})
         )
@@ -532,11 +590,17 @@ class RetrievalService:
         cached = self.store.get_cached_packet(
             request=request, graph_version=graph_version
         )
+        timer.checkpoint("retrieval_cache_lookup")
         if cached is not None:
-            return cached
-        check_deadline("retrieval_cache_lookup")
+            return {
+                **dict(cached),
+                "degradation": {
+                    **dict(cached.get("degradation") or {}),
+                    "request_execution": timer.summary(cache_hit=True),
+                },
+            }
         self._sync_smp_vector_model(graph_version=graph_version)
-        check_deadline("retrieval_vector_model")
+        timer.checkpoint("retrieval_vector_model")
 
         candidates: list[tuple[float, dict[str, Any]]] = []
         omissions: list[dict[str, Any]] = []
@@ -570,7 +634,7 @@ class RetrievalService:
             limit=candidate_scan_limit,
             prioritize_hot=True,
         )
-        check_deadline("retrieval_base_candidates")
+        timer.checkpoint("retrieval_base_candidates")
         candidate_scan_truncated = total_candidate_count > candidate_scan_limit
         indexed_candidate_ids = self._indexed_retrieval_candidates(
             cue_tokens=cue_tokens,
@@ -584,7 +648,7 @@ class RetrievalService:
             atom_ids=sorted(set(indexed_candidate_ids or [])),
             payload_filter=payload_filter,
         )
-        check_deadline("retrieval_indexed_candidates")
+        timer.checkpoint("retrieval_indexed_candidates")
         candidate_atoms_by_id = {
             str(atom["id"]): atom for atom in [*base_atoms, *indexed_atoms]
         }
@@ -592,7 +656,7 @@ class RetrievalService:
         eligible_atoms: list[dict[str, Any]] = []
         for index, atom in enumerate(candidate_universe):
             if index % 32 == 0:
-                check_deadline("retrieval_candidate_filter")
+                timer.checkpoint("retrieval_candidate_filter")
             atom_ref = str(atom["id"])
             if not scope_visible(atom["scope"], request["scope"]):
                 omissions.append({"atom_ref": atom_ref, "reason": "scope_hidden"})
@@ -611,6 +675,7 @@ class RetrievalService:
                 )
             else:
                 eligible_atoms.append(atom)
+        timer.checkpoint("retrieval_candidate_filter")
         eligible_atom_ids = {str(atom["id"]) for atom in eligible_atoms}
         latent_candidate_ids = self._latent_retrieval_candidates(
             eligible_atoms,
@@ -620,7 +685,7 @@ class RetrievalService:
                 0.55 if indexed_candidate_ids else SEMANTIC_MATCH_THRESHOLD
             ),
         )
-        check_deadline("retrieval_latent_candidates")
+        timer.checkpoint("retrieval_latent_candidates")
         if indexed_candidate_ids is None and not latent_candidate_ids:
             atoms = eligible_atoms
         else:
@@ -650,10 +715,10 @@ class RetrievalService:
             retrieval_mode=retrieval_mode,
             superseded_refs=superseded_refs if not include_superseded else None,
         )
-        check_deadline("retrieval_graph_activation")
+        timer.checkpoint("retrieval_graph_activation")
         for index, atom in enumerate(atoms):
             if index % 32 == 0:
-                check_deadline("retrieval_ranking")
+                timer.checkpoint("retrieval_ranking")
             atom_ref = atom["id"]
             if atom.get("deleted"):
                 omissions.append({"atom_ref": atom_ref, "reason": "deleted"})
@@ -709,13 +774,15 @@ class RetrievalService:
             }
             candidates.append((score, atom))
 
+        timer.checkpoint("retrieval_ranking")
         candidates.sort(key=lambda item: item[0], reverse=True)
+        timer.checkpoint("retrieval_sorting")
         byte_budget = self._byte_budget(token_or_byte_budget)
         used_bytes = 0
         items = []
         for index, (score, atom) in enumerate(candidates):
             if index % 32 == 0:
-                check_deadline("retrieval_rendering")
+                timer.checkpoint("retrieval_rendering")
             if len(items) >= max_items:
                 omissions.append(
                     {
@@ -736,6 +803,7 @@ class RetrievalService:
                 continue
             used_bytes += rendered_size
             items.append(item)
+        timer.checkpoint("retrieval_rendering")
         for rank, item in enumerate(items, start=1):
             item["rank"] = rank
 
@@ -747,6 +815,7 @@ class RetrievalService:
                     continue
                 if edge["source_ref"] in selected or edge["target_ref"] in selected:
                     conflicts.append(edge)
+        timer.checkpoint("retrieval_conflicts")
 
         packet = {
             "packet_id": stable_id(
@@ -820,7 +889,10 @@ class RetrievalService:
         # Cache persistence is optional. Preserve enough deadline to publish
         # the response and never turn a successful read into a timeout merely
         # to save a rebuildable cache entry.
-        check_deadline("retrieval_response", reserve_seconds=0.05)
+        timer.checkpoint("retrieval_response", reserve_seconds=0.05)
+        packet["degradation"]["request_execution"] = timer.summary(
+            cache_hit=False
+        )
         self.store.persist_packet_after_read(
             packet_id=packet["packet_id"],
             request=request,
