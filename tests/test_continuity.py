@@ -294,6 +294,8 @@ def test_canonical_record_batch_returns_coherent_head_atoms(amos):
 
     assert batch["status"] == "completed"
     assert batch["profile"] == "amos.canonical-record-batch.v1"
+    assert batch["packet_id"].startswith("pkt_")
+    assert batch["request"]["retrieval_mode"] == "exact_batch"
     assert batch["items_by_id"]["authority_batch_state_1"]["payload"][
         "checksum"
     ] == "sha256:batch"
@@ -307,6 +309,23 @@ def test_canonical_record_batch_returns_coherent_head_atoms(amos):
         "authority_batch_state_1"
     )
     assert batch["heads"][1]["status"] == "absent"
+
+    outcome = amos.record_retrieval_outcome(
+        packet_id=batch["packet_id"],
+        request=batch["request"],
+        outcome={
+            "status": "used",
+            "materially_used": True,
+            "used_atom_refs": ["authority_batch_state_1"],
+            "used_evidence_refs": [],
+            "summary": "The exact batch record materially conditioned the result.",
+        },
+    )
+    assert outcome["status"] == "recorded"
+    assert outcome["feedback"]["ignored_non_packet_refs"] == []
+    assert outcome["feedback"]["positive_refs"] == [
+        "authority_batch_state_1"
+    ]
 
     hidden = amos.get_canonical_records(
         atom_ids=["authority_batch_private"],

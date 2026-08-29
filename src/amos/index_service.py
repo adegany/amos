@@ -1,5 +1,8 @@
 """IndexService implementation for the AMOS service facade."""
 
+import threading
+from collections.abc import Callable
+
 from ._service_support import (
     Any,
     DEFAULT_MEMORY_POLICY,
@@ -15,7 +18,7 @@ from ._service_support import (
     stable_id,
     utc_now,
 )
-from .request_context import check_deadline
+from .request_context import check_deadline, remaining_seconds
 
 
 _RETRIEVAL_STOPWORDS = {
@@ -41,6 +44,76 @@ _SKILL_SELECTION_POSITIVE_FIELDS = (
 _SKILL_SELECTION_NEGATIVE_FIELDS = ("exclusions",)
 
 
+class VectorModelSnapshotCache:
+    """Share immutable graph-versioned vector inputs across service lanes.
+
+    Each AMOS request service retains its own deterministic SMP encoder, while
+    document frequencies and latent vectors are loaded from SQLite once per
+    published revision.  A bounded single-flight wait prevents overlapping
+    request lanes from performing the same global scan.
+    """
+
+    def __init__(self, *, retained_revisions: int = 4) -> None:
+        self.retained_revisions = max(1, int(retained_revisions))
+        self._condition = threading.Condition()
+        self._snapshots: dict[int, tuple[int, Mapping[str, Any]]] = {}
+        self._loading: set[int] = set()
+        self._generation = 0
+
+    def get_or_load(
+        self,
+        graph_version: int,
+        loader: Callable[[], Mapping[str, Any]],
+        *,
+        refresh: bool = False,
+    ) -> tuple[int, Mapping[str, Any]]:
+        graph_version = int(graph_version)
+        while True:
+            with self._condition:
+                cached = self._snapshots.get(graph_version)
+                if cached is not None and not refresh:
+                    return cached
+                if graph_version not in self._loading:
+                    self._loading.add(graph_version)
+                    break
+                remaining = remaining_seconds()
+                if remaining is not None and remaining <= 0.01:
+                    check_deadline(
+                        "vector_model_snapshot_wait",
+                        reserve_seconds=0.01,
+                    )
+                self._condition.wait(
+                    timeout=(
+                        min(0.1, max(0.01, remaining))
+                        if remaining is not None
+                        else 0.1
+                    )
+                )
+                # A concurrent forced refresh satisfies this caller too.
+                refresh = False
+        try:
+            loaded = dict(loader())
+        except Exception:
+            with self._condition:
+                self._loading.discard(graph_version)
+                self._condition.notify_all()
+            raise
+        with self._condition:
+            self._generation += 1
+            snapshot = (self._generation, loaded)
+            self._snapshots[graph_version] = snapshot
+            self._loading.discard(graph_version)
+            if len(self._snapshots) > self.retained_revisions:
+                oldest = sorted(
+                    self._snapshots,
+                    key=lambda revision: self._snapshots[revision][0],
+                )[: len(self._snapshots) - self.retained_revisions]
+                for revision in oldest:
+                    self._snapshots.pop(revision, None)
+            self._condition.notify_all()
+            return snapshot
+
+
 def _content_token(token: str) -> bool:
     """Keep lexical retrieval focused on semantic content, not wire metadata."""
 
@@ -57,10 +130,19 @@ def _content_token(token: str) -> bool:
 
 
 class IndexService:
-    def __init__(self, store: Any, smp: Any):
+    def __init__(
+        self,
+        store: Any,
+        smp: Any,
+        vector_model_snapshots: VectorModelSnapshotCache | None = None,
+    ):
         self.store = store
         self.smp = smp
         self._smp_vector_model_graph_version: int | None = None
+        self._smp_vector_model_generation: int | None = None
+        self._vector_model_snapshots = (
+            vector_model_snapshots or VectorModelSnapshotCache()
+        )
         self._policy_provider: Any | None = None
 
     def set_policy_provider(self, provider: Any) -> None:
@@ -300,30 +382,45 @@ class IndexService:
             if published_revisions
             else canonical_graph_version
         )
+
+        def load_snapshot() -> Mapping[str, Any]:
+            check_deadline("vector_model_document_frequencies")
+            document_count = self.store.atom_text_document_count()
+            document_frequencies = self.store.token_document_frequencies()
+            check_deadline("vector_model_latent_vectors")
+            latent_vectors = self.store.list_token_latent_vectors(
+                graph_version=vector_graph_version
+            )
+            return {
+                "document_count": document_count,
+                "document_frequencies": document_frequencies,
+                "latent_vectors": latent_vectors,
+                "latent_dimensions": max(
+                    (len(vector) for vector in latent_vectors.values()),
+                    default=0,
+                ),
+            }
+
+        generation, snapshot = self._vector_model_snapshots.get_or_load(
+            vector_graph_version,
+            load_snapshot,
+            refresh=force,
+        )
         if (
             not force
             and self._smp_vector_model_graph_version == vector_graph_version
+            and self._smp_vector_model_generation == generation
         ):
             return self.smp.vector_model_info()
-        check_deadline("vector_model_document_frequencies")
-        document_count = self.store.atom_text_document_count()
-        document_frequencies = self.store.token_document_frequencies()
-        check_deadline("vector_model_latent_vectors")
-        latent_vectors = self.store.list_token_latent_vectors(
-            graph_version=vector_graph_version
-        )
-        latent_dimensions = max(
-            (len(vector) for vector in latent_vectors.values()),
-            default=0,
-        )
         self.smp.configure_vector_model(
-            document_frequencies=document_frequencies,
-            document_count=document_count,
+            document_frequencies=snapshot["document_frequencies"],
+            document_count=int(snapshot["document_count"]),
             graph_version=vector_graph_version,
-            latent_vectors=latent_vectors,
-            latent_dimensions=latent_dimensions,
+            latent_vectors=snapshot["latent_vectors"],
+            latent_dimensions=int(snapshot["latent_dimensions"]),
         )
         self._smp_vector_model_graph_version = vector_graph_version
+        self._smp_vector_model_generation = generation
         return self.smp.vector_model_info()
 
 

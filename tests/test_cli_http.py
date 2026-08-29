@@ -37,6 +37,7 @@ from amos import (
 )
 from amos.cli import main as cli_main
 from amos.http_api import AmosHTTPServer, _FairAdmission, _FairServicePool
+from amos.request_context import check_deadline
 from amos.smp import cosine
 
 from .helpers import ExampleTrainingFlightProcessor, item_refs
@@ -510,6 +511,44 @@ def test_http_cold_inventory_cache_returns_bounded_summary_while_refreshing(
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_background_inventory_refresh_has_a_hard_execution_deadline():
+    server = AmosHTTPServer.__new__(AmosHTTPServer)
+    server.DEFAULT_REQUEST_DEADLINE_SECONDS = 0.05
+    server.inventory_lock = threading.Lock()
+    server.inventory_cache_lock = threading.Lock()
+    server.service_lock = threading.RLock()
+    server.inventory_refresh_thread = None
+    server.inventory_refresh_error = None
+    server.closing = False
+
+    class RefreshAmos:
+        @staticmethod
+        def health_memory_inventory():
+            while True:
+                check_deadline("inventory_integrity_test")
+                time.sleep(0.005)
+
+        @staticmethod
+        def close():
+            raise AssertionError("an open server must not close the refresh lane")
+
+    class PolicyWorker:
+        @staticmethod
+        def status():
+            return {"status": "idle"}
+
+    server.inventory_refresh_amos = RefreshAmos()
+    server.memory_policy_worker = PolicyWorker()
+
+    assert server._ensure_inventory_refresh() is True
+    refresh = server.inventory_refresh_thread
+    assert refresh is not None
+    refresh.join(timeout=1)
+    assert refresh.is_alive() is False
+    assert "RequestDeadlineExceeded" in str(server.inventory_refresh_error)
+    assert "inventory_integrity_test" in str(server.inventory_refresh_error)
 
 
 def test_http_heavy_retrievals_reserve_two_general_request_lanes(tmp_path):

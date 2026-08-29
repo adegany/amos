@@ -36,6 +36,7 @@ from amos import (
 )
 from amos.cli import main as cli_main
 from amos.http_api import AmosHTTPServer
+from amos.index_service import IndexService, VectorModelSnapshotCache
 from amos.errors import RequestDeadlineExceeded
 from amos.request_context import check_deadline, request_context
 from amos.smp import cosine
@@ -86,6 +87,74 @@ def test_read_snapshot_interrupts_one_long_sqlite_stage_at_deadline(amos):
     assert time.monotonic() - started < 1.0
 
 from .helpers import ExampleTrainingFlightProcessor, item_refs
+
+
+def test_vector_model_snapshot_is_loaded_once_and_shared_across_service_lanes():
+    class Store:
+        def __init__(self) -> None:
+            self.loads = 0
+
+        @staticmethod
+        def graph_version() -> int:
+            return 7
+
+        @staticmethod
+        def list_derived_index_metadata():
+            return [
+                {"index_name": "semantic_lexical_vectors", "graph_version": 7},
+                {"index_name": "semantic_lsa_vectors", "graph_version": 7},
+            ]
+
+        def atom_text_document_count(self) -> int:
+            self.loads += 1
+            return 2
+
+        @staticmethod
+        def token_document_frequencies():
+            return {"shared": 2}
+
+        @staticmethod
+        def list_token_latent_vectors(*, graph_version: int):
+            assert graph_version == 7
+            return {"shared": [1.0, 0.0]}
+
+    class Smp:
+        processor_id = "test"
+        processor_version = "1"
+
+        def __init__(self) -> None:
+            self.configurations = 0
+            self.graph_version = None
+
+        def configure_vector_model(self, **kwargs):
+            self.configurations += 1
+            self.graph_version = kwargs["graph_version"]
+
+        def vector_model_info(self):
+            return {"idf_graph_version": self.graph_version}
+
+    cache = VectorModelSnapshotCache()
+    first_store = Store()
+    second_store = Store()
+    first_smp = Smp()
+    second_smp = Smp()
+    first = IndexService(first_store, first_smp, cache)
+    second = IndexService(second_store, second_smp, cache)
+
+    first._sync_smp_vector_model()
+    second._sync_smp_vector_model()
+
+    assert first_store.loads == 1
+    assert second_store.loads == 0
+    assert first_smp.configurations == 1
+    assert second_smp.configurations == 1
+
+    first._sync_smp_vector_model(force=True)
+    second._sync_smp_vector_model()
+
+    assert first_store.loads == 2
+    assert second_store.loads == 0
+    assert second_smp.configurations == 2
 
 
 def test_retrieve_packet_uses_graph_version_packet_cache(amos, monkeypatch):

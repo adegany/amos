@@ -2317,7 +2317,7 @@ class ContinuityService:
                 })
             else:
                 atoms_by_id[str(atom["id"])] = atom
-        return {
+        response = {
             "status": "completed",
             "profile": self.CANONICAL_RECORD_BATCH_PROFILE,
             "revision": revision,
@@ -2327,6 +2327,49 @@ class ContinuityService:
             "heads": head_rows,
             "items_by_id": atoms_by_id,
         }
+        request = {
+            "profile": self.CANONICAL_RECORD_BATCH_PROFILE,
+            "atom_ids": normalized_atom_ids,
+            "heads": normalized_heads,
+            "scope": request_scope,
+            "requester": requester,
+            "target_processor": target_processor,
+            "retrieval_mode": "exact_batch",
+            "include_conflicts": bool(include_conflicts),
+            "include_archived": bool(include_archived),
+            "include_low_health": bool(include_low_health),
+            "include_superseded": bool(include_superseded),
+        }
+        packet_id = stable_id("pkt", {
+            "request": request,
+            "revision": revision,
+            "visible_atom_ids": sorted(atoms_by_id),
+        })
+        response["packet_id"] = packet_id
+        response["request"] = request
+        # Exact batch reads participate in the same delayed retrieval-feedback
+        # contract as single-atom packets.  Persist only the bounded membership
+        # projection needed to validate later used_refs; callers already receive
+        # the canonical records in items_by_id.
+        self.store.persist_packet_after_read(
+            packet_id=packet_id,
+            request=request,
+            response={
+                "packet_id": packet_id,
+                "request": request,
+                "items": [
+                    {
+                        "atom_ref": atom_id,
+                        "association_trace": [],
+                    }
+                    for atom_id in atoms_by_id
+                ],
+                "evidence_refs": [],
+            },
+            graph_version=int(revision.get("graph_version", 0) or 0),
+            feedback_only=True,
+        )
+        return response
 
     def observe_memory_transaction(
         self,

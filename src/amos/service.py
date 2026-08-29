@@ -23,7 +23,7 @@ from .diagnostics_service import DiagnosticsService
 from .errors import ValidationError
 from .governance_service import GovernanceService
 from .graph_service import GraphService
-from .index_service import IndexService
+from .index_service import IndexService, VectorModelSnapshotCache
 from .mutations_service import MutationService
 from .policy_service import PolicyService
 from .reasoning_service import ReasoningFrameService
@@ -44,6 +44,7 @@ class Amos:
         store: Any | None = None,
         maintenance_processors: Sequence[MaintenanceProcessor] | None = None,
         maintenance_processor_paths: Sequence[str] | None = None,
+        vector_model_snapshots: VectorModelSnapshotCache | None = None,
     ):
         self.store = store or SQLiteStore(db_path)
         self.smp = SemanticMaintenanceProcessor()
@@ -53,7 +54,11 @@ class Amos:
             processor_paths=maintenance_processor_paths,
         )
         self.access = AccessService(self.store)
-        self.indexes = IndexService(self.store, self.smp)
+        self.indexes = IndexService(
+            self.store,
+            self.smp,
+            vector_model_snapshots=vector_model_snapshots,
+        )
         self.graph = GraphService(self.store, self.indexes)
         self.temporal = TemporalService()
         self.capacity = CapacityService(self.store)

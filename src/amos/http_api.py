@@ -23,6 +23,7 @@ from .errors import (
     ValidationError,
 )
 from .governance_service import GovernanceService
+from .index_service import VectorModelSnapshotCache
 from .request_context import remaining_seconds, request_context
 from .schemas import CONSTITUTIONAL_ATOM_TYPES
 from .service import Amos
@@ -262,17 +263,20 @@ class AmosHTTPServer(ThreadingHTTPServer):
             for token, principal in dict(governance_principals or {}).items()
             if str(token)
         }
-        self.amos = Amos(
-            db_path,
-            maintenance_processor_paths=self.maintenance_processor_paths,
-        )
+        self.vector_model_snapshots = VectorModelSnapshotCache()
+
+        def new_amos() -> Amos:
+            return Amos(
+                db_path,
+                maintenance_processor_paths=self.maintenance_processor_paths,
+                vector_model_snapshots=self.vector_model_snapshots,
+            )
+
+        self.amos = new_amos()
         self.request_services = [
             self.amos,
             *[
-                Amos(
-                    db_path,
-                    maintenance_processor_paths=self.maintenance_processor_paths,
-                )
+                new_amos()
                 for _ in range(self.REQUEST_SERVICE_COUNT - 1)
             ],
         ]
@@ -282,30 +286,12 @@ class AmosHTTPServer(ThreadingHTTPServer):
         self.request_service_pool = _FairServicePool(self.request_services)
         self.heavy_admission = _FairAdmission(self.HEAVY_REQUEST_CAPACITY)
         self.retrieval_singleflight = _SingleFlight()
-        self.health_amos = Amos(
-            db_path,
-            maintenance_processor_paths=self.maintenance_processor_paths,
-        )
-        self.capacity_amos = Amos(
-            db_path,
-            maintenance_processor_paths=self.maintenance_processor_paths,
-        )
-        self.inventory_amos = Amos(
-            db_path,
-            maintenance_processor_paths=self.maintenance_processor_paths,
-        )
-        self.inventory_summary_amos = Amos(
-            db_path,
-            maintenance_processor_paths=self.maintenance_processor_paths,
-        )
-        self.inventory_refresh_amos = Amos(
-            db_path,
-            maintenance_processor_paths=self.maintenance_processor_paths,
-        )
-        self.ready_amos = Amos(
-            db_path,
-            maintenance_processor_paths=self.maintenance_processor_paths,
-        )
+        self.health_amos = new_amos()
+        self.capacity_amos = new_amos()
+        self.inventory_amos = new_amos()
+        self.inventory_summary_amos = new_amos()
+        self.inventory_refresh_amos = new_amos()
+        self.ready_amos = new_amos()
         self.health_lock = threading.Lock()
         self.capacity_lock = threading.Lock()
         self.inventory_lock = threading.Lock()
@@ -314,16 +300,11 @@ class AmosHTTPServer(ThreadingHTTPServer):
         self.inventory_cache: dict[str, Any] | None = None
         self.inventory_cache_at_monotonic: float | None = None
         self.inventory_cache_at_epoch_seconds: float | None = None
+        self.inventory_refresh_error: str | None = None
         self.inventory_refresh_thread: threading.Thread | None = None
         self.ready_lock = threading.Lock()
-        self.maintenance_amos = Amos(
-            db_path,
-            maintenance_processor_paths=self.maintenance_processor_paths,
-        )
-        self.policy_worker_amos = Amos(
-            db_path,
-            maintenance_processor_paths=self.maintenance_processor_paths,
-        )
+        self.maintenance_amos = new_amos()
+        self.policy_worker_amos = new_amos()
         self.maintenance_lock = threading.Lock()
         self.maintenance_leases = ExpiringMaintenanceLeaseGate()
         self.memory_policy_worker = BackgroundMemoryPolicyWorker(
@@ -344,6 +325,7 @@ class AmosHTTPServer(ThreadingHTTPServer):
             self.inventory_cache = dict(payload)
             self.inventory_cache_at_monotonic = time.monotonic()
             self.inventory_cache_at_epoch_seconds = sampled_at_epoch_seconds
+            self.inventory_refresh_error = None
         return sampled_at_epoch_seconds
 
     def inventory_health_payload(self, amos: Amos) -> dict[str, Any]:
@@ -376,7 +358,15 @@ class AmosHTTPServer(ThreadingHTTPServer):
                 with self.service_lock:
                     if self.closing:
                         return
-                payload = self.inventory_refresh_amos.health_memory_inventory()
+                with request_context(
+                    deadline_epoch_seconds=(
+                        time.time() + self.DEFAULT_REQUEST_DEADLINE_SECONDS
+                    ),
+                    request_id="inventory-cache-refresh",
+                ):
+                    payload = (
+                        self.inventory_refresh_amos.health_memory_inventory()
+                    )
                 payload["background_policy_worker"] = (
                     self.memory_policy_worker.status()
                 )
@@ -386,6 +376,11 @@ class AmosHTTPServer(ThreadingHTTPServer):
                     self._publish_inventory_cache(payload)
             finally:
                 self.inventory_lock.release()
+        except (AmosError, RuntimeError, sqlite3.Error, ValueError) as exc:
+            with self.inventory_cache_lock:
+                self.inventory_refresh_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )[:1000]
         finally:
             with self.inventory_cache_lock:
                 if self.inventory_refresh_thread is threading.current_thread():
@@ -428,6 +423,7 @@ class AmosHTTPServer(ThreadingHTTPServer):
             )
             sampled_at = self.inventory_cache_at_monotonic
             sampled_at_epoch_seconds = self.inventory_cache_at_epoch_seconds
+            refresh_error = self.inventory_refresh_error
             if (
                 cached is None
                 or sampled_at is None
@@ -501,6 +497,7 @@ class AmosHTTPServer(ThreadingHTTPServer):
                 "sampled_at_epoch_seconds": sampled_at_epoch_seconds,
                 "refreshing": refreshing,
                 "ttl_seconds": self.INVENTORY_CACHE_TTL_SECONDS,
+                "last_refresh_error": refresh_error,
             },
         }
 
