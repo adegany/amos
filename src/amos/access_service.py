@@ -37,7 +37,25 @@ class AccessService:
             raise IdempotencyConflict(
                 f"idempotency key reused with different payload: {idempotency_key}"
             )
-        return existing["response"]
+        response = dict(existing["response"])
+        # Storage cleanup deliberately compacts large idempotent responses, but
+        # callers still need the canonical references created by the original
+        # mutation. Recover them from the retained event for legacy compact
+        # receipts that predate reference preservation in the compact payload.
+        if response.get("storage_compacted") and not response.get(
+            "evidence_refs"
+        ):
+            event_id = str(response.get("event_id") or "")
+            event = self.store.get_event(event_id) if event_id else None
+            event = event if isinstance(event, Mapping) else {}
+            evidence_refs = [
+                str(ref)
+                for ref in event.get("evidence_refs") or ()
+                if str(ref)
+            ]
+            if evidence_refs:
+                response["evidence_refs"] = evidence_refs
+        return response
 
 
     def _record_idempotency(

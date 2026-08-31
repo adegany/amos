@@ -1459,10 +1459,31 @@ class SQLiteStore:
         for row in rows:
             response_json = row["response_json"] or ""
             original_bytes += len(response_json.encode("utf-8"))
+            original_response = self._json(response_json)
+            original_event = original_response.get("event")
+            original_event = (
+                original_event if isinstance(original_event, Mapping) else {}
+            )
+            original_evidence = original_response.get("evidence")
+            original_evidence = (
+                original_evidence
+                if isinstance(original_evidence, Mapping)
+                else {}
+            )
+            evidence_refs = list(dict.fromkeys(
+                str(ref)
+                for ref in (
+                    *(original_response.get("evidence_refs") or ()),
+                    *(original_event.get("evidence_refs") or ()),
+                    original_evidence.get("evidence_id"),
+                )
+                if str(ref or "")
+            ))
             compact_response = {
                 "status": "compacted",
                 "storage_compacted": True,
                 "event_id": row["event_id"],
+                "evidence_refs": evidence_refs,
                 "payload_digest": row["payload_digest"],
                 "original_response_bytes": len(response_json.encode("utf-8")),
                 "compacted_at": compacted_at,

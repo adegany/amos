@@ -2595,6 +2595,62 @@ def test_memory_policy_storage_cleanup_compacts_idempotency_and_sqlite(amos, mon
     assert json.loads(row["response_json"])["storage_compacted"] is True
 
 
+def test_compacted_capture_idempotency_preserves_and_recovers_evidence_refs(amos):
+    request = {
+        "source_type": "external_effect_history",
+        "source_ref": "external-effect-history:filled",
+        "payload": {"state": "filled", "broker_order_id": "order:123"},
+        "actor": "svc:test:external-effect-observer",
+        "scope": {"system": "test", "namespace": "effects"},
+        "idempotency_key": "external-effect-history-filled",
+    }
+    captured = amos.capture_event(**request)
+    evidence_ref = captured["evidence"]["evidence_id"]
+    old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    with amos.store.transaction() as conn:
+        conn.execute(
+            "UPDATE amos_idempotency SET created_at = ? WHERE actor = ? AND idempotency_key = ?",
+            (old, request["actor"], request["idempotency_key"]),
+        )
+        compacted = amos.store.compact_idempotency_responses(
+            conn,
+            older_than=datetime.now(timezone.utc).isoformat().replace(
+                "+00:00", "Z"
+            ),
+            max_rows=1,
+        )
+    assert compacted["rows"] == 1
+
+    replayed = amos.capture_event(**request)
+    assert replayed["storage_compacted"] is True
+    assert replayed["evidence_refs"] == [evidence_ref]
+
+    # Older compact receipts did not retain the evidence list. A replay must
+    # recover it from the immutable event instead of returning an unresolvable
+    # source alias to the caller.
+    with amos.store.transaction() as conn:
+        row = conn.execute(
+            "SELECT response_json FROM amos_idempotency WHERE actor = ? AND idempotency_key = ?",
+            (request["actor"], request["idempotency_key"]),
+        ).fetchone()
+        legacy_response = json.loads(row["response_json"])
+        legacy_response.pop("evidence_refs")
+        conn.execute(
+            "UPDATE amos_idempotency SET response_json = ? WHERE actor = ? AND idempotency_key = ?",
+            (
+                json.dumps(legacy_response, sort_keys=True),
+                request["actor"],
+                request["idempotency_key"],
+            ),
+        )
+
+    replayed_legacy = amos.capture_event(**request)
+    assert replayed_legacy["storage_compacted"] is True
+    assert replayed_legacy["evidence_refs"] == [evidence_ref]
+
+
 def test_storage_cleanup_runs_under_pressure_despite_recent_activity(amos, monkeypatch):
     amos.commit_atom(
         {
