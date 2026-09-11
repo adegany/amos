@@ -3,3 +3,6 @@
 .env.*
 *.log
 __pycache__/
+
+# Generated provider diagnostics and prompt traces
+/var/debug/prompt-traces/
