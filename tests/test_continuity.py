@@ -734,6 +734,38 @@ def thread_state(
     }
 
 
+def test_intrinsic_provenance_resolves_records_in_the_same_transaction(amos):
+    amos.commit_atom({
+        "id": "prior_source", "type": "semantic",
+        "payload": {"summary": "prior context"},
+    })
+    result = amos.commit_memory_transaction(
+        evidence=[{
+            "evidence_id": "evd_atomic_provenance",
+            "source_type": "observation", "source_ref": "atomic-observation",
+            "payload": {"summary": "new captured observation"},
+        }],
+        atoms=[{
+            "id": "new_lineage", "type": "semantic",
+            "payload": {"summary": "new lineage"},
+        }, {
+            "id": "atomic_consumer", "type": "semantic",
+            "payload": {
+                "summary": "source-bound result",
+                "graph_relations": [{
+                    "target_ref": "prior_source", "relation": "rel:derived_from",
+                    "evidence_refs": ["evd_atomic_provenance", "new_lineage"],
+                }],
+            },
+        }],
+    )
+    edge = result["edges"][0]
+    assert edge["evidence_refs"] == ["evd_atomic_provenance"]
+    assert "new_lineage" in edge["derivation"]["source_refs"]
+    assert not edge["derivation"].get("unresolved_source_refs")
+    assert amos.verify_replay()["status"] == "ok"
+
+
 def test_atomic_interaction_thread_head_and_workspace_visibility(amos, monkeypatch):
     first = amos.commit_memory_transaction(
         scope=SCOPE,

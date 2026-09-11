@@ -242,7 +242,13 @@ class GraphService:
         return score
 
 
-    def _intrinsic_edges_for_atom(self, atom: Mapping[str, Any]) -> list[dict[str, Any]]:
+    def _intrinsic_edges_for_atom(
+        self,
+        atom: Mapping[str, Any],
+        *,
+        pending_evidence_refs: Sequence[str] = (),
+        pending_atom_refs: Sequence[str] = (),
+    ) -> list[dict[str, Any]]:
         """Project deterministic graph edges encoded by structured atom fields."""
 
         if atom.get("deleted") or atom.get("lifecycle_state") != "active":
@@ -254,6 +260,11 @@ class GraphService:
         payload = payload if isinstance(payload, Mapping) else {}
         edges: list[dict[str, Any]] = []
         seen: set[tuple[str, str, str]] = set()
+        reference_kinds: dict[str, set[str]] = {
+            ref: {"atom"} for ref in pending_atom_refs
+        }
+        for ref in pending_evidence_refs:
+            reference_kinds.setdefault(ref, set()).add("evidence")
 
         def active_atom(ref: Any) -> dict[str, Any] | None:
             ref_id = str(ref or "")
@@ -298,21 +309,45 @@ class GraphService:
                     if str(ref)
                 )
             )
+            # Legacy structured relations can still contain atom lineage in
+            # evidence_refs after maintenance has repaired the projected edge.
+            # Classify before projection so stewardship cannot reintroduce it.
+            missing_refs = [ref for ref in relation_evidence if ref not in reference_kinds]
+            if missing_refs:
+                records = self.store.reference_records(missing_refs)
+                reference_kinds.update({
+                    ref: {record["kind"] for record in records.get(ref, [])}
+                    for ref in missing_refs
+                })
+            source_refs = [atom_id]
+            unresolved_refs = []
+            exact_evidence = []
+            for ref in relation_evidence:
+                kinds = reference_kinds[ref]
+                if "evidence" in kinds:
+                    exact_evidence.append(ref)
+                elif "atom" in kinds or ref == atom_id:
+                    source_refs.append(ref)
+                else:
+                    unresolved_refs.append(ref)
+            derivation = {
+                "kind": derivation_kind,
+                "processor_id": "amos.graph.intrinsic.v1",
+                "source_refs": list(dict.fromkeys(source_refs)),
+            }
+            if unresolved_refs:
+                derivation["unresolved_source_refs"] = unresolved_refs
             edges.append(
                 self._edge(
                     source,
                     target,
                     relation,
                     scope,
-                    evidence_refs=relation_evidence,
+                    evidence_refs=exact_evidence,
                     confidence=(
                         confidence if confidence is not None else atom.get("confidence")
                     ),
-                    derivation={
-                        "kind": derivation_kind,
-                        "processor_id": "amos.graph.intrinsic.v1",
-                        "source_refs": [atom_id],
-                    },
+                    derivation=derivation,
                 )
             )
 

@@ -1573,6 +1573,67 @@ def test_memory_policy_archives_commitment_with_recorded_satisfaction(amos):
     assert amos.verify_replay()["status"] == "ok"
 
 
+def test_steward_does_not_restore_mistyped_refs_from_legacy_relation_payload(amos):
+    evidence = amos.capture_event(
+        source_type="observation", source_ref="legacy-relation-test",
+        payload={"summary": "exact observation"},
+    )["evidence"]["evidence_id"]
+    source = amos.commit_atom({
+        "id": "legacy_relation_source", "type": "semantic",
+        "payload": {"summary": "historical lineage"},
+    })["atom"]
+    target = amos.commit_atom({
+        "id": "legacy_relation_target", "type": "semantic",
+        "payload": {
+            "summary": "derived consolidation",
+            "graph_relations": [{
+                "target_ref": source["id"], "relation": "rel:derived_from",
+                "evidence_refs": [evidence, source["id"], "legacy_unknown"],
+            }],
+        },
+    })["atom"]
+    edge = amos.store.list_edges_for_refs([target["id"]])[0]
+    assert edge["evidence_refs"] == [evidence]
+    assert source["id"] in edge["derivation"]["source_refs"]
+    assert edge["derivation"]["unresolved_source_refs"] == ["legacy_unknown"]
+
+    # Reproduce a pre-fix projection, then let normal repair/stewardship run.
+    legacy_edge = dict(edge, evidence_refs=[evidence, source["id"], "legacy_unknown"])
+    with amos.store.transaction() as conn:
+        amos.store.upsert_edge(conn, legacy_edge)
+    repaired = amos.policy._run_reference_contract_repairs(
+        scope={}, actor="legacy-relation-test", max_repairs=10,
+    )
+    assert repaired["action_count"] == 1
+    repaired_version = amos.store.get_edge(edge["edge_id"])["version"]
+    for _ in range(2):
+        amos.run_steward()
+        current = amos.store.get_edge(edge["edge_id"])
+        assert current["evidence_refs"] == [evidence]
+        assert current["version"] == repaired_version
+        assert source["id"] in current["derivation"]["source_refs"]
+        assert current["derivation"]["unresolved_source_refs"] == ["legacy_unknown"]
+    assert amos.health_memory_inventory()["quality"]["reference_contract"]["mistyped_atom_refs"] == 0
+    assert amos.verify_replay()["status"] == "ok"
+
+
+@pytest.mark.parametrize("target_state,expected", [("active", 1), ("superseded", 0)])
+def test_supersession_warning_only_counts_targets_still_active(amos, target_state, expected):
+    for ref, state in [("diagnostic_predecessor", target_state), ("diagnostic_successor", "active")]:
+        amos.commit_atom({
+            "id": ref, "type": "semantic", "lifecycle_state": state,
+            "payload": {"summary": ref},
+        })
+    amos.commit_memory_transaction(edges=[{
+        "source_ref": "diagnostic_successor", "target_ref": "diagnostic_predecessor",
+        "relation": "rel:supersedes",
+    }])
+    for health in (amos.health_memory(run_policy=False), amos.health_memory_inventory()):
+        quality = health["quality"]
+        assert quality["active_superseded_atoms"]["count"] == expected
+        assert ("active_superseded_atoms_present" in quality["warnings"]) is bool(expected)
+
+
 def test_health_memory_reports_quality_diagnostics(amos):
     amos.configure_memory_policy(
         decay={"max_atoms": 1},

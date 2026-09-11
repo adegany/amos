@@ -475,6 +475,11 @@ def test_steward_prunes_live_profile_edges_to_inactive_atoms(amos):
 
 
 def test_steward_backfills_intrinsic_edges_for_existing_atoms(amos):
+    evidence_ref = amos.capture_event(
+        source_type="observation", source_ref="semantic-observation",
+        payload={"summary": "observed semantic provenance"},
+        scope={"tenant": "graph"},
+    )["evidence"]["evidence_id"]
     semantic = amos.commit_atom(
         {
             "id": "early_semantic",
@@ -483,7 +488,7 @@ def test_steward_backfills_intrinsic_edges_for_existing_atoms(amos):
                 "summary": "semantic arrived before source",
                 "source_refs": ["late_source"],
             },
-            "evidence_refs": ["evt_semantic_observation"],
+            "evidence_refs": [evidence_ref],
             "confidence": {"level": "high", "score": 0.91},
             "scope": {"tenant": "graph"},
         }
@@ -520,12 +525,17 @@ def test_steward_backfills_intrinsic_edges_for_existing_atoms(amos):
         and edge["relation"] == "rel:derived_from"
         and edge["target_ref"] == source["id"]
     )
-    assert edge["evidence_refs"] == ["evt_semantic_observation"]
+    assert edge["evidence_refs"] == [evidence_ref]
     assert edge["confidence"] == {"level": "high", "score": 0.91}
     assert amos.verify_replay()["status"] == "ok"
 
 
 def test_steward_refreshes_legacy_intrinsic_edge_provenance(amos):
+    evidence_ref = amos.capture_event(
+        source_type="observation", source_ref="later-provenance",
+        payload={"summary": "observed later provenance"},
+        scope={"tenant": "graph"},
+    )["evidence"]["evidence_id"]
     source = amos.commit_atom(
         {
             "id": "provenance_source",
@@ -560,7 +570,7 @@ def test_steward_refreshes_legacy_intrinsic_edge_provenance(amos):
     updated = amos.update_atom(
         semantic["id"],
         set_fields={
-            "evidence_refs": ["evt_later_provenance"],
+            "evidence_refs": [evidence_ref],
             "confidence": {"level": "high", "score": 0.92},
         },
         expected_version=semantic["version"],
@@ -576,7 +586,7 @@ def test_steward_refreshes_legacy_intrinsic_edge_provenance(amos):
         for action in result["actions"]
     )
     refreshed = amos.store.get_edge(edge["edge_id"])
-    assert refreshed["evidence_refs"] == ["evt_later_provenance"]
+    assert refreshed["evidence_refs"] == [evidence_ref]
     assert refreshed["confidence"] == {"level": "high", "score": 0.92}
     assert refreshed["version"] == unchanged_edge["version"] + 1
     assert updated["version"] == semantic["version"] + 1

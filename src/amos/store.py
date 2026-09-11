@@ -2393,7 +2393,7 @@ class SQLiteStore:
                JOIN amos_atoms AS target
                  ON target.id=edge.target_ref
                 AND target.deleted=0
-                AND target.lifecycle_state IN ('active','superseded')
+                AND target.lifecycle_state='active'
                WHERE edge.deleted=0
                  AND edge.lifecycle_state='active'
                  AND edge.relation='rel:supersedes'"""

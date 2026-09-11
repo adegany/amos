@@ -582,7 +582,11 @@ class ContinuityService:
             historical_edge_matches_allowed: set[str] = set()
             seen_edges: set[str] = set()
             for atom in prepared:
-                for edge in self._intrinsic_edges_for_atom(atom):
+                for edge in self._intrinsic_edges_for_atom(
+                    atom,
+                    pending_evidence_refs=sorted(evidence_ids),
+                    pending_atom_refs=list(prepared_by_id),
+                ):
                     if edge["edge_id"] not in seen_edges:
                         requested_edges.append(edge)
                         seen_edges.add(str(edge["edge_id"]))

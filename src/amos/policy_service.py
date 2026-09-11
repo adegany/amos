@@ -1745,7 +1745,11 @@ class PolicyService:
                     for key in ("proposed", "committed", "already_committed", "deferred", "skipped"):
                         target[key] += int(counters.get(key, 0) or 0)
 
-        superseded_refs = self._active_superseded_refs()
+        superseded_refs = {
+            ref: sources
+            for ref, sources in self._active_superseded_refs().items()
+            if by_ref.get(ref, {}).get("lifecycle_state") == "active"
+        }
         superseded_by_type: dict[str, int] = {}
         for atom_ref in superseded_refs:
             atom = by_ref.get(atom_ref)
