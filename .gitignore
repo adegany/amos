@@ -3,6 +3,8 @@
 .env.*
 *.log
 __pycache__/
+build/
+*.egg-info/
 
 # Generated provider diagnostics and prompt traces
 /var/debug/prompt-traces/
