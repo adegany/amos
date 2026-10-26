@@ -35,6 +35,7 @@ from .workers import BackgroundMemoryPolicyWorker, ExpiringMaintenanceLeaseGate
 OBSERVATION_PATHS = frozenset({
     "/v1/canonical-records:batch-get",
     "/v1/evidence:get",
+    "/v1/evidence:batch-get",
     "/v1/memory-heads:get",
 })
 
@@ -1352,6 +1353,8 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                 if policy_schedule is not None:
                     packet["policy_schedule"] = policy_schedule
                 return self._write_json(packet)
+            if path == "/v1/evidence:batch-get":
+                return self._write_json(amos.retrieve_evidence_batch(**body))
             if path == "/v1/evidence:get":
                 request = dict(body)
                 evidence_id = request.pop("evidence_id")

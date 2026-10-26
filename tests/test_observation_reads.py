@@ -7,6 +7,7 @@ import pytest
 from amos.http_api import AmosHTTPServer
 from amos.request_context import request_context, record_read_effects
 from amos import Amos
+from amos.errors import ValidationError
 from datetime import datetime, timedelta, timezone
 from .test_cli_http import http_json
 
@@ -23,6 +24,8 @@ def test_observation_read_progresses_with_all_normal_channels_waiting_for_writer
     server.amos.commit_atom({"id": "other-scope", "type": "semantic",
                              "payload": {"summary": "private"},
                              "scope": {"namespace": "other"}})
+    evidence=server.amos.capture_event(source_type='test',source_ref='visible',
+        payload={'text':'current'},scope={'namespace':'test'})['evidence']['evidence_id']
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     url = f"http://127.0.0.1:{server.server_address[1]}/v1/canonical-records:batch-get"
@@ -54,6 +57,11 @@ def test_observation_read_progresses_with_all_normal_channels_waiting_for_writer
             assert observation["read_effects_recorded"] is False
             assert observation["items_by_id"]["visible"]["payload"]["summary"] == "current"
             assert "other-scope" not in observation["items_by_id"]
+            batch=http_json(url.replace('canonical-records:batch-get','evidence:batch-get'),
+                {'evidence_ids':[evidence],'scope':{'namespace':'test'}},
+                headers={'X-AMOS-Read-Purpose':'observation'})
+            assert batch['observation_only'] is True
+            assert batch['items'][0]['record']['payload']['text']=='current'
             assert not results
             assert server.observation_amos.store.conn.execute(
                 "SELECT count(*) FROM amos_retrieval_packet_receipts"
@@ -100,6 +108,29 @@ def test_observation_context_is_nested_and_restored():
             assert record_read_effects()
         assert not record_read_effects()
     assert record_read_effects()
+
+
+def test_evidence_batches_preserve_access_and_feedback_and_enforce_bounds(tmp_path):
+    service=Amos(tmp_path / 'batch.sqlite3')
+    try:
+        public=service.capture_event(source_type='test',source_ref='public',
+            payload={'text':'public'},scope={'namespace':'test'})['evidence']['evidence_id']
+        hidden=service.capture_event(source_type='test',source_ref='hidden',
+            payload={'text':'hidden'},scope={'namespace':'other'})['evidence']['evidence_id']
+        request={'evidence_ids':[public,hidden,'missing'],'scope':{'namespace':'test'}}
+        result=service.retrieve_evidence_batch(**request)
+        assert [item['status'] for item in result['items']]==['found','not_found','not_found']
+        assert result['items'][1]['omissions'][0]['reason']=='scope_hidden'
+        count=service.store.conn.execute('SELECT count(*) FROM amos_retrieval_packet_receipts').fetchone()[0]
+        assert count==3
+        with request_context(deadline_epoch_seconds=None,request_id=None,record_read_effects=False):
+            observed=service.retrieve_evidence_batch(**request)
+        assert [item['record'] for item in result['items']]==[item['record'] for item in observed['items']]
+        assert service.store.conn.execute('SELECT count(*) FROM amos_retrieval_packet_receipts').fetchone()[0]==count
+        for invalid in ([public]*129,[''],None):
+            with pytest.raises(ValidationError):service.retrieve_evidence_batch(evidence_ids=invalid)
+    finally:
+        service.close()
 
 
 def test_online_cleanup_catches_up_despite_uninterrupted_foreground_activity(tmp_path):

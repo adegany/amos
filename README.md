@@ -496,6 +496,16 @@ defer new background maintenance starts with the expiring
 `/v1/maintenance-leases:acquire`, `:renew`, and `:release` contract; queued work
 resumes after release or lease expiry.
 
+`POST /v1/evidence:batch-get` reads up to 128 known evidence IDs from one
+snapshot, applying the same scope and access controls as `/v1/evidence:get`.
+It returns individual exact-read packets and does not schedule policy work.
+For presentation only, `X-AMOS-Read-Purpose: observation` on these exact batch
+paths, `/v1/evidence:get`, or `/v1/memory-heads:get` uses one reserved read
+connection without retaining learning feedback packets. Responses explicitly
+mark `observation_only: true` and `read_effects_recorded: false`. Other reads
+retain feedback normally. The four normal request connections and two heavy
+work slots remain independent; capacity health reports all admission queues.
+
 ### Compile revision-bound reasoning frames
 
 Historical reasoning integrations can call `POST

@@ -733,6 +733,16 @@ POST /v1/canonical-records:batch-get
   scope, access, lifecycle, health, and supersession boundaries as exact reads
   does not invoke associative ranking or schedule memory policy work
 
+POST /v1/evidence:batch-get
+  accepts evidence_ids (at most 128), scope, requester, target_processor
+  returns individual exact-evidence packets from one revision-pinned snapshot
+  enforces the ordinary scope/access checks per record; omissions remain explicit
+  does not run policy work; feedback retention remains enabled by default
+  X-AMOS-Read-Purpose: observation uses one reserved read connection and skips
+  feedback retention; observation_only and read_effects_recorded mark this mode
+  observation mode also supports canonical-records:batch-get, evidence:get and
+  memory-heads:get; it cannot change mutation or associative-recall behavior
+
 POST /v1/maintenance-leases:acquire|renew|release
   lets a foreground recovery phase defer new maintenance starts with an opaque,
   bounded, expiring lease; duplicate owner/reason acquisition replaces the old

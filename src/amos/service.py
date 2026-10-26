@@ -625,6 +625,22 @@ class Amos:
                 _policy_already_run=True,
             )
 
+    def retrieve_evidence_batch(
+        self, *, evidence_ids: Sequence[str], scope: Mapping[str, Any] | None = None,
+        requester: str = "system", target_processor: str = "reasoner",
+    ) -> dict[str, Any]:
+        """Bounded exact evidence reads with the ordinary per-record controls."""
+        if not isinstance(evidence_ids, (list, tuple)) or len(evidence_ids) > 128:
+            raise ValidationError("evidence batch must contain at most 128 evidence IDs")
+        if any(not isinstance(ref, str) or not ref.strip() for ref in evidence_ids):
+            raise ValidationError("evidence IDs must be nonempty strings")
+        with self.store.read_snapshot():
+            packets = [self.retrieval.retrieve_evidence(ref, scope=scope,
+                requester=requester, target_processor=target_processor, run_policy=False)
+                for ref in dict.fromkeys(evidence_ids)]
+            return {"profile": "amos.exact-evidence-batch.v1", "status": "completed",
+                "graph_version": self.store.graph_version(), "items": packets}
+
     def compile_memory_frame(
         self,
         *,
