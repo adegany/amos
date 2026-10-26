@@ -24,10 +24,19 @@ from .errors import (
 )
 from .governance_service import GovernanceService
 from .index_service import VectorModelSnapshotCache
-from .request_context import remaining_seconds, request_context
+from .request_context import remaining_seconds, request_context, record_read_effects
 from .schemas import CONSTITUTIONAL_ATOM_TYPES
 from .service import Amos
 from .workers import BackgroundMemoryPolicyWorker, ExpiringMaintenanceLeaseGate
+
+
+# Exact UI observations use normal scope/access/lifecycle checks, but never
+# become learning packets or queue behind the SQLite feedback writer.
+OBSERVATION_PATHS = frozenset({
+    "/v1/canonical-records:batch-get",
+    "/v1/evidence:get",
+    "/v1/memory-heads:get",
+})
 
 
 class _FairAdmission:
@@ -284,6 +293,8 @@ class AmosHTTPServer(ThreadingHTTPServer):
         # retain the existing test/embedding seam while overlapping requests
         # receive isolated SQLite connections.
         self.request_service_pool = _FairServicePool(self.request_services)
+        self.observation_amos = new_amos()
+        self.observation_admission = _FairAdmission(1)
         self.heavy_admission = _FairAdmission(self.HEAVY_REQUEST_CAPACITY)
         self.retrieval_singleflight = _SingleFlight()
         self.health_amos = new_amos()
@@ -526,6 +537,7 @@ class AmosHTTPServer(ThreadingHTTPServer):
                 ):
                     self.inventory_refresh_amos.close()
                 self.ready_amos.close()
+                self.observation_amos.close()
                 for service in self.request_services:
                     service.close()
 
@@ -550,6 +562,11 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
             with request_context(
                 deadline_epoch_seconds=deadline,
                 request_id=request_id,
+                record_read_effects=not (
+                    method == "POST"
+                    and self.path.split("?", 1)[0] in OBSERVATION_PATHS
+                    and self.headers.get("X-AMOS-Read-Purpose") == "observation"
+                ),
             ):
                 self._handle_with_context(method)
 
@@ -716,6 +733,18 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         )
                     finally:
                         server.inventory_lock.release()
+                if not record_read_effects():
+                    if not server.observation_admission.acquire(
+                        timeout=self._request_deadline_remaining(),
+                        request_class="interactive",
+                    ):
+                        return self._write_saturated(stage="observation_read_admission")
+                    try:
+                        return self._dispatch(
+                            server, method, body, amos=server.observation_amos
+                        )
+                    finally:
+                        server.observation_admission.release()
                 request_amos: Amos | None = None
                 heavy_acquired = False
                 request_class = (
@@ -913,6 +942,8 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
                         "service_capacity": server.REQUEST_SERVICE_COUNT,
                         "service_available": server.request_service_pool.qsize(),
                         "service_pool": server.request_service_pool.status(),
+                        "observation_reads": server.observation_admission.status(),
+                        "total_read_service_capacity": server.REQUEST_SERVICE_COUNT + 1,
                         "heavy": server.heavy_admission.status(),
                         "retrieval_singleflight": (
                             server.retrieval_singleflight.status()
@@ -1573,6 +1604,9 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
         def _write_json(
             self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK
         ) -> None:
+            if not record_read_effects():
+                payload = {**payload, "read_effects_recorded": False,
+                           "observation_only": True}
             raw = json.dumps(payload, sort_keys=True).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")

@@ -20,7 +20,9 @@ from .journal_replay import (
     replay_events,
     serializable_replay_state,
 )
-from .request_context import check_deadline, current_stage, remaining_seconds
+from .request_context import (
+    check_deadline, current_stage, remaining_seconds, record_read_effects,
+)
 from .schemas import SCHEMA_VERSION, canonical_json, digest, utc_now
 
 JSON_COLUMNS = {
@@ -371,6 +373,8 @@ class SQLiteStore:
         graph_version: int,
         feedback_only: bool = False,
     ) -> None:
+        if not record_read_effects():
+            return
         effect = (
             "feedback" if feedback_only else "packet",
             {

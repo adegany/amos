@@ -18,21 +18,32 @@ _REQUEST_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _STAGE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "amos_request_stage", default=None
 )
+_RECORD_READ_EFFECTS: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "amos_record_read_effects", default=True
+)
 
 
 @contextmanager
 def request_context(
-    *, deadline_epoch_seconds: float | None, request_id: str | None
+    *, deadline_epoch_seconds: float | None, request_id: str | None,
+    record_read_effects: bool = True,
 ) -> Iterator[None]:
     deadline_token = _DEADLINE.set(deadline_epoch_seconds)
     request_token = _REQUEST_ID.set(str(request_id or "") or None)
     stage_token = _STAGE.set(None)
+    effects_token = _RECORD_READ_EFFECTS.set(record_read_effects)
     try:
         yield
     finally:
+        _RECORD_READ_EFFECTS.reset(effects_token)
         _STAGE.reset(stage_token)
         _REQUEST_ID.reset(request_token)
         _DEADLINE.reset(deadline_token)
+
+
+def record_read_effects() -> bool:
+    """Whether this read participates in learning/feedback packet retention."""
+    return _RECORD_READ_EFFECTS.get()
 
 
 def remaining_seconds() -> float | None:
