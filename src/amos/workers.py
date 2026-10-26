@@ -479,6 +479,18 @@ class BackgroundMemoryPolicyWorker:
         results = result.get("results")
         if isinstance(results, Mapping):
             compact["result_keys"] = sorted(str(key) for key in results)
+            cleanup = results.get("storage_cleanup")
+            if isinstance(cleanup, Mapping):
+                # Operational counters survive the bounded worker projection;
+                # deleted payloads, references and journal contents do not.
+                compact["storage_cleanup"] = {
+                    key: cleanup[key]
+                    for key in (
+                        "status", "deleted_atom_count", "physically_purged_atom_count",
+                        "reference_protection", "atom_scan",
+                    )
+                    if key in cleanup
+                }
         event = result.get("event")
         if isinstance(event, Mapping):
             compact["event_id"] = event.get("event_id")

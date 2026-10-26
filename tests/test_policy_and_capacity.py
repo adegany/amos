@@ -3132,3 +3132,18 @@ def test_memory_policy_journal_summarizes_large_smp_results(amos):
     assert payload["results"]["steward"]["event_id"]
     assert len(json.dumps(payload)) < 20000
     assert amos.verify_replay()["status"] == "ok"
+
+
+def test_background_policy_status_keeps_cleanup_counts_without_deleted_payloads(amos):
+    worker = BackgroundMemoryPolicyWorker(amos)
+    projected = worker._compact_result({"status": "completed", "results": {
+        "storage_cleanup": {"status": "completed", "deleted_atom_count": 23,
+            "physically_purged_atom_count": 23, "deleted_atom_refs": ["private-old-source"],
+            "reference_protection": {"protected_candidate_count": 9},
+            "atom_scan": {"remaining_eligible_candidate_count": 17},
+            "events": [{"payload": "not in status"}]}}})
+    assert projected["storage_cleanup"]["physically_purged_atom_count"] == 23
+    assert projected["storage_cleanup"]["reference_protection"]["protected_candidate_count"] == 9
+    assert projected["storage_cleanup"]["atom_scan"]["remaining_eligible_candidate_count"] == 17
+    assert "private-old-source" not in json.dumps(projected)
+    assert "not in status" not in json.dumps(projected)
