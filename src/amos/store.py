@@ -1712,6 +1712,20 @@ class SQLiteStore:
         )
         return int(cursor.rowcount or 0)
 
+    def stale_atom_ids_missing_text_index(self) -> list[str]:
+        rows = self.conn.execute(
+            """
+            SELECT a.id FROM amos_atoms AS a
+            WHERE a.health_status = 'stale' AND a.deleted = 0
+              AND a.lifecycle_state NOT IN ('archived', 'superseded', 'deleted')
+              AND NOT EXISTS (
+                SELECT 1 FROM amos_atom_text_index AS i WHERE i.atom_id = a.id
+              )
+            ORDER BY a.id
+            """
+        ).fetchall()
+        return [str(row["id"]) for row in rows]
+
     def prune_atom_text_index(
         self,
         conn: sqlite3.Connection,

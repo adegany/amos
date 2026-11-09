@@ -2626,7 +2626,30 @@ def test_routine_policy_preserves_transactional_text_index(amos):
         {"id": "routine_next_tick", "type": "semantic", "payload": {"summary": "nextword"}}
     )
     restored = amos.run_memory_policy()["results"]["index"]
-    assert restored["rebuilt_atom_count"] > 0
+    assert restored["rebuilt_atom_count"] == 1
+    assert amos.store.candidate_atom_ids_for_tokens(["staleword"]) == ["routine_stale"]
+
+    amos.configure_memory_policy(
+        schedule={"every_graph_versions": 0, "every_seconds": 0},
+        storage_cleanup={
+            "remove_stale_from_hot_index": True,
+            "idle_after_seconds": 0,
+            "min_interval_seconds": 0,
+            "max_deletions_per_tick": 0,
+            "max_idempotency_compactions_per_tick": 0,
+            "journal_compaction": {"enabled": False},
+        },
+    )
+    cleanup_only = amos.run_memory_policy()["results"]
+    assert "index" not in cleanup_only
+    assert not amos.store.candidate_atom_ids_for_tokens(["staleword"])
+    amos.configure_memory_policy(
+        schedule={"every_graph_versions": 1}, storage_cleanup={"enabled": False}
+    )
+    amos.commit_atom(
+        {"id": "routine_storage_only", "type": "semantic", "payload": {"summary": "new cycle"}}
+    )
+    assert amos.run_memory_policy()["results"]["index"]["rebuilt_atom_count"] == 1
     assert amos.store.candidate_atom_ids_for_tokens(["staleword"]) == ["routine_stale"]
     assert amos.verify_replay()["status"] == "ok"
 

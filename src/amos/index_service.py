@@ -445,45 +445,37 @@ class IndexService:
         prune_stale = cleanup.get("enabled", True) and cleanup.get(
             "remove_stale_from_hot_index", True
         )
-        if not rebuild_text_index:
-            lexical = next(
-                (
-                    index
-                    for index in self.store.list_derived_index_metadata()
-                    if index["index_name"] == "semantic_lexical_vectors"
-                ),
-                None,
-            )
-            # Atom mutations maintain the text index transactionally. Bootstrap
-            # old stores and restore previously pruned stale rows on policy change.
-            prior_prune = (lexical or {}).get("details_json", {}).get(
-                "hot_index_prune", {}
-            )
-            rebuild_text_index = lexical is None or (
-                not prune_stale and "stale" in prior_prune.get("health_statuses", ())
-            )
-        rebuilt_atoms = 0
-        write_batch_count = 0
-        if rebuild_text_index:
-            # Re-read each atom under the writer to avoid replacing a foreground
-            # update with stale repair input.
-            with self.store.read_snapshot():
+        with self.store.read_snapshot():
+            if rebuild_text_index or not any(
+                index["index_name"] == "semantic_lexical_vectors"
+                for index in self.store.list_derived_index_metadata()
+            ):
                 planned_atom_ids = [
                     str(atom["id"])
                     for atom in self.store.list_atoms_filtered(include_deleted=True)
                 ]
-            for offset in range(0, len(planned_atom_ids), write_batch_size):
-                atom_ids = planned_atom_ids[offset : offset + write_batch_size]
-                with self.store.transaction() as conn:
-                    for atom_id in atom_ids:
-                        atom = self.store.get_atom(atom_id)
-                        if atom is None:
-                            self.store.delete_atom_text_index(conn, atom_id)
-                            continue
-                        self.store.replace_atom_text_index(conn, atom)
-                        rebuilt_atoms += 1
-                write_batch_count += 1
-                self.store.cooperative_maintenance_yield()
+            elif not prune_stale:
+                # A storage-only pass may have pruned rows before policy changed.
+                planned_atom_ids = self.store.stale_atom_ids_missing_text_index()
+            else:
+                # Atom mutations already maintain the text index transactionally.
+                planned_atom_ids = []
+        rebuilt_atoms = 0
+        write_batch_count = 0
+        for offset in range(0, len(planned_atom_ids), write_batch_size):
+            atom_ids = planned_atom_ids[offset : offset + write_batch_size]
+            # Re-read each atom under the writer to avoid replacing a foreground
+            # update with stale repair input.
+            with self.store.transaction() as conn:
+                for atom_id in atom_ids:
+                    atom = self.store.get_atom(atom_id)
+                    if atom is None:
+                        self.store.delete_atom_text_index(conn, atom_id)
+                        continue
+                    self.store.replace_atom_text_index(conn, atom)
+                    rebuilt_atoms += 1
+            write_batch_count += 1
+            self.store.cooperative_maintenance_yield()
 
         pruned_index = {"status": "skipped", "reason": "storage_cleanup_disabled"}
         if cleanup.get("enabled", True):
