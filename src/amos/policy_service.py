@@ -440,6 +440,7 @@ class PolicyService:
                 results["index"] = self._rebuild_derived_indexes(
                     graph_version=policy_event_graph_version,
                     publish_revision_offset=1,
+                    rebuild_text_index=force,
                 )
             if (
                 invalidate_packet_cache

@@ -2585,6 +2585,52 @@ def test_memory_policy_rebuild_keeps_archived_stale_atoms_out_of_hot_index(amos)
     assert stale["id"] not in amos.store.candidate_atom_ids_for_tokens(["stale"])
 
 
+def test_routine_policy_preserves_transactional_text_index(amos):
+    amos.configure_memory_policy(
+        schedule={"every_graph_versions": 1, "every_seconds": 0},
+        maintenance={
+            "repair_reference_contracts": False,
+            "run_smp": False,
+            "run_steward": False,
+            "rebuild_lsa": False,
+        },
+        distillation={"enabled": False},
+        maintenance_distiller={"enabled": False},
+        decay={"enabled": False},
+    )
+    for atom_id, word, health in (
+        ("routine_changed", "oldword", "healthy"),
+        ("routine_deleted", "deleteword", "healthy"),
+        ("routine_stale", "staleword", "stale"),
+    ):
+        amos.commit_atom(
+            {
+                "id": atom_id,
+                "type": "semantic",
+                "payload": {"summary": word},
+                "health_status": health,
+            }
+        )
+    IndexMaintainer(amos).rebuild()
+    amos.update_atom("routine_changed", payload_patch={"summary": "newword"})
+    amos.delete_atom("routine_deleted", reason="index regression fixture")
+
+    routine = amos.run_memory_policy()["results"]["index"]
+    assert routine["rebuilt_atom_count"] == 0
+    assert routine["write_batch_count"] == 0
+    assert amos.store.candidate_atom_ids_for_tokens(["newword"]) == ["routine_changed"]
+    assert not amos.store.candidate_atom_ids_for_tokens(["oldword", "deleteword", "staleword"])
+
+    amos.configure_memory_policy(storage_cleanup={"remove_stale_from_hot_index": False})
+    amos.commit_atom(
+        {"id": "routine_next_tick", "type": "semantic", "payload": {"summary": "nextword"}}
+    )
+    restored = amos.run_memory_policy()["results"]["index"]
+    assert restored["rebuilt_atom_count"] > 0
+    assert amos.store.candidate_atom_ids_for_tokens(["staleword"]) == ["routine_stale"]
+    assert amos.verify_replay()["status"] == "ok"
+
+
 def test_memory_policy_storage_cleanup_compacts_idempotency_and_sqlite(amos, monkeypatch):
     amos.commit_atom(
         {

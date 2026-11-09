@@ -429,6 +429,7 @@ class IndexService:
         *,
         graph_version: int | None = None,
         publish_revision_offset: int = 0,
+        rebuild_text_index: bool = True,
     ) -> dict[str, Any]:
         requested_graph_version = (
             graph_version if graph_version is not None else self.store.graph_version()
@@ -440,31 +441,50 @@ class IndexService:
             1, int(maintenance.get("index_write_batch_size", 64) or 64)
         )
 
-        # Refresh the rebuildable lexical projection in short transactions.
-        # Each batch re-reads its atoms under the writer, so a foreground
-        # mutation that lands after planning is never overwritten by stale
-        # maintenance input.
-        with self.store.read_snapshot():
-            planned_atom_ids = [
-                str(atom["id"])
-                for atom in self.store.list_atoms_filtered(include_deleted=True)
-            ]
+        cleanup = policy.get("storage_cleanup", {})
+        prune_stale = cleanup.get("enabled", True) and cleanup.get(
+            "remove_stale_from_hot_index", True
+        )
+        if not rebuild_text_index:
+            lexical = next(
+                (
+                    index
+                    for index in self.store.list_derived_index_metadata()
+                    if index["index_name"] == "semantic_lexical_vectors"
+                ),
+                None,
+            )
+            # Atom mutations maintain the text index transactionally. Bootstrap
+            # old stores and restore previously pruned stale rows on policy change.
+            prior_prune = (lexical or {}).get("details_json", {}).get(
+                "hot_index_prune", {}
+            )
+            rebuild_text_index = lexical is None or (
+                not prune_stale and "stale" in prior_prune.get("health_statuses", ())
+            )
         rebuilt_atoms = 0
         write_batch_count = 0
-        for offset in range(0, len(planned_atom_ids), write_batch_size):
-            atom_ids = planned_atom_ids[offset : offset + write_batch_size]
-            with self.store.transaction() as conn:
-                for atom_id in atom_ids:
-                    atom = self.store.get_atom(atom_id)
-                    if atom is None:
-                        self.store.delete_atom_text_index(conn, atom_id)
-                        continue
-                    self.store.replace_atom_text_index(conn, atom)
-                    rebuilt_atoms += 1
-            write_batch_count += 1
-            self.store.cooperative_maintenance_yield()
+        if rebuild_text_index:
+            # Re-read each atom under the writer to avoid replacing a foreground
+            # update with stale repair input.
+            with self.store.read_snapshot():
+                planned_atom_ids = [
+                    str(atom["id"])
+                    for atom in self.store.list_atoms_filtered(include_deleted=True)
+                ]
+            for offset in range(0, len(planned_atom_ids), write_batch_size):
+                atom_ids = planned_atom_ids[offset : offset + write_batch_size]
+                with self.store.transaction() as conn:
+                    for atom_id in atom_ids:
+                        atom = self.store.get_atom(atom_id)
+                        if atom is None:
+                            self.store.delete_atom_text_index(conn, atom_id)
+                            continue
+                        self.store.replace_atom_text_index(conn, atom)
+                        rebuilt_atoms += 1
+                write_batch_count += 1
+                self.store.cooperative_maintenance_yield()
 
-        cleanup = policy.get("storage_cleanup", {})
         pruned_index = {"status": "skipped", "reason": "storage_cleanup_disabled"}
         if cleanup.get("enabled", True):
             lifecycle_states: list[str] = []
@@ -472,11 +492,7 @@ class IndexService:
                 lifecycle_states.append("archived")
             if cleanup.get("remove_superseded_from_hot_index", True):
                 lifecycle_states.append("superseded")
-            health_statuses = (
-                ["stale"]
-                if cleanup.get("remove_stale_from_hot_index", True)
-                else []
-            )
+            health_statuses = ["stale"] if prune_stale else []
             pruned_index = {
                 "status": "completed",
                 "rows": 0,
@@ -486,7 +502,9 @@ class IndexService:
                 "lifecycle_states": lifecycle_states,
                 "health_statuses": health_statuses,
             }
-            remaining_prune_atoms = max(write_batch_size, len(planned_atom_ids))
+            remaining_prune_atoms = max(
+                write_batch_size, self.store.atom_count(include_deleted=True)
+            )
             while remaining_prune_atoms > 0:
                 prune_batch_size = min(
                     write_batch_size, remaining_prune_atoms
