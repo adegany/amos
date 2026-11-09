@@ -3742,6 +3742,23 @@ class SQLiteStore:
         retain_snapshots = max(1, int(retain_snapshots))
         retain_full_segments = max(0, int(retain_full_segments))
         with self.read_snapshot():
+            live_count_row = self.conn.execute(
+                "SELECT COUNT(*) AS count FROM amos_event_journal"
+            ).fetchone()
+            eligible = max(
+                0, int(live_count_row["count"] or 0) - retain_tail_events
+            )
+            if eligible < min_events:
+                return {
+                    "status": "skipped",
+                    "reason": "journal_segment_below_minimum",
+                    "compacted_event_count": 0,
+                    "eligible_event_count": eligible,
+                    "min_events": min_events,
+                    "live_event_count": int(live_count_row["count"] or 0),
+                    "retain_tail_events": retain_tail_events,
+                }
+            # Decode retained state only when this snapshot has a compactable tail.
             prior_snapshot = self.latest_journal_snapshot()
             retained_segment_events = {
                 str(segment["segment_id"]): self.journal_segment_events(
@@ -3762,22 +3779,6 @@ class SQLiteStore:
             prior_version = int(
                 (prior_snapshot or {}).get("through_graph_version", 0) or 0
             )
-            live_count_row = self.conn.execute(
-                "SELECT COUNT(*) AS count FROM amos_event_journal"
-            ).fetchone()
-            eligible = max(
-                0, int(live_count_row["count"] or 0) - retain_tail_events
-            )
-            if eligible < min_events:
-                return {
-                    "status": "skipped",
-                    "reason": "journal_segment_below_minimum",
-                    "compacted_event_count": 0,
-                    "eligible_event_count": eligible,
-                    "min_events": min_events,
-                    "live_event_count": int(live_count_row["count"] or 0),
-                    "retain_tail_events": retain_tail_events,
-                }
             selected = self.list_live_events(limit=min(max_events, eligible))
             if not selected:
                 return {

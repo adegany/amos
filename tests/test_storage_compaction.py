@@ -5,6 +5,39 @@ import sqlite3
 from amos import Amos
 
 
+def test_ineligible_journal_compaction_does_not_decode_archives(tmp_path, monkeypatch):
+    amos = Amos(tmp_path / "amos.sqlite3")
+    try:
+        for index in range(2):
+            amos.commit_atom(
+                {
+                    "id": f"compact_threshold_{index}",
+                    "type": "semantic",
+                    "payload": {"summary": "Journal threshold"},
+                }
+            )
+        initial = amos.store.compact_journal_segment(
+            max_events=1, min_events=1, retain_tail_events=1
+        )
+        assert initial["status"] == "completed"
+
+        def unexpected_decode(*args, **kwargs):
+            raise AssertionError("ineligible compaction decoded retained state")
+
+        monkeypatch.setattr(amos.store, "_decode_journal_blob", unexpected_decode)
+        assert amos.store.compact_journal_segment(min_events=2, retain_tail_events=0) == {
+            "status": "skipped",
+            "reason": "journal_segment_below_minimum",
+            "compacted_event_count": 0,
+            "eligible_event_count": 1,
+            "min_events": 2,
+            "live_event_count": 1,
+            "retain_tail_events": 0,
+        }
+    finally:
+        amos.close()
+
+
 def test_journal_snapshot_compaction_bounds_retained_event_payloads(tmp_path):
     path = tmp_path / "amos.sqlite3"
     amos = Amos(path)
