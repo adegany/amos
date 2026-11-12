@@ -569,6 +569,13 @@ PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 maintenance-processors
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 maintenance-distiller --domain generic --processor-id amos.maintenance.generic.v1
 ```
 
+The `memory-policy --run --force` example requests a forced operator pass.
+When `maintenance.enabled` and `maintenance.rebuild_indexes` are enabled, this
+also reconstructs the text index from canonical atoms. Routine due runs reuse
+transactionally maintained text rows after initialization, with targeted repair
+when stale-row pruning is disabled. See the
+[maintenance guide](docs/developer-guide.md#8-let-amos-maintain-memory) for details.
+
 ### Load an external maintenance processor pack
 
 ```bash

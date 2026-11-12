@@ -429,6 +429,16 @@ segment in one maintenance transaction. Replay then uses the latest snapshot
 plus the live tail. A bounded number of recent segments retain full event
 bodies; older bodies are zeroed after compact receipts are durable.
 
+Before decoding retained snapshots or segment bodies, compaction computes
+`eligible_event_count = max(0, live_event_count - retain_tail_events)` within the
+same read snapshot used to plan the segment. If this is below the effective
+`min_events` threshold, it returns `status: skipped` with
+`reason: journal_segment_below_minimum` and `compacted_event_count: 0`.
+The result also reports `eligible_event_count`, `live_event_count`, `min_events`,
+and `retain_tail_events`. The threshold is clamped to at least one and at most
+`max_events`; policy supplies the normal or pressure-specific segment minimum.
+This skipped path does not decode retained journal state.
+
 ```text
 CompactedJournalSegment
   segment_id
@@ -549,6 +559,24 @@ automatic memory policy:
 
 V1 memory maintenance is a service-owned policy, not an integration-specific
 manual bridge call.
+
+With `maintenance.enabled` and `maintenance.rebuild_indexes` enabled, a due
+index phase refreshes configured derived indexes. Atom mutations already update
+`amos_atom_text_index` in the same transaction. Routine policy runs reuse those
+rows while applying configured hot-index pruning and LSA/metadata refresh.
+Full text-index reconstruction occurs when `semantic_lexical_vectors` metadata
+is absent, for a forced policy pass (`force: true` / CLI `--force`), or through
+an explicit `IndexMaintainer.rebuild()` call. Reconstruction uses bounded
+`maintenance.index_write_batch_size` batches and re-reads atoms under the writer.
+
+When stale pruning is disabled by either
+`storage_cleanup.remove_stale_from_hot_index: false` or
+`storage_cleanup.enabled: false`, routine index maintenance restores only stale
+atoms with no text-index rows, including rows removed by earlier storage-only
+cleanup. Deleted atoms and archived, superseded, or deleted lifecycle states
+remain excluded. The phase's `rebuilt_atom_count` and `write_batch_count` count
+text reconstruction or repair work, so both can be zero while derived-index
+metadata and configured LSA vectors still refresh.
 
 Default policy:
 

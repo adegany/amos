@@ -479,6 +479,23 @@ proposal retention/deduplication, separate active/proposed quota enforcement,
 cache invalidation, and capacity governance. It does not require an LLM or an
 external vector database.
 
+Atom mutations maintain the token candidate index transactionally. After
+initialization, routine due index maintenance reuses those rows while applying
+configured hot-index pruning and LSA refresh, and publishing index metadata.
+`results.index.rebuilt_atom_count` and `results.index.write_batch_count` can
+therefore both be zero on a successful refresh; these counters measure text-row
+reconstruction, excluding pruning and vector/metadata writes. A missing lexical
+index metadata record, an explicit `IndexMaintainer.rebuild()`, or a forced
+policy pass requests full text-index reconstruction. Policy-driven index work
+requires both `maintenance.enabled` and `maintenance.rebuild_indexes` to be enabled.
+
+If `storage_cleanup.remove_stale_from_hot_index` or `storage_cleanup.enabled`
+is changed to `false`, the next due index phase restores missing rows for
+eligible stale atoms, including rows pruned by an earlier storage-only pass.
+It only repairs stale atoms with no text-index rows and excludes deleted,
+archived, and superseded atoms. Each repair re-reads the current atom within its
+write transaction so a concurrent foreground update is preserved.
+
 Storage cleanup runs after either a quiet interval or configured orange/red
 capacity pressure. Pressure bypasses the idle gate but remains rate-limited.
 Expired records are physically removed from `amos_atoms` and `amos_edges` after
@@ -487,6 +504,12 @@ snapshot plus bounded recent segments and compact receipts. Capacity includes
 both the SQLite main file and WAL. New databases use incremental auto-vacuum;
 an older database needs one full `VACUUM` before incremental file-byte reclaim
 is available.
+
+Journal compaction first counts live events beyond the retained tail. If that
+count is below the configured segment minimum, it returns
+`journal_segment_below_minimum` without decoding retained snapshots or segment
+bodies. See the [journal rollup contract](v1-local-contract.md#19-journal-rollup-format)
+for the eligibility and result fields.
 
 Distillation and maintenance-processor commits precede decay within one policy
 pass. A newly committed active successor therefore causes its active

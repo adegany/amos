@@ -24,11 +24,13 @@ Status terms:
 | Self-model and shared views | `src/amos/views_service.py` | `tests/test_self_models.py` |
 | Stewardship and SMP | `src/amos/stewardship_service.py`, `src/amos/maintenance.py`, `src/amos/smp.py` | `tests/test_maintenance.py` |
 | Automatic policy and capacity | `src/amos/policy_service.py`, `src/amos/capacity_service.py`, `src/amos/workers.py` | `tests/test_policy_and_capacity.py` |
+| Routine text-index preservation and targeted stale-row restoration | `src/amos/index_service.py`, `src/amos/policy_service.py`, `src/amos/store.py` | `tests/test_policy_and_capacity.py::test_routine_policy_preserves_transactional_text_index` (update/delete correctness, zero routine rewrites, restoration after pruning or cleanup is disabled, and replay) |
 | External processor packs | `src/amos/maintenance.py`, `src/amos/stewardship_service.py` | `tests/test_processor_packs.py` |
 | Processor worksets and hierarchical evidence coverage | `src/amos/maintenance.py`, `src/amos/stewardship_service.py` | `tests/test_processor_packs.py` |
 | Edge derivation and legacy migration | `src/amos/graph_service.py`, `src/amos/store.py` | `tests/test_maintenance.py` |
 | Graph/proposal/processor quality diagnostics | `src/amos/policy_service.py` | `tests/test_policy_and_capacity.py` |
 | Journal and health verification | `src/amos/diagnostics_service.py`, `src/amos/store.py` | `tests/test_schema_and_mutations.py`, `tests/test_policy_and_capacity.py` |
+| Journal compaction eligibility and snapshot recovery | `src/amos/store.py`, `src/amos/journal_replay.py` | `tests/test_storage_compaction.py`, including `test_ineligible_journal_compaction_does_not_decode_archives` (below-threshold skip without decoding retained state) |
 | SQLite concurrency and maintenance fairness | `src/amos/store.py`, `src/amos/service.py`, `src/amos/index_service.py`, `src/amos/policy_service.py` | `tests/test_concurrency.py` |
 | HTTP and CLI adapters | `src/amos/http_api.py`, `src/amos/cli.py` | `tests/test_cli_http.py` |
 | Mirror Agent reference integration | `examples/mirror_agent_demo.py`, `examples/mirror_agent_ui.py` | `tests/test_mirror_agent_demo.py` (packets, frames/pages, exact lookup, canonical graph metadata, governed proposals, truthful feedback, browser endpoints) |
