@@ -9,8 +9,8 @@ Status terms:
 
 - **Implemented:** checked-in behavior with automated verification.
 - **Partial:** only the stated v1-local subset is implemented.
-- **Evidence only:** reproducible evidence exists, but no automated acceptance
-  threshold is enforced.
+- **Evidence plus bounded smoke checks** means the benchmark is reproducible
+  and pytest applies thresholds to a small workload.
 
 ## Architecture and artifact coverage
 
@@ -30,6 +30,7 @@ Status terms:
 | Edge derivation and legacy migration | `src/amos/graph_service.py`, `src/amos/store.py` | `tests/test_maintenance.py` |
 | Graph/proposal/processor quality diagnostics | `src/amos/policy_service.py` | `tests/test_policy_and_capacity.py` |
 | Journal and health verification | `src/amos/diagnostics_service.py`, `src/amos/store.py` | `tests/test_schema_and_mutations.py`, `tests/test_policy_and_capacity.py` |
+| Readiness, inventory diagnostics, and retryable HTTP failures | `src/amos/http_api.py`, `src/amos/diagnostics_service.py` | `tests/test_cli_http.py` |
 | Journal compaction eligibility and snapshot recovery | `src/amos/store.py`, `src/amos/journal_replay.py` | `tests/test_storage_compaction.py`, including `test_ineligible_journal_compaction_does_not_decode_archives` (below-threshold skip without decoding retained state) |
 | SQLite concurrency and maintenance fairness | `src/amos/store.py`, `src/amos/service.py`, `src/amos/index_service.py`, `src/amos/policy_service.py` | `tests/test_concurrency.py` |
 | HTTP and CLI adapters | `src/amos/http_api.py`, `src/amos/cli.py` | `tests/test_cli_http.py` |
@@ -53,11 +54,11 @@ Status terms:
 | Authorization | Implemented | Scope, visibility, mutation roles, trust levels, capabilities, and evidence visibility are independently exercised. |
 | Constitutional authorship | Implemented | External sources can remain evidence, but only an identity-matched `self_ratification` capability can adopt a proposal; generic mutation and privileged maintenance cannot substitute for that transition. |
 | Deletion | Partial | Expired atom/edge payload rows are physically purged behind tombstones and retired identities; hot indexes/cache and compacted journal bodies are removed. External evidence archives, key management, and backups are not owned by v1-local. |
-| Capacity | Partial | The SQLite main file and WAL jointly produce one pressure mode, maintenance escalation, and packet degradation. Per-tier and external-store budgets are planned. |
+| Capacity | Partial | Used SQLite main-file bytes plus WAL drive one pressure mode, maintenance escalation, and packet degradation. Per-tier and external-store budgets are planned. |
 | SMP and processor packs | Implemented | Deterministic proposal envelopes, review gates, low-risk auto-commit policy, and external processor loading are tested. |
 | Memory policy | Implemented | Background and forced deterministic maintenance, decay, cleanup, distillation, index refresh, cache invalidation, and journal summaries are tested. |
 | Concurrency | Implemented for one process | Composite reads are revision-pinned, writers use FIFO database-scoped admission across connections, HTTP reads queue policy work in the background, policy execution is single-flight, cleanup/index/decay writes are batched, and stale steward, decay, and derived-index plans fail closed. Multi-process coordination remains a production-adapter concern. |
-| Performance | Evidence plus bounded smoke thresholds | `benchmarks/benchmark_amos.py` reproducibly measures canonical writes, exact lookup, cold/warm operational retrieval, deliberative candidate recall, root-provenance analysis, coherent frames, demand-page loads, governed semantic/graph maintenance, final-state replay, and the complete SQLite DB/WAL/SHM footprint. The small CI workload requires deliberation and provenance p95 below one second; production scale thresholds remain deployment-specific. |
+| Performance | Evidence plus bounded smoke checks | `benchmarks/benchmark_amos.py` measures canonical writes, exact lookup, cold/warm recall, deliberation, root-provenance analysis, frames and pages, maintenance, replay, and the complete SQLite DB/WAL/SHM footprint. `tests/test_benchmark.py` requires deliberation and root-provenance p95 latency below one second on a 24-atom workload. Production-scale acceptance thresholds are planned. |
 | Observability | Implemented with declared constants | Health, capacity, index freshness, retrieval outcomes, and deletion residuals are reportable. Projection lag is fixed at zero for the transactional single-process profile. |
 | Procedure policy | Implemented | Procedures are advisory; autonomous execution is denied by default. |
 | LLM reviewer default | Implemented | Disabled and non-authoritative by default. |

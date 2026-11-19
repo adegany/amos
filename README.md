@@ -472,22 +472,29 @@ telemetry.
 
 ```bash
 PYTHONPATH=src python -m amos.cli --db /tmp/amos.sqlite3 serve \
-  --host 127.0.0.1 --port 8765 \
-  --governance-principals @/run/amos/governance-principals.json
+  --host 127.0.0.1 --port 8765
 ```
 
-The principals file is a JSON object keyed by bearer token. Each value binds
-`identity_ref`, `actor`, and `capabilities`. Keep it mode 0600 and outside
-request-accessible storage.
+Check readiness in a second terminal.
+
+```bash
+curl -fsS http://127.0.0.1:8765/v1/ready
+```
+
+The response includes `status: "ready"` and the current `graph_version`.
+For constitutional governance operations, configure bearer-token principals
+when starting the service. [Governance setup](docs/developer-guide.md#3a-adopt-proposals-through-self-ratification)
 
 The HTTP service starts a background memory-policy worker. `GET
 /v1/health/memory` reports canonical atom and graph-edge counts, health, and
-worker status without running maintenance inline, while `POST /v1/atoms:get`
-resolves a known atom ID without semantic or
-associative ranking and `POST /v1/packets:retrieve` performs associative recall.
-Both retrieval paths queue a policy tick and return immediately. Explicit
-`POST /v1/memory-policy:run` and the CLI
-`memory-policy --run` command remain synchronous operator paths.
+worker status. Use `POST /v1/atoms:get` to look up a known atom ID and
+`POST /v1/packets:retrieve` for associative recall. Both queue policy work on
+the background worker by default. `POST /v1/memory-policy:run` and the CLI
+`memory-policy --run` command run policy synchronously.
+
+`GET /v1/health/capacity` reports pressure based on used SQLite main-file
+bytes plus WAL, with allocation and reusable freelist bytes reported
+separately. [Service monitoring](docs/developer-guide.md#monitor-the-service)
 
 `POST /v1/canonical-records:batch-get` is the bounded, revision-pinned exact
 read path for applications that must verify many known records and canonical
@@ -632,9 +639,9 @@ reports the complete SQLite DB, WAL, and SHM footprint. It measures the current
 in-process v1-local baseline, not HTTP, network, or background-worker scheduling
 overhead.
 
-Reference result from a local workstation run on 2026-08-16 with the forced
-memory policy enabled. These values are single-run evidence for the 100-atom
-v1-local profile, not an enforced performance gate:
+The table records one 100-atom run on a local workstation on 2026-08-16 with
+the forced memory policy enabled. The verification matrix describes the
+smaller pytest smoke workload and its latency checks. [Verification matrix](docs/v1-verification.md#acceptance-status)
 
 | Benchmark | Result |
 | --- | ---: |
@@ -768,8 +775,6 @@ future architecture is not presented as current v1-local behavior.
   responsibility.
 - No v1-local ownership of external evidence-object deletion, encryption keys,
   cold archives, or offline-backup enforcement.
-- No per-tier capacity accounting or production-scale latency guarantee; the
-  current capacity mode covers the SQLite main file plus its WAL, and the
-  benchmark is evidence, not an acceptance threshold.
+- No per-tier capacity accounting or production-scale latency guarantee.
 - No bundled production Postgres service yet; Postgres DDL is included as the
   target migration contract, while v1-local uses SQLite behind the HTTP API.

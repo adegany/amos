@@ -15,18 +15,35 @@ Agents should call the HTTP API instead of opening the SQLite database directly.
 The service owns validation, journal writes, packet cache invalidation,
 background memory policy work, and capacity reporting.
 
-Use these endpoints as basic readiness checks:
+### Monitor the service
 
-```text
-GET /v1/health/memory
-GET /v1/health/capacity
-GET /v1/verify
-```
+| Request | Use |
+| --- | --- |
+| `GET /v1/ready` | Startup and readiness probes. A lightweight database read returns `status: "ready"` and `graph_version`. |
+| `GET /v1/health/memory` | Detailed memory and graph quality, index freshness, and background worker status. |
+| `GET /v1/health/memory-inventory` | Atom counts by type and lifecycle, reference integrity, and index lag. |
+| `GET /v1/health/capacity` | Used and allocated bytes, capacity pressure, and request and writer admission queues. |
+| `GET /v1/memory-policy` | Effective policy, schedule, worker status, and maintenance leases. |
+| `GET /v1/verify` | Journal checksum and replay verification. |
+
+The inventory endpoint computes exact diagnostics by default. Dashboards can
+send `X-AMOS-Diagnostic-Consistency: stale-while-refresh` to use a cached
+sample or a bounded summary on a cold cache. Samples become stale after 60
+seconds and requests using the header can trigger a background refresh. Read
+`diagnostic_cache` for freshness and age and `quality.integrity_exact` to
+check whether the sampled integrity counts are exact.
+
+When the worker's latest result includes storage cleanup, inspect
+`background_policy_worker.last_result.storage_cleanup` for `status`,
+`deleted_atom_count`, `physically_purged_atom_count`, `reference_protection`,
+and `atom_scan`.
 
 ### Handle transient service failures
 
-AMOS returns a structured transient-failure envelope when the service is
-shutting down or its SQLite store is temporarily locked or busy:
+An HTTP 503 with `retryable: true` can indicate service shutdown, temporary
+SQLite contention, or a deadline. The default request deadline is 30 seconds.
+Clients can send an absolute Unix deadline in milliseconds with
+`X-Request-Deadline-Epoch-Ms`.
 
 ```http
 HTTP/1.1 503 Service Unavailable
@@ -35,22 +52,24 @@ HTTP/1.1 503 Service Unavailable
 ```json
 {
   "status": "error",
-  "error": "database is locked",
+  "error": "AMOS request capacity was unavailable before deadline",
+  "code": "request_capacity_exhausted",
+  "stage": "request_capacity_admission",
+  "retry_after_ms": 250,
   "retryable": true
 }
 ```
 
-Clients should retry only bounded transient failures, using exponential backoff
-with jitter. A typical client makes three or four attempts over a few seconds,
-then moves the operation into its own delayed retry queue instead of converting
-an infrastructure failure into a domain decision or operator approval.
+`request_capacity_exhausted` and `maintenance_capacity_exhausted` indicate an
+admission timeout. `request_deadline_exhausted` indicates an expired deadline
+before dispatch or during deadline-aware work. Retry transient failures within
+the operation's time budget using exponential backoff with jitter. Honor
+`retry_after_ms` when present and set a fresh deadline for each attempt.
 
-Writes are safe to retry only when the request carries a stable
-`idempotency_key`, or when the endpoint is otherwise documented as
-observational. Reuse the same actor, key, and payload on every attempt. Do not
-silently retry schema, authorization, expected-version, or idempotency
-conflicts; refresh, correct, merge, or request review according to the returned
-error.
+For write retries, use an endpoint that supports idempotency and reuse the
+same actor, `idempotency_key`, and payload on every attempt. Handle schema,
+authorization, expected-version, and idempotency errors according to the
+returned error before attempting the operation again.
 
 ## 2. Store Typed Memory, Not Prompt Text
 
@@ -197,7 +216,27 @@ dissent, review triggers, three-axis standing, and reconstruction metadata.
 The ratifier must be
 `{"identity_ref": "...", "mode": "self_ratification"}`.
 
-The HTTP server must be started with a private principals file:
+For governance requests, create a private principals file such as
+`/run/amos/governance-principals.json`. The file maps bearer tokens to an
+`identity_ref`, the exact service `actor`, and a list of `capabilities`. Replace
+the example key with a securely generated token and keep the file outside
+request-accessible storage with mode `0600`.
+
+```json
+{
+  "replace-with-a-random-token": {
+    "identity_ref": "ent:agent:example",
+    "actor": "svc:example_agent:self-governance",
+    "capabilities": [
+      "constitutional_authoring",
+      "self_adjudication",
+      "self_ratification"
+    ]
+  }
+}
+```
+
+Start the server with the `@`-prefixed path to the file.
 
 ```bash
 PYTHONPATH=src python -m amos.cli --db /var/lib/amos/amos.sqlite3 serve \
@@ -205,15 +244,15 @@ PYTHONPATH=src python -m amos.cli --db /var/lib/amos/amos.sqlite3 serve \
   --governance-principals @/run/amos/governance-principals.json
 ```
 
-The file maps an unguessable bearer token to `identity_ref`, the exact service
-`actor`, and capabilities. A protected request sends `Authorization: Bearer
-<token>`. Never put identity, actor, capabilities, or authentication material
-in the JSON payload; protected endpoints reject those caller-supplied claims.
+Send the token in the `Authorization: Bearer <token>` header on protected
+requests. AMOS supplies the principal's identity, actor, and capabilities
+from server configuration.
 
-Finally call:
+Send the adjudication to the ratification endpoint.
 
 ```http
 POST /v1/proposals:ratify
+Authorization: Bearer <token>
 ```
 
 ```json
@@ -257,9 +296,8 @@ POST /v1/packets:retrieve
   "memory_mode": "operational_recall",
   "scope": {"project": "qandl", "mission": "performance_search"},
   "cues": ["chunk 7", "exploration floor", "candidate diversity"],
-  "profile": "planner",
   "max_items": 12,
-  "token_budget": 3000,
+  "token_or_byte_budget": {"tokens": 3000},
   "attention_context": {
     "active_task": "choose next training directive",
     "focus_terms": ["mission policy", "current controls", "open commitments"],
@@ -338,9 +376,11 @@ visible boundary references beyond the resident unit; loading the descriptor at
 `supporting` depth retrieves those continuation atoms. This is explicit partial
 knowledge, not silent clipping or a fixed atom-count API.
 
-Keep the frame and its descriptors in trusted runtime state. If the reasoner
-needs deeper detail, resolve its requested page ID locally and send the retained
-descriptor:
+Keep the frame and its descriptors in trusted runtime state. For deeper detail,
+resolve the reasoner's selected page ID locally. Take `frame_id` and `revision`
+from the frame and replace the abbreviated `page` below with the complete
+descriptor from `page_index`. Reuse the frame request's scope, requester,
+target processor, and memory mode.
 
 ```http
 POST /v1/reasoning-pages:load
@@ -355,9 +395,10 @@ X-Request-ID: reasoning-cycle-42-page-1
   "need": "the decision rationale",
   "purpose": "verify the active conclusion",
   "depth": "supporting",
-  "scope": {"project": "memory-demo"},
+  "scope": {"tenant": "local"},
   "requester": "agent:example",
   "target_processor": "reasoner",
+  "memory_mode": "operational_recall",
   "token_or_byte_budget": {"tokens": 1200}
 }
 ```
@@ -395,23 +436,27 @@ known constraints.
 
 ## 6. Put Packets Into Prompts Transparently
 
-Render only the packet fields the model needs:
+Give the model the memory content it needs with request-local handles. In
+trusted runtime state, bind each handle to the exact AMOS reference and its
+packet or frame revision.
 
 ```text
 Relevant Amos memory:
-- atom_id, type, claim/action/outcome summary
-- confidence, salience, utility when useful
-- evidence refs or provenance note
-- conflict or omission warnings
-- compact attention trace: selected refs, inhibited refs, omitted reasons
+- memory:item:0 (procedure)
+  Summary: Validate the proposed directive against the current policy.
+  Confidence: medium.
+  Provenance: A recorded check succeeded in a prior run.
 ```
 
-Avoid dumping raw JSON into prompts unless the role needs exact fields. Keep the
-full packet in telemetry so operators can audit why a prompt saw a memory.
+Include relevant conflicts, omissions, and attention details in the model
+view. Keep the full packet in telemetry so operators can audit what was
+available to the model.
 
 ## 7. Report Retrieval Outcomes
 
-After the agent uses a packet, report whether it helped:
+Have the model cite the handles that materially shaped its answer. Resolve
+those handles against the retained response before sending the corresponding
+AMOS atom references in `used_item_refs` or `correction_refs`.
 
 ```http
 POST /v1/retrieval-outcomes
@@ -500,10 +545,10 @@ Storage cleanup runs after either a quiet interval or configured orange/red
 capacity pressure. Pressure bypasses the idle gate but remains rate-limited.
 Expired records are physically removed from `amos_atoms` and `amos_edges` after
 their tombstone/retired identity is durable; old journal bodies become a
-snapshot plus bounded recent segments and compact receipts. Capacity includes
-both the SQLite main file and WAL. New databases use incremental auto-vacuum;
-an older database needs one full `VACUUM` before incremental file-byte reclaim
-is available.
+snapshot plus bounded recent segments and compact receipts. Capacity pressure
+uses the SQLite main file minus reusable freelist space, plus the WAL.
+New databases use incremental auto-vacuum. An older database needs one full
+`VACUUM` before incremental file-byte reclaim is available.
 
 Journal compaction first counts live events beyond the retained tail. If that
 count is below the configured segment minimum, it returns
@@ -632,12 +677,8 @@ available memory. A good integration renders:
 - The active task or mission policy.
 - A small set of materially relevant memories, including counterevidence.
 - Learned experience-profile capabilities and limitations for the agent.
-- Citation candidates and a rule for when to cite or explain non-use.
-
-The model should be instructed to cite AMOS atom refs only when a memory
-materially shapes the decision. Otherwise it should record why retrieved memory
-was not used. This avoids false reinforcement and gives maintenance useful
-signal.
+- Request-local citation handles and a rule for when to cite an item or explain
+  why it was unused.
 
 ## 11. Integration Lessons
 
@@ -671,7 +712,8 @@ signal.
 - Record retrieval outcomes.
 - Promote recurring experience into compact learned profile atoms; do not use
   AMOS as an append-only logging sink.
-- Monitor memory health, capacity health, worker status, and journal verify.
+- Use `GET /v1/ready` for probes and monitor memory health, capacity, worker
+  status, and journal verification during operation.
 - Keep packet payloads in telemetry for audit and debugging.
 - Keep model and provider metadata out of the durable self-model, and route all
   model-derived memory changes through evidence-linked proposal review.

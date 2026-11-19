@@ -272,8 +272,9 @@ Acceptance:
   historical and current design conclusions together.
 - The client displays frame revision, compression, resident units, descriptors,
   loaded page, and token budget.
-- A browser page-load request supplies only a `page_id`; the runtime resolves
-  scope, requester, revision, and the signed descriptor locally.
+- The browser requests a page by `page_id`. The runtime resolves the scope,
+  requester, revision, and retained descriptor locally. AMOS checks the
+  descriptor digest when loading the page.
 - `retrieve_atom` resolves the known active design conclusion through the exact
   access/lifecycle contract.
 - Any graph mutation makes the retained frame visibly stale and requires a

@@ -340,7 +340,12 @@ Packets must enforce both item and token/byte budgets. If budget limits suppress
 
 ### 1.7 Retention control defaults
 
-Retention-class authority:
+The authority and retention windows below describe the design policy. In
+v1-local, `retention_class` is stored as metadata. Decay and cleanup use atom
+decay and proposal policies, lifecycle and health states, and service settings.
+[V1 automatic memory policy](#111-v1-automatic-memory-policy)
+
+The design assigns control by retention class.
 
 ```text
 ephemeral:
@@ -365,7 +370,7 @@ user_pinned:
   user-controlled unless compliance/legal policy forbids retention
 ```
 
-Default retention windows:
+The design targets these retention windows.
 
 ```text
 ephemeral:
@@ -578,21 +583,31 @@ remain excluded. The phase's `rebuilt_atom_count` and `write_batch_count` count
 text reconstruction or repair work, so both can be zero while derived-index
 metadata and configured LSA vectors still refresh.
 
-Default policy:
+A fresh store uses these effective defaults.
 
-```text
-enabled:
-  true
+```yaml
+enabled: true
 
 schedule:
   every_graph_versions: 25
   every_seconds: 300
   run_on_pressure: true
+  pressure_min_interval_seconds: 300
+  pressure_catchup_interval_seconds: 60
 
 maintenance:
+  enabled: true
+  repair_reference_contracts: true
+  max_reference_contract_repairs: 2048
   run_smp: true
+  max_smp_atoms: 128
   run_steward: true
+  max_steward_atoms: 128
+  max_steward_edge_mutations: 128
   rebuild_indexes: true
+  rebuild_lsa: true
+  lsa_dimensions: 32
+  lsa_max_terms: 300
   index_write_batch_size: 64
   invalidate_packet_cache: true
 
@@ -601,11 +616,11 @@ distillation:
   min_source_atoms: 6
   max_source_atoms: 10
   candidate_types:
-    action_outcome
-    agentic_trace
-    belief
-    episode
-    preference
+    - action_outcome
+    - agentic_trace
+    - belief
+    - episode
+    - preference
   distillation_type: automatic_policy
   archive_sources: false
   approved_by: null
@@ -634,9 +649,13 @@ decay:
   proposal_pressure_min_age_seconds: 3600
   archive_proposed_after_seconds: null
   pressure_max_archives_per_run: 256
+  pressure_low_water_ratio: 0.8
   pressure_protected_types:
+    - adjudication
     - commitment
+    - covenant
     - policy
+    - primal_guidance
     - self_model
   capacity_assessment_targets:
     - 256
@@ -655,6 +674,7 @@ storage_cleanup:
   run_on_pressure: true
   pressure_modes: [orange, red]
   pressure_min_interval_seconds: 300
+  pressure_catchup_interval_seconds: 60
   idle_after_seconds: 300
   min_interval_seconds: 900
   max_deletions_per_tick: 256
@@ -685,11 +705,11 @@ storage_cleanup:
       max_deletions_per_tick: 256
   protected_types:
     - adjudication
-    - policy
-    - self_model
     - commitment
     - covenant
+    - policy
     - primal_guidance
+    - self_model
   compact_idempotency_after_seconds: 3600
   pressure_compact_idempotency_after_seconds: 300
   max_idempotency_compactions_per_tick: 512
@@ -729,12 +749,24 @@ The v1 HTTP service starts a background memory-policy worker. Foreground
 service calls do not need to complete maintenance before responding:
 
 ```text
+GET /v1/ready
+  returns status ready and graph_version through a dedicated connection
+
 GET /v1/health/memory
   reports memory health and background worker status
   reports canonical atoms and non-deleted graph edges as atoms and edges
   includes quality diagnostics for active atom pressure, active superseded
   atoms, isolated active atoms, and derived-index graph lag
   does not run a policy tick inline
+
+GET /v1/health/memory-inventory
+  reports counts by type and lifecycle, reference integrity, and index lag
+  computes exact diagnostics by default
+  X-AMOS-Diagnostic-Consistency: stale-while-refresh opts into a cached sample
+  or a bounded summary while exact diagnostics refresh in the background
+
+GET /v1/health/capacity
+  reports used and allocated bytes, capacity pressure, and admission queues
 
 POST /v1/packets:retrieve
   returns a packet from the current graph view
@@ -1030,7 +1062,7 @@ never create or amend covenants, primal guidance, identity commitments,
   standing, operational authority, or ratification records
 never create active derived output from proposed, contested, or unratified
   source atoms
-prune archived/superseded/stale atoms from hot retrieval indexes immediately
+apply configured hot-index pruning for archived/superseded/stale atoms
 physically purge expired archived/superseded/stale/deleted atom and edge
   payload rows through tombstone and retired-identity projection paths
 compact old idempotency responses so duplicate-response cache rows do not
@@ -1068,12 +1100,12 @@ Decay execution is deterministic and non-generative. By default, v1-local only
 applies time, utility, and expiry rules to active atoms with explicit atom-level
 `decay_policy` rules, except for active atoms superseded by active replacements
 when `archive_superseded` is enabled. `max_atoms` bounds the complete hot set,
-while `max_active_atoms` and `max_proposed_atoms` independently bound canonical
-and proposal populations. When any bound is exceeded, the worker first archives
-the minimum eligible proposal excess, then the minimum eligible policyless
-active excess. Proposed atoms are pressure-eligible only when their producer
-attached `payload.proposal_retention`; `proposal_pressure_min_age_seconds`
-prevents newly generated review work from being removed immediately.
+while `max_active_atoms` and `max_proposed_atoms` independently bound the
+lifecycle-active and proposed populations. When a bound is reached, pressure
+archiving targets the configured `pressure_low_water_ratio` of the bounds
+(80% by default). The worker prioritizes eligible proposals, then eligible
+policyless active atoms. Proposed atoms need recognized retention metadata and
+must meet `proposal_pressure_min_age_seconds`.
 
 The same producer-owned retention object may declare a stable
 `deduplication_key` and `archive_after_seconds`. Maintenance archives duplicate
@@ -1086,11 +1118,12 @@ audit history. Active pressure cleanup preserves `decay_policy.enabled = false`,
 future `retain_until` rules, recognized explicit atom decay rules, and configured
 `pressure_protected_types`. Candidates are ordered deterministically: isolated
 before connected, unhealthy before healthy, then lower utility, lower salience,
-older access/update time, and atom id. `pressure_max_archives_per_run` bounds each
-maintenance transaction; residual pressure remains visible for the next tick.
+older access/update time, and atom id. `pressure_max_archives_per_run` caps
+pressure-driven archives per pass. Pending lifecycle and storage-cleanup work
+have separate catch-up intervals, both defaulting to 60 seconds.
 Memory health also reports a non-mutating `capacity_assessment` across the
 configured candidate targets. It recommends the smallest target that preserves
-`capacity_headroom_ratio` above the current active count and warns when the
+`capacity_headroom_ratio` for the current hot count and warns when the
 configured target no longer has that headroom. Deployments should use this
 signal with retrieval-quality and maintenance-latency measurements rather than
 raising `max_atoms` solely to suppress pressure warnings.
@@ -1123,15 +1156,15 @@ overwriting a concurrent update. Current-head repair is committed atomically
 with its journal event.
 
 Storage cleanup is deterministic and is due after either its idle window or
-configured orange/red capacity pressure. Pressure bypasses the idle gate but
-uses its own minimum interval. Archived, superseded, and stale atoms leave the
-hot token index immediately. Once their retention window elapses, bounded
-write batches journal a minimal removal projection and tombstone, physically
-delete the atom row, replace incident edge rows with minimal retired identities,
-and purge packet copies. Previously logical-only deleted rows are also purged
-after a short grace period. Each batch revalidates atom version, scope, and
-current-head protection before publication and yields writer admission before
-the next batch.
+configured orange/red capacity pressure. Pressure bypasses the idle gate and
+uses its own minimum interval. Cleanup applies the configured hot token index
+pruning rules for archived, superseded, and stale atoms. Once their retention
+window elapses, bounded write batches journal a minimal removal projection and
+tombstone, physically delete the atom row, replace incident edge rows with
+minimal retired identities, and purge packet copies. Rows that were only
+logically deleted are purged after a short grace period. Each batch revalidates
+atom version, scope, and current-head protection before publication and yields
+writer admission before the next batch.
 
 Idempotency response bodies compact after one hour by default and after five
 minutes under pressure. Journal compaction verifies event checksums, publishes
@@ -1142,12 +1175,16 @@ memory-transaction observations. Replay uses the latest snapshot plus live
 tail. Verification clearly reports whether older events were checked through
 digest-only boundaries rather than claiming their discarded payloads remain.
 
-Capacity counts the SQLite main file plus its WAL. Normal cleanup uses a
-`PASSIVE` checkpoint; pressure defaults to `TRUNCATE`. New databases select
-incremental auto-vacuum before schema creation and cleanup reclaims a bounded
-number of free pages. Existing databases continue to reuse freed pages but need
-one explicitly enabled, idle-gated full `VACUUM` to adopt incremental
-auto-vacuum and visibly shrink pre-existing file slack.
+Capacity pressure uses `used_size_bytes`, also reported as `size_bytes`,
+which is the SQLite main file minus `freelist_space_bytes` plus WAL.
+`allocated_size_bytes` and `managed_size_bytes` report the full main file
+plus WAL. The report lists SHM bytes separately.
+
+Normal cleanup uses a `PASSIVE` checkpoint and pressure cleanup defaults to
+`TRUNCATE`. New databases select incremental auto-vacuum before schema
+creation, and cleanup reclaims a bounded number of free pages. Existing
+databases need one explicitly enabled, idle-gated full `VACUUM` to adopt
+incremental auto-vacuum and visibly shrink pre-existing file slack.
 
 Derived-index maintenance similarly refreshes lexical rows in bounded write
 batches and performs LSA computation on a pinned read snapshot. Publication
@@ -1476,11 +1513,11 @@ Acceptance status:
 | Shared memory | Implemented | Common graph-version views and identity-specific overlays/omissions are tested. |
 | Authorization | Implemented | Scope, visibility, mutation roles, trust, capabilities, and evidence visibility are independently exercised. |
 | Deletion | Partial | Expired atom and edge payload rows are physically removed after durable tombstone/retired-identity publication; hot derived state and packet copies are purged. External evidence archives, encryption keys, and backups remain integration responsibilities. |
-| Capacity | Partial | The SQLite main file plus WAL drive one pressure mode, cleanup/checkpoint escalation, and packet degradation. Per-tier budgets and external-object-store capacity are planned. |
+| Capacity | Partial | Used SQLite main-file bytes plus WAL drive one pressure mode, cleanup/checkpoint escalation, and packet degradation. Per-tier budgets and external-object-store capacity are planned. |
 | SMP and processor packs | Implemented | Deterministic processors produce advisory proposals; only policy-approved low-risk atoms auto-commit. |
 | Memory policy | Implemented | Background and operator-triggered deterministic maintenance paths are tested without an LLM. |
-| Performance | Evidence only | A reproducible local benchmark exists, but CI has no scale or latency acceptance threshold; this is not a production-scale guarantee. |
-| Observability | Implemented with declared constants | Health, capacity, index freshness, retrieval outcomes, and deletion residuals are reportable. Projection lag is always zero in the single-process transactional profile. |
+| Performance | Evidence plus bounded smoke checks | The local benchmark measures in-process performance. A 24-atom pytest workload checks that deliberation and root-provenance p95 latencies each stay below one second. Production-scale acceptance thresholds are planned. |
+| Observability | Implemented with declared constants | Readiness, memory inventory, capacity, worker status, index freshness, retrieval outcomes, and deletion residuals are reportable. Projection lag is fixed at zero in the single-process transactional profile. |
 
 [`v1-verification.md`](v1-verification.md) maps implemented and partial gates to
 the exact artifacts and tests. Planned portions are not represented as passing
