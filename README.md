@@ -13,7 +13,7 @@ and show the evidence behind its answer.**
 
 **AMOS** stands for **Agent Memory Operating System**.
 
-## Try one memory behavior
+## Usage examples
 
 From the repository root, run either example with Python 3.10+. Each starts a temporary AMOS service, writes one kind of memory, restarts the service, and shows what the next session can do. Both run locally with the Python standard library.
 
@@ -25,7 +25,7 @@ PYTHONPATH=src python3 -m usage_examples.preference_continuity
 PYTHONPATH=src python3 -m usage_examples.successful_action_recall
 ```
 
-To adapt either example to your agent loop, see the [usage guide](usage_examples/README.md). Once you've tried one, explore self-models, reasoning frames, governance, and maintenance together in [Mirror Agent](usage_examples/mirror_agent).
+To copy either behavior into your agent loop, follow the [examples guide to writing and recalling memory](usage_examples/README.md#copy-the-write-and-read). For a full agent that combines recall, self-models, reasoning frames, and maintenance, see the [Mirror Agent walkthrough](usage_examples/mirror_agent/README.md).
 
 ## Integrate AMOS with Codex or Claude
 
@@ -340,6 +340,7 @@ SQLite database and uses isolated request connections behind the service boundar
 
 ### Documentation
 
+- [Runnable usage examples](usage_examples/README.md)
 - [Amos Design Spec](docs/design-spec.md)
 - [AMOS V1-Local Contract](docs/v1-local-contract.md)
 - [Amos Developer Guide](docs/developer-guide.md)
@@ -348,6 +349,13 @@ SQLite database and uses isolated request connections behind the service boundar
 - [Amos Mirror Agent Demo Spec](docs/mirror-agent-demo-spec.md)
 
 ## Quick start
+
+### Run a usage example
+
+Choose the behavior you want to try. Each walkthrough gives you one command and the output to expect after a service restart.
+
+- Make a reminder honor the user's preferred time format across sessions. [Preference continuity](usage_examples/README.md#remember-a-users-preference)
+- Make an import worker reuse the delimiter that succeeded for the same feed. [Successful action recall](usage_examples/README.md#reuse-a-successful-action-outcome)
 
 ### Run the test suite
 
@@ -702,11 +710,14 @@ a controlled quiet window; it is not part of routine foreground maintenance.
 
 AMOS owns canonical memory, recall, provenance, constitutional transition
 enforcement, cleanup metadata, self-awareness views, and advisory maintenance.
-It does not directly execute external actions. Integrations such as the Mirror
-Agent demo should keep live external-action authority, validation, approval
-checks, and runtime packet application outside AMOS. Cognitive proposal
-disposition remains identity-authored while AMOS enforces the authenticated
-ratification or resolution contract.
+The host application validates and applies the recalled information and owns
+approvals and external actions. In the reminder example, AMOS returns the
+user's preference and the host formats the time. In the import example, AMOS
+returns the successful delimiter and the worker uses it to parse a new file.
+[Usage examples](usage_examples/README.md)
+
+Cognitive proposal disposition remains identity-authored while AMOS enforces
+the authenticated ratification or resolution contract.
 Domain-specific maintenance packs should follow the same boundary: they inspect
 bounded AMOS evidence windows and return side-effect-free proposals; optional
 `window_request` metadata narrows lifecycle/type/profile and evidence needs but
