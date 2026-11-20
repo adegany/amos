@@ -18,6 +18,14 @@ Amos is a model-neutral, layered, associative, self-maintaining memory substrate
 
 The core thesis is that long-term agent memory should not be stored primarily as English summaries. English, embeddings, prompt snippets, and planner-specific payloads should be generated views over a canonical memory substrate composed of typed atoms, evidence links, associative edges, health states, and maintenance actions.
 
+## Integrate AMOS with Codex or Claude
+
+Give Codex or Claude your project files or a description of the workflow you have in mind. Use the public link in this prompt or point the assistant to a local copy of the [AMOS integration skill](skills/amos-integration/SKILL.md).
+
+> Read <https://raw.githubusercontent.com/adegany/amos/main/skills/amos-integration/SKILL.md> and assess whether AMOS would help this project. Trace one workflow, identify where memory would be written and used, and explain how we could verify the benefit. Keep this to an assessment.
+
+For implementation, give the same link and name the behavior you want. For example, “Integrate AMOS so our import worker can recall which settings succeeded for a feed on its previous run. Verify it through the worker's normal entry point.”
+
 ## Architecture
 
 ```mermaid
