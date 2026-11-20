@@ -6,8 +6,8 @@ import urllib.request
 
 import pytest
 
-from examples.mirror_agent_demo import run_demo
-from examples.mirror_agent_ui import MirrorAgentUIServer, used_memory_refs
+from usage_examples.mirror_agent.mirror_agent_demo import run_demo
+from usage_examples.mirror_agent.mirror_agent_ui import MirrorAgentUIServer, used_memory_refs
 
 
 def test_mirror_agent_demo_runs_all_scenarios_and_emits_inspector_report(tmp_path):

@@ -8,15 +8,24 @@
 [![Storage](https://img.shields.io/badge/v1%20storage-SQLite-lightgrey.svg)](#roadmap)
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#current-status)
 
-**A typed, auditable memory service for agents that need durable recall,
-provenance, self-models, and deterministic maintenance instead of prompt-only
-memory.**
+**A memory service that lets an agent remember what worked on a previous run
+and show the evidence behind its answer.**
 
 **AMOS** stands for **Agent Memory Operating System**.
 
-Amos is a model-neutral, layered, associative, self-maintaining memory substrate for agentic AI systems. It treats agent memory as an operating-system-like service: capture evidence, maintain typed memory, preserve provenance, perform cleanup, promote and demote memories across tiers, and render task-specific memory packets for reasoners, planners, executors, critics, and future processors.
+## Try one memory behavior
 
-The core thesis is that long-term agent memory should not be stored primarily as English summaries. English, embeddings, prompt snippets, and planner-specific payloads should be generated views over a canonical memory substrate composed of typed atoms, evidence links, associative edges, health states, and maintenance actions.
+From the repository root, run either example with Python 3.10+. Each starts a temporary AMOS service, writes one kind of memory, restarts the service, and shows what the next session can do. Both run locally with the Python standard library.
+
+- **Remember a preference.** A reminder changes from `02:30 PM` to `14:30` after the user asks for 24-hour time. The agent cites the saved preference and the original message. [Preference continuity](usage_examples/preference_continuity.py)
+- **Reuse a successful import setting.** A worker's default comma delimiter accepts zero rows. The next run recalls the tab delimiter that worked for that feed, imports a new row, and cites the successful run. [Successful action recall](usage_examples/successful_action_recall.py)
+
+```sh
+PYTHONPATH=src python3 -m usage_examples.preference_continuity
+PYTHONPATH=src python3 -m usage_examples.successful_action_recall
+```
+
+To adapt either example to your agent loop, see the [usage guide](usage_examples/README.md). Once you've tried one, explore self-models, reasoning frames, governance, and maintenance together in [Mirror Agent](usage_examples/mirror_agent).
 
 ## Integrate AMOS with Codex or Claude
 
@@ -27,6 +36,10 @@ Give Codex or Claude your project files or a description of the workflow you hav
 For implementation, give the same link and name the behavior you want. For example, “Integrate AMOS so our import worker can recall which settings succeeded for a feed on its previous run. Verify it through the worker's normal entry point.”
 
 ## Architecture
+
+Amos is a model-neutral, layered, associative, self-maintaining memory substrate for agentic AI systems. It treats agent memory as an operating-system-like service: capture evidence, maintain typed memory, preserve provenance, perform cleanup, promote and demote memories across tiers, and render task-specific memory packets for reasoners, planners, executors, critics, and future processors.
+
+The core thesis is that long-term agent memory should not be stored primarily as English summaries. English, embeddings, prompt snippets, and planner-specific payloads should be generated views over a canonical memory substrate composed of typed atoms, evidence links, associative edges, health states, and maintenance actions.
 
 ```mermaid
 flowchart TB
@@ -442,13 +455,13 @@ the same commit.
 ### Run the Mirror Agent integration demo
 
 ```bash
-PYTHONPATH=src python examples/mirror_agent_demo.py --format text
+PYTHONPATH=src python usage_examples/mirror_agent/mirror_agent_demo.py --format text
 ```
 
 ### Run the Mirror Agent browser UI
 
 ```bash
-PYTHONPATH=src python examples/mirror_agent_ui.py --host 127.0.0.1 --port 8787 --lm codex
+PYTHONPATH=src python usage_examples/mirror_agent/mirror_agent_ui.py --host 127.0.0.1 --port 8787 --lm codex
 ```
 
 The UI chat path uses local `codex exec` as the LM provider by default. AMOS

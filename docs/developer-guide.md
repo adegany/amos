@@ -3,6 +3,8 @@
 This guide shows how to integrate Amos as a practical memory service for an
 agent or multi-agent system.
 
+For a runnable first integration, try remembering a user's time format or reusing a successful import setting. Both examples show the application's output before and after a service restart. [Usage examples](../usage_examples/README.md)
+
 ## 1. Run Amos As A Service
 
 For v1, use one Amos HTTP service with a service-owned SQLite database:
